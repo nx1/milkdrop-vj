@@ -243,9 +243,14 @@ impl Stage3App {
         self.logger.check_frame(&main_gl, 0, "main-init");
 
         // Find a WGL config supporting off-screen pbuffers (`WGL_ARB_pbuffer`).
+        // IMPORTANT (Windows WGL): `.compatible_with_native_window(raw_window_handle)` is
+        // required so glutin calls `GetDC(hwnd)` on our real window instead of `GetDC(0)`
+        // (desktop screen DC), which otherwise causes `wglCreatePbufferARB` to fail with
+        // OS error `0xC0070591` (ERROR_DC_NOT_FOUND = 1425).
         let pbuffer_template = ConfigTemplateBuilder::new()
             .with_alpha_size(8)
             .with_surface_type(ConfigSurfaceTypes::PBUFFER)
+            .compatible_with_native_window(raw_window_handle)
             .build();
         let pbuffer_config = unsafe {
             gl_display
