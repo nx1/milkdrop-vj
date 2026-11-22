@@ -202,11 +202,13 @@ Every shortcut below is **100% remappable** through `mappings.json`. Shortcuts p
 | **Deck B Hot-Presets** | `5`, `6`, `7`, `8` | Load preset slot into Deck B | Smooth transition by default; `Shift` + key = hard cut. |
 | **Deck A Visual EQ Kills** | `Q` / `W` / `E` | Toggle Bass / Mid / Treble kill | Matches left-hand deck side. |
 | **Deck B Visual EQ Kills** | `I` / `O` / `P` | Toggle Bass / Mid / Treble kill | Symmetric right-hand deck side. |
-| **Crossfader Cuts & Nudge** | `[` / `\` / `]` and `←` / `→` | Cut A / Center / Cut B; nudge left/right | Keeps `A`/`S`/`D` free from accidental hits near `Q`/`W`/`E`. |
-| **Momentary Master FX** | `Z` / `X` / `C` / `V` | Hold for Strobe / Invert / Kaleidoscope / Freeze | Releases immediately when you lift the key. |
-| **Manual Beat Pulse** | `Spacebar` | Fires one synthetic beat pulse (+ optional zoom punch) | Separate from Tap Tempo. |
-| **Tap Tempo** | `T` | Averages last 4 taps to set BPM | Drives synced strobe rate and timed auto-fades; never fires a beat pulse. |
-| **Emergency Blackout** | `Backspace` | Smoothly fades output to black (toggle) | Safe panic button for live shows. |
+| **Crossfader Cuts & Nudge** | `[` / `\` / `]` and `←` / `→` | Cut A / Center / Cut B; nudge `±0.05` left/right | Keeps `A`/`S`/`D` free from accidental hits near `Q`/`W`/`E`. Paused while typing in search. |
+| **Blend Mode Cycle** | `M` | Cycle Crossfade / Additive / Multiply / Difference / Luma Key | Live in Milestone 2 (`2A-3`). |
+| **Browser & Deck Load** | `/`, `Esc`, `↑`/`↓`, `Enter`, `A`, `B` | `/` focus search; `Esc` exit search; `↑`/`↓` select row; `Enter` load off-air deck; `A`/`B` target deck | `Shift` + load = hard cut (`smooth=false`). `Ctrl` + `A`/`B` = force load onto on-air deck. Live in `2A-3`/`2A-4`. |
+| **Momentary Master FX** | `Z` / `X` / `C` / `V` | Hold for Strobe / Invert / Kaleidoscope / Freeze | Releases immediately when you lift the key (Milestone 3). |
+| **Manual Beat Pulse** | `Spacebar` | Fires one synthetic beat pulse (+ optional zoom punch) | Separate from Tap Tempo (Milestone 3). |
+| **Tap Tempo** | `T` | Averages last 4 taps to set BPM | Drives synced strobe rate and timed auto-fades; never fires a beat pulse (Milestone 3). |
+| **Emergency Blackout** | `Backspace` | Smoothly fades Master output to black (`0.4 s`, toggle) | Safe panic button for live shows. **Brought forward into Milestone 2 (`2A-2`/`2A-3`).** |
 
 ### 5.2 Control Bus and `mappings.json` Schema
 
@@ -348,7 +350,8 @@ The **Dell Precision 7740** has both an **Intel integrated GPU (iGPU)** and an *
   - **Window 2 (Projector Output):** Borderless fullscreen window placed on whichever external monitor you select, with a one-click monitor picker and an internal render resolution toggle (for example render at `1280×720` or `1920×1080` even if plugged into a `4K` TV so frame rates stay smooth).
   - **Two-Window Swap Interval Rule (VSync):** In a single-threaded multi-window OpenGL loop, enabling VSync (`SwapInterval::Wait(1)`) on *both* windows can serialize two VSync waits per frame and halve FPS to `30 FPS`. Therefore, only **one** window waits on VSync at a time:
     - **Single-window mode (no projector open):** Control Console uses `SwapInterval::Wait(1)`.
-    - **Dual-window mode (projector open):** Projector Output uses `SwapInterval::Wait(1)` (so the audience display stays tear-free and locked to projector refresh) while the Control Console switches to `SwapInterval::DontWait` (it still runs at the projector's 60 Hz pace with zero double-VSync penalty).
+    - **Dual-window mode (projector open):** Projector Output uses `SwapInterval::Wait(1)` (so the audience display stays tear-free and locked to projector refresh) while the Control Console switches to `SwapInterval::DontWait` (it still runs at the projector's pace with zero double-VSync penalty).
+    - **Known trade-off (different monitor refresh rates):** Because the single-threaded loop paces itself to the Projector Output's VSync, the Control Console runs at the **projector's refresh rate** (for example, 60 Hz even if the laptop panel is 120 Hz, or 30 Hz if a TV negotiates 4K/30 Hz). Always check that the external display is set to 60 Hz in Windows Display Settings.
 
 ---
 
@@ -376,13 +379,13 @@ The **Dell Precision 7740** has both an **Intel integrated GPU (iGPU)** and an *
 | Dual `libprojectM 4.1.8` OpenGL engine + `AudioSource` + WASAPI Loopback + lock-free ring buffer | **Milestone 1 (Complete)** | Accepted complete (`10-min` live-audio soak **deferred** to Section 12). |
 | **Control Bus (`0.0..=1.0`) + `mappings.json` + remappable keyboard shortcuts** | **Milestone 2 (`2A-1`, `2A-3`)** | Built **first** before UI widgets so `egui`, keyboard, and future MIDI share one bus from day one. |
 | Dark-venue `egui` console, Deck A/B/Master previews, FPS display, blank-deck async warning, `glFenceSync`/`glWaitSync` | **Milestone 2 (`2A-1`)** | Plus preset-load + next-2-frames logging in normal runs. |
-| GPU Mixer (Crossfader + 5 Blend Modes: Crossfade, Additive, Multiply, Difference, Luma Wipe) | **Milestone 2 (`2A-2`)** | Driven through the Control Bus. |
-| Preset Browser (background scan + disk cache, search, calibrated complexity badge, Deck A/B load) | **Milestone 2 (`2A-4`)** | Tested with a few hundred presets (gitignored). |
+| GPU Mixer (Crossfader, 5 Blend Modes: Crossfade, Additive, Multiply, Difference, Luma Key, + **Emergency Blackout `Backspace`**) | **Milestone 2 (`2A-2`)** | Driven through the Control Bus. Smooth `0.4 s` fade-to-black panic button brought forward into `2A-2`. |
+| Preset Browser (background scan + disk cache, search, calibrated complexity badge, Deck A/B load + Load Safety guard) | **Milestone 2 (`2A-4`)** | Tested with a few hundred presets (gitignored). |
 | Top Bar (audio device dropdown w/ non-blocking restart, Live/Test switch, runtime resolution toggle) | **Milestone 2 (`2A-5`)** | Default `1280×720` during dev; 5-toggle test now, 20-toggle on Section 12 list. |
 | Borderless Fullscreen Projector Output Window (2nd monitor + swap-interval rule) | **Milestone 2 (`2B`)** | 30–60s test on a real external monitor. |
 | **Per-deck 3-band Visual EQ & Kill switches (`Q`/`W`/`E`, `I`/`O`/`P`)** | **Milestone 3** | **Not in Milestone 2.** |
 | **Manual Beat Pulse (`Spacebar`) & Tap Tempo (`T`)** | **Milestone 3** | **Not in Milestone 2.** |
-| **Two GPU Effect Racks (Hue, Mirror/Kaleidoscope, Invert, Strobe, Freeze, Blackout)** | **Milestone 3** | **Not in Milestone 2.** |
+| **Two GPU Effect Racks (Hue, Mirror/Kaleidoscope, Invert, Strobe, Freeze)** | **Milestone 3** | **Not in Milestone 2** (Emergency Blackout is already in `2A-2`). |
 | **Hot-Preset Banks (`1`–`8`)** | **Milestone 3** | **Not in Milestone 2.** |
 | **Line-In / USB audio interface input (`AudioSource` backend #2)** | **Milestone 4** | **Not in Milestone 2.** |
 | **USB MIDI (`midir`) + one-click MIDI Learn** | **Milestone 4** | **Not in Milestone 2** (Control Bus + `mappings.json` already ready). |
@@ -396,7 +399,7 @@ The **Dell Precision 7740** has both an **Intel integrated GPU (iGPU)** and an *
    - *Deferred (not failed):* 10-minute live-audio soak (see Section 12).
 2. **Milestone 2 — Control Bus, Dual-Deck Traktor Console & Projector Output (6 Sub-Stages)**
    - **`2A-1`:** `egui` dark-venue window with Deck A & Deck B previews, FPS display, blank-deck async warning, `glFenceSync`/`glWaitSync`, preset-load + next-2-frame logging, and the **Control Bus (`0.0..=1.0`) + `mappings.json`** (no mixer yet).
-   - **`2A-2`:** GPU mixer, Master preview, crossfader, and 5 blend modes wired through the Control Bus.
+   - **`2A-2`:** GPU mixer, Master preview, crossfader (with double-click center), 5 blend modes (Crossfade, Additive, Multiply, Difference, Luma Key), and **Emergency Blackout (`Backspace`, `0.4 s` fade to black)**—all wired through the Control Bus.
    - **`2A-3`:** Remappable keyboard mapping through the Control Bus (keyboard-first controls, remappable from the start).
    - **`2A-4`:** Preset browser (background scanner + disk cache, search, calibrated complexity badge, load to Deck A or Deck B).
    - **`2A-5`:** Top bar (audio device dropdown with unplug-safe non-blocking restart, Live/Test source switch, runtime resolution toggle).
@@ -451,3 +454,109 @@ Re-run the following tests once stronger hardware is available:
 7. **Resolution toggle stress test:** 20 runtime resolution toggles in a row (checking GL errors and memory growth).
 
 *(Append additional items here as later milestones uncover hardware-limited checks.)*
+
+---
+
+## 13. Milestone 2 Wireframe and UI Specification (Approved)
+
+### 13.1 Window Sizing, `egui` Points, and Exact Vertical Sums
+
+All UI measurements use **`egui` logical points (`pt`)**, which Windows display scaling converts to physical pixels automatically (`1.0×` at 100%, `1.25×` at 125%, `1.5×` at 150%). Do **not** confuse window size (`pt`) with internal deck render resolution (`1280×720 px` or `1920×1080 px`).
+
+- **Design window size:** **`1920×1080 pt`** (100% scaling on a 1080p screen).
+- **Minimum window size (nothing clipped):** **`1280×720 pt`** (also fits a 1080p laptop screen at 150% Windows scaling).
+- **Responsive sizing rule:** Preview size follows the **available stage height** (keeping exact `16:9` aspect ratio, capped by column width), and the **Preset Browser** expands to take all remaining vertical height:
+  - `stage_h = (window_h * 0.40).clamp(306.0, 432.0)`
+  - Non-preview chrome inside each of the 3 stage columns = **`126 pt`** (`30 pt` header + `26 pt` info/blend row + `54 pt` controls/slider rows + `16 pt` internal padding/gaps).
+  - `preview_h = (stage_h - 126.0).min(col_inner_w * 9.0 / 16.0)` and `preview_w = preview_h * 16.0 / 9.0`.
+
+| Vertical Region | At `1280×720 pt` (Minimum) | At `1920×1080 pt` (Design) | Notes |
+| :--- | :---: | :---: | :--- |
+| **Top Bar** | `56 pt` | `56 pt` | Fixed height; single row (`~1,010 pt` content fits easily in `1,280 pt`). |
+| **Visual Stage** (chrome `126 pt` + 16:9 preview) | `306 pt` *(preview `320×180 pt`)* | `432 pt` *(preview `544×306 pt`)* | All 3 previews (`3 × 320 = 960 pt` or `3 × 544 = 1,632 pt`) fit inside width with padding. |
+| **Preset Browser** *(fills remaining height)* | `322 pt` *(7 rows visible)* | `556 pt` *(14 rows visible)* | `42 pt` filter bar + `28 pt` header + scrollable `34 pt` rows. *(Typing banner takes `30 pt` from list scroll area when active.)* |
+| **Bottom Status Strip** | `28 pt` | `28 pt` | Fixed height. |
+| **Panel borders / margins** | `8 pt` | `8 pt` | Exact spacing allowance. |
+| **TOTAL HEIGHT** | **`720 pt` (100.0%)** | **`1080 pt` (100.0%)** | **Zero overflow, zero clipped controls.** |
+
+### 13.2 Approved Text Wireframe
+
+```text
++=======================================================================================================+
+| TOP BAR (56 pt fixed)                                                                                 |
+| [Live WASAPI v] [Speakers (USB CODEC) v] [||||--- -12dB] [ LIVE ] | [Res:720p v] [Proj:OFF] [Keys]   |
+|   (2A-5)          (2A-5)                  (Live Meter)  (16pt Bold)|  (2A-5)      (2B)      (2A-3)    |
+|                                                          [RTX 3000]  [ 60.0 FPS ]                     |
++=======================================================================================================+
+| VISUAL STAGE (306 pt at 720p min / 432 pt at 1080p design — 3 equal columns, 16:9 previews by height) |
+|                                                                                                       |
+| +-------------------------------+  +-------------------------------+  +-----------------------------+ |
+| | DECK A  [ON-AIR]*   [ 2.1 ms] |  | MASTER OUTPUT       [LIVE]    |  | DECK B   [CUE]*   [ 2.3 ms] | |
+| | (*hidden in 2A-1 until 2A-2)  |  | (2A-2 placeholder in 2A-1)    |  | (*hidden in 2A-1)           | |
+| |                               |  |                               |  |                             | |
+| |      16:9 Live Preview        |  |       16:9 Mixed Output       |  |      16:9 Live Preview      | |
+| |   (320x180 .. 544x306 pt)     |  |    (Exact Projector View)     |  |   (320x180 .. 544x306 pt)   | |
+| |                               |  |                               |  |                             | |
+| +-------------------------------+  +-------------------------------+  +-----------------------------+ |
+| | 02_Geometric... [LIGHT 78]    |  | Blend [M]: [Crossfade      v] |  | 06_Waveform... [LIGHT  1]   | |
+| | [! BLANK DECK] (only >=2s)    |  | A [=========|=========] B 50% |  | [! BLANK DECK] (only >=2s)  | |
+| | [< Prev] [Next >] [Smooth1.5s]|  | (Double-click = Center, <- ->)|  | [< Prev] [Next >][Smooth1.5s| |
+| |                               |  | [Cut A [] [Center \] [Cut B ]]|  |                             | |
+| |                               |  | [     BLACKOUT   (Bksp)     ] |  |                             | |
+| +-------------------------------+  +-------------------------------+  +-----------------------------+ |
++=======================================================================================================+
+| [CONDITIONAL 30 pt AMBER BANNER — ONLY WHILE SEARCH BOX HAS FOCUS:]                                   |
+| >>>  KEYS PAUSED — TYPING IN SEARCH  (Press Esc to resume live keys; Enter exits search first)  <<<   |
++=======================================================================================================+
+| PRESET BROWSER (Fills remaining height: 322 pt at 720p / 556 pt at 1080p — 34 pt rows)                |
+| +---------------------------------------------------------------------------------------------------+ |
+| | Search [/]: [____________________________]  Weight: [All][Light][Med][Heavy]  Folder: [All v]     | |
+| | (2A-4 greyed in 2A-1..3)                                           320 presets (cached)           | |
+| +---------------------------------------------------------------------------------------------------+ |
+| | Preset Name                                | Folder    | Est. Load       | Actions                | |
+| |--------------------------------------------+-----------+-----------------+------------------------| |
+| | > 02_Geometric - underwater cathedral      | Geometric | [LIGHT]    78   | [Load A]   [Load B]    | |
+| |   04_Particles - Mashup 287                | Particles | [MEDIUM]  353   | [Load A]   [Load B]    | |
+| |   06_Waveform - Flow with the Go           | Waveform  | [LIGHT]     1   | [Load A]   [Load B]    | |
+| |   08_Reaction - the green machine 2        | Reaction  | [HEAVY]  3584   | [Load A]   [Load B]    | |
+| +---------------------------------------------------------------------------------------------------+ |
++=======================================================================================================+
+| STATUS STRIP (28 pt fixed)                                                                            |
+| Audio: 48 kHz | Last load: 06_Waveform (9.4 ms) | GL Errors: 0 | Keys: ACTIVE (/ Search)              |
++=======================================================================================================+
+```
+
+### 13.3 Thresholds, Rules, and Verified Behavior
+
+1. **Audio Status in Top Bar:** Shown in large bold text right beside the peak meter:
+   - **`LIVE`** (green) when WASAPI loopback packets arrive (or **`TEST`** in cyan for Synthetic Test audio).
+   - **`SILENCE`** (amber) when `0 pkt/s` arrive (music paused).
+   - **`DEVICE LOST`** (bold high-contrast white-on-red) when Windows invalidates/unplugs the audio device.
+2. **Global FPS + Per-Deck Render Time (`ms`):**
+   - Rendering is single-threaded, so FPS is one global number: **Green** `>= 55.0 FPS`, **Yellow** `45.0–54.9 FPS`, **Red** `< 45.0 FPS`.
+   - Each deck shows its rolling average render time (`cpu_submit_ms` in normal live mode): **Normal** `< 6.0 ms`, **Yellow (`SLOW`)** `6.0–9.9 ms`, **Red (`OVER BUDGET`)** `>= 10.0 ms` (provisional, laptop-limited, based on sharing a `16.67 ms` 60 Hz frame budget between two decks + mixer/UI).
+3. **`ON-AIR` / `MIXED` / `CUE` Labels (Hidden in `2A-1`, Active from `2A-2`):**
+   - From crossfader `x ∈ [0.0, 1.0]` (`w_A = 1.0 - x`, `w_B = x`):
+     - **`CUE`:** `w <= 0.05` (off-air, safe to load in one click/press).
+     - **`MIXED`:** `0.05 < w < 0.95` (both decks visible in Master).
+     - **`ON-AIR`:** `w >= 0.95` (deck dominates Master).
+4. **Blank-Deck Warning:**
+   - Blit `output_texture` to a `32×18` FBO and read back asynchronously via PBO every **`500 ms`** (`2×/sec`, zero stall).
+   - Compute Rec. 709 average luma `Y = 0.2126 R + 0.7152 G + 0.0722 B` (`0..=255`).
+   - Trigger `[! BLANK DECK]` only when `avg_luma < 3.0` continuously for **`>= 2.0 seconds`** (`4` consecutive samples), so brief fades-to-black do not false-trigger while broken `shader_body` presets (`0.0/255`) are caught reliably.
+5. **Load Safety & Last-Load Stall Highlight:**
+   - Any deck with `w > 0.05` (`ON-AIR` or `MIXED`) is **protected**.
+   - `Enter` loads the selected browser row into the `CUE` deck (`w <= 0.05`). If both decks are live (`0.05 < x < 0.95`), `Enter` refuses and shows an inline notice instead of overwriting a live deck.
+   - Clicking `[Load A]`, `[Load B]`, or `[< Prev]`/`[Next >]` (previous/next in the currently filtered browser list) on a protected deck arms a **`[CONFIRM?]`** state for `3.0 seconds`; a second click executes the load. Keyboard force override: `Ctrl + A` / `Ctrl + B`.
+   - In the Status Strip, `Last load` turns **yellow** if load time `>= 16.7 ms` (`> 1` frame) and **red** if `>= 33.3 ms` (`>= 2` frames).
+6. **Preset Behavior Verified in `libprojectM 4.1.8` Source:**
+   - Verified in [`ProjectM.cpp`](file:///C:/vcpkg/buildtrees/projectm/src/v4.1.8-9c1797eb3b.clean/src/libprojectM/ProjectM.cpp#L108-L125) and [`ProjectM.hpp`](file:///C:/vcpkg/buildtrees/projectm/src/v4.1.8-9c1797eb3b.clean/src/libprojectM/ProjectM.hpp#L195-L208): `libprojectM` never switches presets automatically (it only notifies a callback if registered). In `Deck::new()` we additionally call `projectm_set_preset_locked(handle, true)` and `projectm_set_hard_cut_enabled(handle, false)`, and never register a preset-switch-requested callback. **Only user actions can change a preset.**
+   - **Default transition:** **`Smooth (1.5 s)`** (`smooth_transition = true`, `soft_cut_duration = 1.5`), shown in each deck bar (`[Smooth 1.5s]` / `[Hard Cut]`). Smooth avoids harsh flashes on live decks while completing quickly on cue decks; holding **`Shift`** on any load triggers a hard cut (`smooth_transition = false`).
+7. **Five GPU Blend Modes (`2A-2`, where `t = mixer.crossfader ∈ [0, 1]`):**
+   - **`Crossfade` (Default):** `mix(A, B, t)` — standard linear DJ crossfade.
+   - **`Additive`:** `clamp(A * min(1.0, 2.0 * (1.0 - t)) + B * min(1.0, 2.0 * t), 0.0, 1.0)` — glowing light addition in the center, clean pure A/B at ends.
+   - **`Multiply`:** `mix(mix(A, B, t), A * B, 1.0 - abs(2.0 * t - 1.0))` — darker color-filter overlap in the middle, pure A/B at ends.
+   - **`Difference`:** `mix(mix(A, B, t), abs(A - B), 1.0 - abs(2.0 * t - 1.0))` — high-contrast inverted overlap in the middle, pure A/B at ends.
+   - **`Luma Key`:** `mix(mix(A, B, smoothstep(0.08, 0.35, luma(B)) * t), B, smoothstep(0.92, 1.0, t))` — bright elements of Deck B key over Deck A while dark areas of B stay transparent, reaching pure B at `t = 1.0`.
+8. **Stage Placeholders:** Controls arriving in `2A-2`..`2B` are rendered greyed out (`add_enabled(false, ...)`) with their stage tag until implemented.
+9. **2A-3 Live vs. Inert Keys:** Live in `2A-3`: `[`, `\`, `]`, `←`, `→`, `M`, `Backspace`, `/`, `Esc`, `↑`, `↓`, `Enter`, `A`, `B` (plus `Shift` = Hard Cut, `Ctrl` = Force On-Air). Inert until Milestone 3 (not drawn or promised in Milestone 2): `1`–`8`, `Q`/`W`/`E`, `I`/`O`/`P`, `Z`/`X`/`C`/`V`, `Space`, `T`.
