@@ -1,3 +1,5 @@
 /target
 /vcpkg_installed
+/logs
+/presets
 *.pdb

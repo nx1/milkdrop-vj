@@ -5,7 +5,16 @@ edition = "2021"
 description = "Human-in-the-loop MilkDrop VJ instrument powered by libprojectM 4.x"
 
 [dependencies]
-# Runtime crates (OpenGL, UI, WASAPI audio) will be added in Milestone 1.
+# Window creation and keyboard/mouse event loop (matches egui-winit 0.37 for Milestone 2).
+winit = "0.30"
+# Low-level OpenGL context creation, including shared contexts for Pattern 1 multi-deck.
+glutin = "0.32.3"
+# Glue between winit windows and glutin OpenGL contexts.
+glutin-winit = "0.5.0"
+# Shared window/display handle types used by winit and glutin.
+raw-window-handle = "0.6.2"
+# Thin, clean Rust bindings to OpenGL functions (matches egui_glow 0.37 for Milestone 2).
+glow = "0.17"
 
 [build-dependencies]
 # bindgen reads C header files (projectM-4/projectM.h) using libclang
