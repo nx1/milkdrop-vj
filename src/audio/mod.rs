@@ -7,6 +7,8 @@
 //! - Our deterministic test signal (`TestAudioSource`, for testing without music)
 //! - External Line-In / USB DJ mixer capture (Milestone 4)
 
+pub mod capture_thread;
+pub mod ring_buffer;
 pub mod test_source;
 pub mod wasapi_loopback;
 

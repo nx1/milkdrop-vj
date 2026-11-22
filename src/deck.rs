@@ -258,4 +258,14 @@ mod tests {
     fn runtime_version_is_4_1_8() {
         assert_eq!(projectm_version_string(), "4.1.8");
     }
+
+    /// Verifies `projectm_pcm_get_max_samples()` returns a sensible positive limit.
+    #[test]
+    fn pcm_max_samples_is_nonzero() {
+        let max_samples = max_pcm_samples_per_channel();
+        assert!(
+            max_samples >= 512,
+            "Expected projectm_pcm_get_max_samples() >= 512, got {max_samples}"
+        );
+    }
 }
