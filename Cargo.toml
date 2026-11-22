@@ -1,0 +1,13 @@
+[package]
+name = "milkdrop-vj"
+version = "0.1.0"
+edition = "2021"
+description = "Human-in-the-loop MilkDrop VJ instrument powered by libprojectM 4.x"
+
+[dependencies]
+# Runtime crates (OpenGL, UI, WASAPI audio) will be added in Milestone 1.
+
+[build-dependencies]
+# bindgen reads C header files (projectM-4/projectM.h) using libclang
+# and automatically generates Rust function declarations at build time.
+bindgen = "0.73.2"
