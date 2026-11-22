@@ -35,13 +35,13 @@ We checked every repository directly on GitHub and verified Rust packages on `cr
 
 - **Why this is tricky:** `libprojectM` does not own an OpenGL context. Every time we call `projectm_create()` or `projectm_opengl_render_frame()`, it runs on whichever OpenGL context is currently active on that thread. It also leaves OpenGL state modified after rendering (for example, `READ_FRAMEBUFFER_BINDING` can remain pointed at one of `projectM`'s internal buffers).
 - **Two valid ways to run Deck A and Deck B:**
-  1. **Per-deck shared OpenGL contexts (VERIFIED on `libprojectM 4.1.8` + Quadro RTX 3000):** Each deck gets its own OpenGL 3.3 Core context that shares textures with the main window context, plus an off-screen WGL pbuffer surface. Before calling Deck A or Deck B, we switch to that deck's context, save GL state, render with `projectm_opengl_render_frame()`, copy the pbuffer to a shared texture, and restore GL state. Verified with `0` OpenGL errors across `8,596 frames`, crisp `1920×1080` side-by-side PNG captures, and zero visual bleed. *(Windows-specific lessons verified: host app must call `glewInit()` once before `projectm_create()`, and WGL pbuffer configs must pass `.compatible_with_native_window(raw_window_handle)`.)*
+  1. **Per-deck shared OpenGL contexts (VERIFIED on `libprojectM 4.1.8` + Quadro RTX 3000):** Each deck gets its own OpenGL 3.3 Core context that shares textures with the main window context, plus an off-screen WGL pbuffer surface. Before calling Deck A or Deck B, we switch to that deck's context, save GL state, render with `projectm_opengl_render_frame()`, copy the pbuffer to a shared texture, insert an OpenGL fence sync (`glFenceSync` + `glFlush`), and restore GL state. Before sampling a deck's shared texture in the main or projector context, we issue a GPU-only `glWaitSync` (OpenGL 3.3 Core Spec, Chapter 5 / Section 5.3) and delete the sync object—guaranteeing cross-context ordering with zero CPU stall. Verified with `0` OpenGL errors across `8,596 frames`, crisp `1920×1080` side-by-side PNG captures, and zero visual bleed. *(Windows-specific lessons verified: host app must call `glewInit()` once before `projectm_create()`, and WGL pbuffer configs must pass `.compatible_with_native_window(raw_window_handle)`.)*
   2. **Single OpenGL context with `projectm_opengl_render_frame_fbo` (Fallback only — not needed):** As of **2026-11-22**, `projectm_opengl_render_frame_fbo()` exists **only on `projectM`'s `master` development branch** and is **not** in any officially released version (`v4.1.8` is the latest stable release). Since Pattern 1 is now verified cleanly, we stay on official `v4.1.8`.
-- **Spike Hardware Findings (Dell Precision 7740 / Quadro RTX 3000 — 10-Minute Soak Passed):**
-  - **10-minute active stability soak (`1920×1080 × 2`, `59` preset switches, `34,587 frames`):** **`0` OpenGL errors**, **zero memory leak** (`WorkingSet` flat at `116.7 MiB` from minute 1.5 to minute 10.0; VRAM flat at `~1.2 GiB / 6 GiB`), and **zero GPU thermal clock throttling** (boosted cleanly to `1,395 MHz` at `80°C` GPU peak).
+- **Spike Hardware Findings (Dell Precision 7740 / Quadro RTX 3000 — *all performance, latency, and thermal numbers below are provisional, laptop-limited*):**
+  - **10-minute synthetic-audio active stability soak (`1920×1080 × 2`, `59` preset switches, `34,587 frames`):** **`0` OpenGL errors**, **zero memory leak** (`WorkingSet` flat at `116.7 MiB` from minute 1.5 to minute 10.0; VRAM flat at `~1.2 GiB / 6 GiB`), and **zero GPU thermal clock throttling** (boosted cleanly to `1,395 MHz` at `80°C` GPU peak). *(The 10-minute live-audio WASAPI soak was approved as **deferred**, not failed; see Section 12.)*
   - **VSync timing behavior:** With VSync enabled, NVIDIA's driver waits for the previous frame's VSync at the *start* of the next frame's first OpenGL call rather than inside `swap_buffers()`. Accurate per-deck GPU render timing requires a diagnostic `--measure-gpu` mode (using `glFinish()`) or asynchronous `GL_TIME_ELAPSED` timer queries—never `glFinish()` in the normal live render loop.
-  - **Heavy-preset & thermal findings (`--measure-gpu`, controlled Runs 3A/3C/3D/3E on Best Performance):** Standard presets (`01`–`06`, `09_Drawing`, `10_Dancer`) take `2–9 ms` per deck and hold a locked **`60.0 FPS`** at `1080p × 2`. Controlled runs proved that `08_Reaction`'s slowdown is caused by **`shapecode_*_num_inst`** (`3,584` instances = `22.84 ms` / `38.6 FPS`; `256` instances = `5.32 ms` / `60.0 FPS`; `4` instances = `2.64 ms` / `60.0 FPS` at `1080p`), while dropping resolution to `1280×720` saved only `0.49 ms` (`22.35 ms` / `40.0 FPS`). Split timing proved the `num_inst` cost is **roughly 50/50 CPU submission (`10.25 ms`) and GPU execution (`12.11 ms`)**—not purely CPU-bound. Sustained heavy load reached `~80°C` GPU and `90–91°C` on unidentified sensor `temp0` (fans `3,700 RPM`). **Milestone 2 requirements:** live FPS warning, blank-deck warning, selectable deck resolution (`1920×1080` / `1280×720`), and a static `.milk` complexity badge summing enabled `shapecode_*_num_inst`.
-  - **Bad-preset behavior verified:** Missing files and 0-byte empty files fire `on_preset_switch_failed` and keep the previous working preset visible; a broken `shader_body` does **not** fire the callback and silently renders a black deck (`0.0/255` luma) without crashing while the other deck stays at `60 FPS`. **Milestone 2 requirement:** Add a blank/black-deck warning indicator (and optional preset scanner) so broken presets are spotted off-air.
+  - **Heavy-preset & thermal findings (`--measure-gpu`, controlled Runs 3A/3C/3D/3E on Best Performance):** Standard presets (`01`–`06`, `09_Drawing`, `10_Dancer`) take `2–9 ms` per deck and hold a locked **`60.0 FPS`** at `1080p × 2`. Controlled runs proved that `08_Reaction`'s slowdown is caused by **`shapecode_*_num_inst`** (`3,584` instances = `22.84 ms` / `38.6 FPS`; `256` instances = `5.32 ms` / `60.0 FPS`; `4` instances = `2.64 ms` / `60.0 FPS` at `1080p`), while dropping resolution to `1280×720` saved only `0.49 ms` (`22.35 ms` / `40.0 FPS`). Split timing proved the `num_inst` cost is **roughly 50/50 CPU submission (`10.25 ms`) and GPU execution (`12.11 ms`)**—not purely CPU-bound. Sustained heavy load reached `~80°C` GPU and `90–91°C` on unidentified sensor `temp0` (fans `3,700 RPM`). **Development default on this laptop:** `1280×720` per deck, `<= 60s` test runs, Balanced power mode ok. **Milestone 2 requirements:** live FPS warning, blank-deck async downscaled warning, selectable deck resolution (`1280×720` / `1920×1080`), and a calibrated `.milk` complexity badge summing `shapecode_*_num_inst` for `enabled=1` shapes (`Light <= 100`, `Medium 101–500`, `Heavy > 500`, labeled as an estimate of CPU/draw cost).
+  - **Bad-preset behavior verified:** Missing files and 0-byte empty files fire `on_preset_switch_failed` and keep the previous working preset visible; a broken `shader_body` does **not** fire the callback and silently renders a black deck (`0.0/255` luma) without crashing while the other deck stays at `60 FPS`. **Milestone 2 requirement:** Add a blank/black-deck warning indicator using a tiny downscaled asynchronous PBO readback (~2×/sec) so broken presets are spotted off-air without stalling the render loop.
 
 ---
 
@@ -84,10 +84,10 @@ We inspected [github.com/kushiemoon-dev/OpenDrop-VJ](https://github.com/kushiemo
 
 | Crate | Version | Last Updated | Downloads | Status & Role in Our App |
 | :--- | :--- | :--- | :--- | :--- |
-| **[`wasapi`](https://crates.io/crates/wasapi)** | `0.27.0` | 2026-11-06 | 569,185 | **Actively maintained.** Primary crate for low-latency Windows WASAPI Loopback capture. |
-| **[`cpal`](https://crates.io/crates/cpal)** | `0.18.2` | 2026-08-16 | 30,172,684 | **Actively maintained.** Strong option for Line-In and USB audio interface capture in Phase 2. |
-| **[`eframe`](https://crates.io/crates/eframe)** (`egui`) | `0.37.0` | 2026-10-15 | 25,954,989 | **Actively maintained.** Fast native Rust UI for decks, faders, knobs, and preset browser. |
-| **[`glow`](https://crates.io/crates/glow)** | `0.18.0` | 2026-07-09 | 60,957,030 | **Actively maintained.** Thin, clean OpenGL bindings for FBOs and our GPU mixer/FX shaders. |
+| **[`wasapi`](https://crates.io/crates/wasapi)** | `0.27.0` | 2026-11-06 | 569,185 | **Actively maintained (IN USE).** Primary crate for low-latency Windows WASAPI Loopback capture. |
+| **[`cpal`](https://crates.io/crates/cpal)** | `0.18.2` | 2026-08-16 | 30,172,684 | **Actively maintained.** Optional fallback for Line-In / USB audio interface capture in Milestone 4 (`wasapi` also supports `Direction::Capture`). |
+| **[`egui`](https://crates.io/crates/egui) / `egui-winit` / `egui_glow`** | `0.37.0` | 2026-10-15 | 25,954,989+ | **Actively maintained (RE-VERIFIED FOR MILESTONE 2).** Directly integrates with our `winit 0.30.13`, `glutin 0.32.3`, and `glow 0.17.0` multi-context stack (we use `egui-winit` + `egui_glow` directly instead of `eframe` so we keep full control of shared OpenGL contexts and our second projector window). |
+| **[`glow`](https://crates.io/crates/glow)** | `0.17.0` | 2026 | 60,957,030 | **Actively maintained (IN USE).** Exact version required by `egui_glow 0.37.0` (`^0.17.0`); thin OpenGL bindings for FBOs, sync objects, and GPU mixer/FX shaders. |
 | **[`midir`](https://crates.io/crates/midir)** | `0.11.1` | 2026-10-10 | 1,230,394 | **Actively maintained.** Cross-platform USB MIDI input for Milestone 4. |
 | **[`spout2-rs`](https://crates.io/crates/spout2-rs)** | `0.1.1` | 2026-06-19 | 4,112 | **Young / cautious use.** BSD-2-Clause, no linked source repo on `crates.io`, only 2 releases (`0.1.0`, `0.1.1`), though used in `OpenDrop-VJ`. Keep isolated behind a trait in Milestone 4; fall back to direct C++ Spout2 SDK bindings if needed. |
 
@@ -322,6 +322,10 @@ Live visuals feel "locked to the music" when total delay stays under **~50 milli
 | **Total Audio-to-Visual Target** | **35–50 ms** | **Hard ceiling: 70 ms.** |
 | **Keyboard / Mouse-to-Visual Target** | **< 33 ms** | Response visible within 2 frames at 60 FPS. |
 
+**Milestone 1 measurement status (provisional, laptop-limited):**
+- **Measured inside the app (Stage B Run #2, Balanced power):** Internal `audio_age` averaged **`23.12 ms`** (`22.0–22.3 ms` steady at 60 FPS; worst `168.60 ms` during a brief 28 FPS dip). `audio_age` starts from **WASAPI packet arrival** (minus packet duration) to `projectm_pcm_add_float()`—it does **not** start from original sound production.
+- **Assumed / not yet directly measured:** GPU render (`~5–8 ms`), VSync scanout (`~8–16.7 ms`), upstream media-player/Windows mixer buffering, and monitor/projector pixel response. Adding the measured `22–23 ms` to assumed render + VSync gives an **estimated `~35–48 ms`** (not yet verified end-to-end; full retest on better hardware is listed in Section 12).
+
 ---
 
 ## 8. Display and Multi-Monitor Handling (Dell Precision 7740)
@@ -340,8 +344,11 @@ The **Dell Precision 7740** has both an **Intel integrated GPU (iGPU)** and an *
 
 - **Startup GPU Verification:** Our app will log and display the active `GL_RENDERER` string in the status bar (for example `NVIDIA Quadro RTX 3000`) and show a clear warning banner if it detects `Intel` graphics.
 - **Two Windows:**
-  - **Window 1 (Control Console):** Stays on your laptop screen with Deck A preview, Deck B preview, Master preview, EQ, FX, and preset browser.
-  - **Window 2 (Projector Output):** Borderless fullscreen window placed on whichever external monitor you select, with a one-click monitor picker and an internal render resolution toggle (for example render at `1920x1080` even if plugged into a `4K` TV so frame rates stay locked at 60 FPS).
+  - **Window 1 (Control Console):** Stays on your laptop screen with Deck A preview, Deck B preview, Master preview, crossfader/mixer, preset browser, and status bar.
+  - **Window 2 (Projector Output):** Borderless fullscreen window placed on whichever external monitor you select, with a one-click monitor picker and an internal render resolution toggle (for example render at `1280×720` or `1920×1080` even if plugged into a `4K` TV so frame rates stay smooth).
+  - **Two-Window Swap Interval Rule (VSync):** In a single-threaded multi-window OpenGL loop, enabling VSync (`SwapInterval::Wait(1)`) on *both* windows can serialize two VSync waits per frame and halve FPS to `30 FPS`. Therefore, only **one** window waits on VSync at a time:
+    - **Single-window mode (no projector open):** Control Console uses `SwapInterval::Wait(1)`.
+    - **Dual-window mode (projector open):** Projector Output uses `SwapInterval::Wait(1)` (so the audience display stays tear-free and locked to projector refresh) while the Control Console switches to `SwapInterval::DontWait` (it still runs at the projector's 60 Hz pace with zero double-VSync penalty).
 
 ---
 
@@ -356,20 +363,46 @@ The **Dell Precision 7740** has both an **Intel integrated GPU (iGPU)** and an *
 | **5. WASAPI Loopback stops sending packets during silence** | High | Medium | Known Windows behavior! When no loopback packets arrive, feed zeroed silence buffers (+ any manual beat pulses) so visuals stay alive at 60 FPS between songs. |
 | **6. `spout2-rs` crate goes unmaintained (`v0.1.1`)** | Medium | Low | Keep Spout in Milestone 4 behind a clean `VideoOutput` trait; replace with direct C++ Spout2 SDK bindings if needed. |
 | **7. Rust learning curve slows iteration** | Medium | Medium | Keep architecture simple (no complex async runtime needed in core/UI), comment every file thoroughly, and document every module in [`PROJECT_NOTES.md`](file:///c:/Users/norma/Desktop/antigravity/PROJECT_NOTES.md). |
-| **8. Preset-load & shader-compile stall (off-air load stalls on-air deck)** | High | Medium | **Plain fact (verified in `ProjectM.cpp` lines 56–67):** Because rendering is single-threaded and `projectm_load_preset_file()` parses files and compiles OpenGL shaders synchronously on the calling thread, **loading a preset on the off-air deck also briefly stalls the on-air deck** (`~7–25 ms` on warm NVIDIA shader cache, longer on a true cold compile). **Options:** (1) Accept small warm-cache hitches as minor; (2) cue/preload new presets on the off-air deck during a quiet musical moment or breakdown; (3) flag slow-loading presets in the browser; (4) only if hitches prove visibly distracting live, evaluate moving each deck's shared OpenGL context onto its own worker thread in a later milestone. |
+| **8. Preset-load & shader-compile stall (off-air load stalls on-air deck)** | High | Medium | **Plain fact (verified in `ProjectM.cpp` lines 56–67):** Because rendering is single-threaded and `projectm_load_preset_file()` parses files and compiles OpenGL shaders synchronously on the calling thread, **loading a preset on the off-air deck also briefly stalls the on-air deck** (`~7–25 ms` on warm NVIDIA shader cache, longer on a true cold compile). **Measurement in Milestone 2:** Normal runs will automatically log the frame containing each preset load plus the next two frames for both decks so real stall impact is visible without a separate stress test. **Options:** (1) Accept small warm-cache hitches as minor; (2) cue/preload new presets on the off-air deck during a quiet musical moment or breakdown; (3) flag slow-loading presets in the browser; (4) only if hitches prove visibly distracting live, evaluate moving each deck's shared OpenGL context onto its own worker thread in a later milestone. |
 
 ---
 
-## 10. Updated Four-Milestone Roadmap
+## 10. Updated Four-Milestone Roadmap & Scope Agreement
 
-1. **Milestone 1 — Dual-Instance Spike + Single-Deck Audio Proof of Concept**
-   - **First check:** Prove two independent `libprojectM 4.1.8` instances render cleanly in one Rust process on the Quadro RTX 3000 using **Pattern 1** (one shared OpenGL context per deck + GL state save/restore).
-   - Build the swappable `AudioSource` trait + `WasapiLoopbackSource` (with device selection and silence fallback).
-   - Render live `.milk` presets at 60 FPS with basic keyboard preset switching and `GL_RENDERER` check.
-2. **Milestone 2 — Dual-Deck Traktor Console & Projector Output**
-   - Build Deck A and Deck B previews, preset browser, GPU crossfader + blend modes, and the borderless fullscreen Projector Output window.
+### Feature-to-Milestone Scope Table
+
+| Feature (from Sections 3–8) | Milestone | Notes |
+| :--- | :---: | :--- |
+| Dual `libprojectM 4.1.8` OpenGL engine + `AudioSource` + WASAPI Loopback + lock-free ring buffer | **Milestone 1 (Complete)** | Accepted complete (`10-min` live-audio soak **deferred** to Section 12). |
+| **Control Bus (`0.0..=1.0`) + `mappings.json` + remappable keyboard shortcuts** | **Milestone 2 (`2A-1`, `2A-3`)** | Built **first** before UI widgets so `egui`, keyboard, and future MIDI share one bus from day one. |
+| Dark-venue `egui` console, Deck A/B/Master previews, FPS display, blank-deck async warning, `glFenceSync`/`glWaitSync` | **Milestone 2 (`2A-1`)** | Plus preset-load + next-2-frames logging in normal runs. |
+| GPU Mixer (Crossfader + 5 Blend Modes: Crossfade, Additive, Multiply, Difference, Luma Wipe) | **Milestone 2 (`2A-2`)** | Driven through the Control Bus. |
+| Preset Browser (background scan + disk cache, search, calibrated complexity badge, Deck A/B load) | **Milestone 2 (`2A-4`)** | Tested with a few hundred presets (gitignored). |
+| Top Bar (audio device dropdown w/ non-blocking restart, Live/Test switch, runtime resolution toggle) | **Milestone 2 (`2A-5`)** | Default `1280×720` during dev; 5-toggle test now, 20-toggle on Section 12 list. |
+| Borderless Fullscreen Projector Output Window (2nd monitor + swap-interval rule) | **Milestone 2 (`2B`)** | 30–60s test on a real external monitor. |
+| **Per-deck 3-band Visual EQ & Kill switches (`Q`/`W`/`E`, `I`/`O`/`P`)** | **Milestone 3** | **Not in Milestone 2.** |
+| **Manual Beat Pulse (`Spacebar`) & Tap Tempo (`T`)** | **Milestone 3** | **Not in Milestone 2.** |
+| **Two GPU Effect Racks (Hue, Mirror/Kaleidoscope, Invert, Strobe, Freeze, Blackout)** | **Milestone 3** | **Not in Milestone 2.** |
+| **Hot-Preset Banks (`1`–`8`)** | **Milestone 3** | **Not in Milestone 2.** |
+| **Line-In / USB audio interface input (`AudioSource` backend #2)** | **Milestone 4** | **Not in Milestone 2.** |
+| **USB MIDI (`midir`) + one-click MIDI Learn** | **Milestone 4** | **Not in Milestone 2** (Control Bus + `mappings.json` already ready). |
+| **Spout2 Output (`VideoOutput` trait) & Preset License-Folder Filtering** | **Milestone 4** | **Not in Milestone 2.** |
+
+### Milestone Details
+
+1. **Milestone 1 — Dual-Instance Spike + WASAPI Live Audio (COMPLETE)**
+   - Proved two independent `libprojectM 4.1.8` instances on the Quadro RTX 3000 using **Pattern 1** (`0` GL errors, flat memory in 10-minute synthetic soak).
+   - Built the swappable `AudioSource` trait, `WasapiLoopbackSource`, `TestAudioSource`, and lock-free SPSC ring buffer feeding live music to both decks.
+   - *Deferred (not failed):* 10-minute live-audio soak (see Section 12).
+2. **Milestone 2 — Control Bus, Dual-Deck Traktor Console & Projector Output (6 Sub-Stages)**
+   - **`2A-1`:** `egui` dark-venue window with Deck A & Deck B previews, FPS display, blank-deck async warning, `glFenceSync`/`glWaitSync`, preset-load + next-2-frame logging, and the **Control Bus (`0.0..=1.0`) + `mappings.json`** (no mixer yet).
+   - **`2A-2`:** GPU mixer, Master preview, crossfader, and 5 blend modes wired through the Control Bus.
+   - **`2A-3`:** Remappable keyboard mapping through the Control Bus (keyboard-first controls, remappable from the start).
+   - **`2A-4`:** Preset browser (background scanner + disk cache, search, calibrated complexity badge, load to Deck A or Deck B).
+   - **`2A-5`:** Top bar (audio device dropdown with unplug-safe non-blocking restart, Live/Test source switch, runtime resolution toggle).
+   - **`2B`:** Borderless fullscreen Projector Output window on a second monitor.
 3. **Milestone 3 — Human-in-the-Loop Performance Controls**
-   - Add per-deck 3-band Visual EQ + Kill switches, Manual Beat Pulse (`Spacebar`), Tap Tempo (`T`), GPU FX racks (Hue, Mirror/Kaleidoscope, Invert, Strobe, Freeze, Blackout), Hot-Presets (`1`–`8`), and full `mappings.json` remapping.
+   - Add per-deck 3-band Visual EQ + Kill switches, Manual Beat Pulse (`Spacebar`), Tap Tempo (`T`), two GPU Effect Racks (Hue, Mirror/Kaleidoscope, Invert, Strobe, Freeze, Blackout), and Hot-Preset banks (`1`–`8`)—all wired into the existing Control Bus.
 4. **Milestone 4 — Hardware & Pro Extensions**
    - Add Line-In / USB audio interface input (`AudioSource` backend #2).
    - Add USB MIDI (`midir`) + one-click MIDI Learn writing to `mappings.json`.
@@ -396,3 +429,25 @@ Our current terminal is running as a **standard user (`IsAdmin: False`)**. Steps
 | **4** | **LLVM / Clang** (`23.1.6`) + `LIBCLANG_PATH` | `winget install -e --id LLVM.LLVM --accept-package-agreements --accept-source-agreements` (then set user env `LIBCLANG_PATH=C:\Program Files\LLVM\bin`) | **Requires Admin (UAC).** No restart. |
 | **5** | **Rust (`rustup`)** (`1.29.3`, `stable-x86_64-pc-windows-msvc`) | `winget install -e --id Rustlang.Rustup --accept-package-agreements --accept-source-agreements` (then verify/ensure `stable-x86_64-pc-windows-msvc`) | **No admin needed** (user profile). No restart. |
 | **6** | **`vcpkg`** + `VCPKG_ROOT` | `git clone https://github.com/microsoft/vcpkg C:\vcpkg` → `C:\vcpkg\bootstrap-vcpkg.bat` → set user env `VCPKG_ROOT=C:\vcpkg` | **No admin needed** (`C:\` allows Authenticated Users to create folders). No restart. |
+
+---
+
+## 12. Light-Load Development Rules and Retest on Better Hardware
+
+### Light-Load Rules (Active on the Dell Precision 7740)
+- Keep test runs to **60 seconds or less**, apart from functional checks that need longer.
+- **No** soak tests, **no** 120-second heavy-preset runs, and **no** repeated max-load runs on this laptop.
+- Plugged in + **Balanced** power mode is fine for functional testing. Use **`1280×720` per deck** by default while developing.
+- Label any performance, latency, or thermal number from this laptop **"provisional, laptop-limited"**.
+
+### Retest on Better Hardware
+Re-run the following tests once stronger hardware is available:
+1. **10-minute live-audio soak** with real music and preset switching across both decks.
+2. **Heavy-preset timings (Runs 3A and 3C to 3E)** at `1920×1080`.
+3. **Audio-to-visual latency**, with measured parts (`audio_age` from WASAPI packet arrival, GPU render time) and assumed/unmeasured parts (upstream player buffer, VSync, display lag) listed separately.
+4. **Thermals and GPU clock behavior** over a long run (including named CPU sensor identification).
+5. **Projector output:** which GPU drives the external display, lag, and VSync behavior.
+6. **Full preset library scan time** across the full `presets-cream-of-the-crop` library (~9,795 presets).
+7. **Resolution toggle stress test:** 20 runtime resolution toggles in a row (checking GL errors and memory growth).
+
+*(Append additional items here as later milestones uncover hardware-limited checks.)*
