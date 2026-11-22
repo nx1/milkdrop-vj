@@ -1,4 +1,4 @@
-//! Dark-Venue Traktor-Style `egui 0.37` Console UI (Milestone 2 — Stage `2A-3`).
+//! Dark-Venue Traktor-Style `egui 0.37` Console UI (Milestone 2 — Stage `2A-4`).
 //!
 //! Layout specification: Section 13 of `docs/project_research_and_design.md`.
 //! - All sizes are in `egui` logical points (`pt`), automatically scaled by Windows DPI.
@@ -6,10 +6,11 @@
 //! - Preview sizes follow available stage height (`(window_h * 0.40).clamp(306, 432)`)
 //!   keeping exact `16:9` aspect ratio, and the Preset Browser fills all remaining height.
 //! - Every working control (crossfader, cuts, blend modes, blackout, deck load buttons,
-//!   transition mode, and remappable keyboard bindings) reads and writes through the
-//!   unified `ControlBus` (`0.0..=1.0`) and `mappings.json`.
-//! - Controls arriving in `2A-4`, `2A-5`, and `2B` remain greyed out until implemented.
+//!   browser row Load A/B buttons, transition mode, and remappable keyboard bindings)
+//!   reads and writes through the unified `ControlBus` (`0.0..=1.0`) and `mappings.json`.
+//! - Controls arriving in `2A-5` and `2B` remain greyed out until implemented.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use egui::{
@@ -20,6 +21,7 @@ use egui::{
 use crate::mixer::{BlendMode, DeckAirState};
 use crate::render_deck::BlankDeckStatus;
 use milkdrop_vj::control::{param, ControlBus, MappingMode, BLEND_MODE_COUNT};
+use milkdrop_vj::preset_browser::{PresetEntry, ScanStatus, WeightFilter};
 use milkdrop_vj::preset_meta::{ComplexityTier, PresetComplexity};
 
 /// Thresholds for per-deck rolling GPU render time (`ms`) warnings (provisional, laptop-limited).
@@ -95,15 +97,21 @@ impl LoadGuardState {
     }
 }
 
-/// Interactive focus, selection, and key-remapping modal state shared between `main.rs` and `ui.rs`.
+/// Interactive focus, selection, filter, and key-remapping modal state shared between `main.rs` and `ui.rs`.
 #[derive(Default)]
 pub struct UiInteractionState {
-    /// Highlighted row in the Preset Browser list (controlled by Up/Down arrows or click).
+    /// Highlighted row index inside the currently filtered Preset Browser list (`Up`/`Down` or click).
     pub selected_preset_idx: usize,
-    /// True after Up/Down moved selection so the scroll area scrolls the row into view.
+    /// True after Up/Down moved selection so the virtualized scroll area scrolls the row into view.
     pub scroll_to_selected: bool,
-    /// Search box text (verifies Typing Mode in 2A-3; live list filtering arrives in 2A-4).
+    /// Live search query text (case-insensitive multi-term match against preset name and folder).
     pub search_query: String,
+    /// Active estimated-load (`Weight:`) filter pill (`All`, `Light`, `Med`, `Heavy`).
+    pub weight_filter: WeightFilter,
+    /// Optional folder filter (`None` = All folders).
+    pub folder_filter: Option<String>,
+    /// Set when the user clicks `Rescan` in the Preset Browser toolbar.
+    pub request_rescan: bool,
     /// True while the Search `TextEdit` has keyboard focus (pauses performance shortcuts).
     pub search_focused: bool,
     /// Set by `/` key to focus the Search box on the next UI frame.
@@ -161,24 +169,17 @@ pub struct LastLoadSummary {
     pub error: Option<String>,
 }
 
-/// One row shown in the Preset Browser list.
-#[derive(Debug, Clone)]
-pub struct StarterPresetRow {
-    pub name: String,
-    pub folder: String,
-    pub complexity: PresetComplexity,
-}
-
 /// Read-only per-deck snapshot passed into `draw_console_ui()` each frame.
 pub struct DeckUiSnapshot<'a> {
     pub texture_id: TextureId,
     pub preset_name: &'a str,
+    pub preset_path: &'a Path,
     pub complexity: PresetComplexity,
     pub render_ms_avg: f64,
     pub blank: BlankDeckStatus,
 }
 
-/// All live readouts needed to draw one frame of the `2A-3` Control Console.
+/// All live readouts needed to draw one frame of the `2A-4` Control Console.
 pub struct ConsoleUiState<'a> {
     pub audio_source_label: &'a str,
     pub audio_device_name: &'a str,
@@ -197,7 +198,10 @@ pub struct ConsoleUiState<'a> {
     pub blackout_alpha: f32,
     pub deck_a: DeckUiSnapshot<'a>,
     pub deck_b: DeckUiSnapshot<'a>,
-    pub starter_presets: &'a [StarterPresetRow],
+    pub all_presets: &'a [PresetEntry],
+    pub filtered_indices: &'a [usize],
+    pub folders: &'a [String],
+    pub scan_status: &'a ScanStatus,
 }
 
 /// Applies the high-contrast dark-venue palette and larger readable typography once at startup.
@@ -361,7 +365,16 @@ pub fn draw_console_ui(
                 .stroke(Stroke::new(1.0, BORDER_SUBTLE)),
         )
         .show(ui, |ui| {
-            draw_browser_panel(ui, state.starter_presets, interact);
+            draw_browser_panel(
+                ui,
+                state,
+                air_a,
+                air_b,
+                shift_held,
+                bus,
+                load_guard,
+                interact,
+            );
         });
 
     // 6. IN-APP REMAPPABLE KEYS MODAL (`mappings.json`).
@@ -928,11 +941,21 @@ fn draw_master_mixer_column(
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_browser_panel(
     ui: &mut egui::Ui,
-    presets: &[StarterPresetRow],
+    state: &ConsoleUiState<'_>,
+    air_a: DeckAirState,
+    air_b: DeckAirState,
+    shift_held: bool,
+    bus: &mut ControlBus,
+    load_guard: &mut LoadGuardState,
     interact: &mut UiInteractionState,
 ) {
+    let total_presets = state.all_presets.len();
+    let filtered_len = state.filtered_indices.len();
+
+    // Header row: title + key hints + live scan progress / count + Rescan button.
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("PRESET BROWSER")
@@ -942,14 +965,73 @@ fn draw_browser_panel(
         );
         ui.label(
             RichText::new(
-                "Up/Down select | Enter loads off-air deck | A/B target deck (Ctrl forces on-air; Shift hard-cuts) | Full scan & filter in 2A-4",
+                "Up/Down select | Enter loads CUE deck | A/B target deck (Ctrl forces on-air; Shift hard-cuts)",
             )
             .font(FontId::proportional(13.0))
             .color(TEXT_MUTED),
         );
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let rescan_enabled = !state.scan_status.scanning;
+            if ui
+                .add_enabled(rescan_enabled, egui::Button::new("Rescan"))
+                .on_hover_text("Re-scan presets\\ on a background thread and refresh preset_cache.json")
+                .clicked()
+            {
+                interact.request_rescan = true;
+            }
+
+            if state.scan_status.scanning {
+                let text = if state.scan_status.total > 0 {
+                    format!(
+                        "Scanning {}/{}...",
+                        state.scan_status.scanned, state.scan_status.total
+                    )
+                } else {
+                    "Scanning presets...".to_string()
+                };
+                Frame::new()
+                    .fill(Color32::from_rgb(76, 58, 12))
+                    .corner_radius(CornerRadius::same(4))
+                    .inner_margin(Margin::symmetric(8, 2))
+                    .stroke(Stroke::new(1.0, COLOR_WARN))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(text)
+                                .font(FontId::monospace(12.5))
+                                .strong()
+                                .color(COLOR_WARN),
+                        );
+                    });
+            } else {
+                let summary_text = format!("Showing {filtered_len} / {total_presets}");
+                let hover_detail = format!(
+                    "Library scan complete in {:.1} ms (provisional, laptop-limited)\n\
+                     Cache hits: {} | Newly parsed: {}\n\
+                     Cache file: preset_cache.json",
+                    state.scan_status.elapsed_ms,
+                    state.scan_status.cache_hits,
+                    state.scan_status.parsed
+                );
+                Frame::new()
+                    .fill(BG_CARD)
+                    .corner_radius(CornerRadius::same(4))
+                    .inner_margin(Margin::symmetric(8, 2))
+                    .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(summary_text)
+                                .font(FontId::monospace(12.5))
+                                .strong()
+                                .color(ACCENT_DECK_A),
+                        )
+                        .on_hover_text(hover_detail);
+                    });
+            }
+        });
     });
 
-    // Search box IS live in 2A-3 so Typing Mode (`/`, `Esc`, cursor `<-`/`->`, banner) can be verified!
+    // Filter toolbar: live Search box + Weight pills + Folder dropdown.
     ui.horizontal(|ui| {
         ui.label("Search [/]:");
 
@@ -968,7 +1050,7 @@ fn draw_browser_panel(
                     egui::TextEdit::singleline(&mut interact.search_query)
                         .id(search_id)
                         .desired_width(240.0)
-                        .hint_text("Press / to test Typing Mode (filtering in 2A-4)..."),
+                        .hint_text("Type name or folder (e.g. fractal)..."),
                 );
                 if interact.request_focus_search {
                     resp.request_focus();
@@ -981,17 +1063,76 @@ fn draw_browser_panel(
                 interact.search_focused = resp.has_focus();
             });
 
-        ui.add_enabled_ui(false, |ui| {
-            ui.separator();
-            ui.label("Weight:");
-            let _ = ui.button("All");
-            let _ = ui.button("Light");
-            let _ = ui.button("Med");
-            let _ = ui.button("Heavy");
-            ui.separator();
-            ui.label("Folder:");
-            let _ = ui.button("All v (2A-4)");
-        });
+        if !interact.search_query.is_empty() && ui.button("Clear").clicked() {
+            interact.search_query.clear();
+        }
+
+        ui.separator();
+        ui.label(
+            RichText::new("Weight:")
+                .color(TEXT_MUTED)
+                .font(FontId::proportional(14.0)),
+        )
+        .on_hover_text("Filter by estimated CPU/draw load (enabled shape instances; estimate only).");
+
+        for (filter_opt, active_bg, active_fg) in [
+            (WeightFilter::All, ACCENT_DECK_A, Color32::BLACK),
+            (WeightFilter::Light, COLOR_OK, Color32::BLACK),
+            (WeightFilter::Medium, COLOR_WARN, Color32::BLACK),
+            (WeightFilter::Heavy, COLOR_ALERT, Color32::WHITE),
+        ] {
+            let is_active = interact.weight_filter == filter_opt;
+            let btn = if is_active {
+                egui::Button::new(
+                    RichText::new(filter_opt.label())
+                        .strong()
+                        .color(active_fg),
+                )
+                .fill(active_bg)
+            } else {
+                egui::Button::new(filter_opt.label())
+            };
+            if ui.add(btn).clicked() {
+                interact.weight_filter = filter_opt;
+            }
+        }
+
+        ui.separator();
+        ui.label(
+            RichText::new("Folder:")
+                .color(TEXT_MUTED)
+                .font(FontId::proportional(14.0)),
+        );
+        let selected_folder_text = interact
+            .folder_filter
+            .as_deref()
+            .unwrap_or("All Folders");
+        egui::ComboBox::from_id_salt("browser_folder_filter")
+            .selected_text(RichText::new(truncate_chars(selected_folder_text, 24)).strong())
+            .width(190.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(interact.folder_filter.is_none(), "All Folders")
+                    .clicked()
+                {
+                    interact.folder_filter = None;
+                }
+                for folder in state.folders {
+                    let is_sel = interact.folder_filter.as_deref() == Some(folder.as_str());
+                    if ui.selectable_label(is_sel, folder).clicked() {
+                        interact.folder_filter = Some(folder.clone());
+                    }
+                }
+            });
+
+        let has_any_filter = !interact.search_query.is_empty()
+            || interact.weight_filter != WeightFilter::All
+            || interact.folder_filter.is_some();
+        if has_any_filter && ui.button("Reset Filters").clicked() {
+            interact.search_query.clear();
+            interact.weight_filter = WeightFilter::All;
+            interact.folder_filter = None;
+        }
     });
 
     ui.separator();
@@ -999,14 +1140,52 @@ fn draw_browser_panel(
     let scroll_to = interact.scroll_to_selected;
     interact.scroll_to_selected = false;
 
+    if filtered_len == 0 {
+        ui.add_space(16.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new("No presets match the current search / weight / folder filter.")
+                    .font(FontId::proportional(15.5))
+                    .color(TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+            if ui.button("Reset Filters").clicked() {
+                interact.search_query.clear();
+                interact.weight_filter = WeightFilter::All;
+                interact.folder_filter = None;
+            }
+        });
+        return;
+    }
+
+    // Virtualized scroll list (`show_rows`): renders ONLY visible rows (O(1) for 300 or 10,000 presets).
+    let row_height = 34.0;
     ScrollArea::vertical()
+        .id_salt("preset_browser_scroll")
         .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for (idx, row) in presets.iter().enumerate() {
-                let is_selected = idx == interact.selected_preset_idx;
+        .show_rows(ui, row_height, filtered_len, |ui, row_range| {
+            let row_stride = row_height + ui.spacing().item_spacing.y;
+            if scroll_to {
+                let sel = interact.selected_preset_idx.min(filtered_len - 1);
+                let list_top_y = ui.cursor().top() - (row_range.start as f32 * row_stride);
+                let target_y = list_top_y + (sel as f32 * row_stride);
+                let target_rect = Rect::from_min_size(
+                    egui::pos2(ui.cursor().left(), target_y),
+                    Vec2::new(ui.available_width().max(10.0), row_height),
+                );
+                ui.scroll_to_rect(target_rect, None);
+            }
+
+            for vis_idx in row_range {
+                let entry_idx = state.filtered_indices[vis_idx];
+                let row = &state.all_presets[entry_idx];
+                let is_selected = vis_idx == interact.selected_preset_idx;
+                let on_deck_a = row.path == state.deck_a.preset_path;
+                let on_deck_b = row.path == state.deck_b.preset_path;
+
                 let row_bg = if is_selected {
                     Color32::from_rgb(24, 54, 68)
-                } else if idx % 2 == 0 {
+                } else if vis_idx % 2 == 0 {
                     BG_CARD
                 } else {
                     Color32::from_rgb(20, 24, 31)
@@ -1017,64 +1196,139 @@ fn draw_browser_panel(
                     Stroke::NONE
                 };
 
-                let frame_resp = Frame::new()
-                    .fill(row_bg)
-                    .stroke(row_stroke)
-                    .corner_radius(CornerRadius::same(3))
-                    .inner_margin(Margin::symmetric(10, 6))
-                    .show(ui, |ui| {
-                        ui.set_min_height(24.0);
-                        ui.horizontal(|ui| {
-                            let marker = if is_selected { ">" } else { " " };
-                            ui.label(
-                                RichText::new(marker)
-                                    .font(FontId::monospace(15.0))
-                                    .strong()
-                                    .color(ACCENT_DECK_A),
-                            );
-
-                            let (badge_bg, badge_fg) = complexity_colors(row.complexity.tier);
-                            Frame::new()
-                                .fill(badge_bg)
-                                .corner_radius(CornerRadius::same(4))
-                                .inner_margin(Margin::symmetric(6, 2))
-                                .show(ui, |ui| {
+                let row_w = ui.available_width().max(200.0);
+                let frame_resp = ui.allocate_ui_with_layout(
+                    Vec2::new(row_w, row_height),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        Frame::new()
+                            .fill(row_bg)
+                            .stroke(row_stroke)
+                            .corner_radius(CornerRadius::same(3))
+                            .inner_margin(Margin::symmetric(8, 3))
+                            .show(ui, |ui| {
+                                ui.set_min_width((row_w - 18.0).max(160.0));
+                                ui.set_min_height((row_height - 8.0).max(20.0));
+                                ui.horizontal_centered(|ui| {
+                                    let marker = if is_selected { ">" } else { " " };
                                     ui.label(
-                                        RichText::new(format!(
-                                            "{:<6} {:>4}",
-                                            row.complexity.tier.label(),
-                                            row.complexity.enabled_shape_instances
-                                        ))
-                                        .font(FontId::monospace(12.5))
-                                        .strong()
-                                        .color(badge_fg),
+                                        RichText::new(marker)
+                                            .font(FontId::monospace(15.0))
+                                            .strong()
+                                            .color(ACCENT_DECK_A),
                                     );
+
+                                    let (badge_bg, badge_fg) =
+                                        complexity_colors(row.complexity.tier);
+                                    Frame::new()
+                                        .fill(badge_bg)
+                                        .corner_radius(CornerRadius::same(4))
+                                        .inner_margin(Margin::symmetric(6, 1))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{:<6} {:>4}",
+                                                    row.complexity.tier.label(),
+                                                    row.complexity.enabled_shape_instances
+                                                ))
+                                                .font(FontId::monospace(12.0))
+                                                .strong()
+                                                .color(badge_fg),
+                                            )
+                                            .on_hover_text(
+                                                "Estimated CPU/draw load (enabled shape instances; estimate only).",
+                                            );
+                                        });
+
+                                    if on_deck_a {
+                                        Frame::new()
+                                            .fill(ACCENT_DECK_A.gamma_multiply(0.28))
+                                            .stroke(Stroke::new(1.0, ACCENT_DECK_A))
+                                            .corner_radius(CornerRadius::same(3))
+                                            .inner_margin(Margin::symmetric(4, 1))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    RichText::new("A")
+                                                        .font(FontId::monospace(11.5))
+                                                        .strong()
+                                                        .color(ACCENT_DECK_A),
+                                                );
+                                            });
+                                    }
+                                    if on_deck_b {
+                                        Frame::new()
+                                            .fill(ACCENT_DECK_B.gamma_multiply(0.28))
+                                            .stroke(Stroke::new(1.0, ACCENT_DECK_B))
+                                            .corner_radius(CornerRadius::same(3))
+                                            .inner_margin(Margin::symmetric(4, 1))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    RichText::new("B")
+                                                        .font(FontId::monospace(11.5))
+                                                        .strong()
+                                                        .color(ACCENT_DECK_B),
+                                                );
+                                            });
+                                    }
+
+                                    let name_short = truncate_chars(&row.display_name, 56);
+                                    ui.label(
+                                        RichText::new(name_short)
+                                            .font(FontId::proportional(14.5))
+                                            .strong()
+                                            .color(TEXT_PRIMARY),
+                                    )
+                                    .on_hover_text(&row.display_name);
+
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        let key_b = format!("row_load_b_{entry_idx}");
+                                        if guarded_load_button(
+                                            ui,
+                                            "Load B",
+                                            &key_b,
+                                            air_b,
+                                            load_guard,
+                                            "Load preset into Deck B (2-click confirm if ON-AIR/MIXED; Shift+Click = hard cut)",
+                                        ) {
+                                            interact.selected_preset_idx = vis_idx;
+                                            bus.trigger(
+                                                param::DECK_B_LOAD_SELECTED,
+                                                shift_held,
+                                                true,
+                                            );
+                                        }
+
+                                        let key_a = format!("row_load_a_{entry_idx}");
+                                        if guarded_load_button(
+                                            ui,
+                                            "Load A",
+                                            &key_a,
+                                            air_a,
+                                            load_guard,
+                                            "Load preset into Deck A (2-click confirm if ON-AIR/MIXED; Shift+Click = hard cut)",
+                                        ) {
+                                            interact.selected_preset_idx = vis_idx;
+                                            bus.trigger(
+                                                param::DECK_A_LOAD_SELECTED,
+                                                shift_held,
+                                                true,
+                                            );
+                                        }
+
+                                        ui.label(
+                                            RichText::new(truncate_chars(&row.folder, 24))
+                                                .font(FontId::proportional(13.0))
+                                                .color(TEXT_MUTED),
+                                        )
+                                        .on_hover_text(&row.folder);
+                                    });
                                 });
-
-                            ui.label(
-                                RichText::new(&row.name)
-                                    .font(FontId::proportional(15.0))
-                                    .strong()
-                                    .color(TEXT_PRIMARY),
-                            );
-
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.add_enabled(false, egui::Button::new("Load B (2A-4)"));
-                                ui.add_enabled(false, egui::Button::new("Load A (2A-4)"));
-                                ui.label(
-                                    RichText::new(&row.folder)
-                                        .font(FontId::proportional(13.5))
-                                        .color(TEXT_MUTED),
-                                );
                             });
-                        });
-                    });
+                    },
+                );
 
                 if frame_resp.response.interact(egui::Sense::click()).clicked() {
-                    interact.selected_preset_idx = idx;
-                }
-                if is_selected && scroll_to {
-                    frame_resp.response.scroll_to_me(Some(Align::Center));
+                    interact.selected_preset_idx = vis_idx;
                 }
             }
         });

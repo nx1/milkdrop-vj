@@ -31,7 +31,6 @@ mod render_deck;
 mod ui;
 
 use std::ffi::CStr;
-use std::fs;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,7 +50,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use milkdrop_vj::audio::capture_thread::LiveAudioCapture;
@@ -63,7 +62,11 @@ use milkdrop_vj::control::{
 use milkdrop_vj::deck::{
     init_gl_loader_for_projectm, max_pcm_samples_per_channel, projectm_version_string,
 };
-use milkdrop_vj::preset_meta::{estimate_complexity_from_file, PresetComplexity};
+use milkdrop_vj::preset_browser::{
+    discover_immediate_starter_presets, filter_preset_indices, PresetEntry, PresetScannerHandle,
+    ScanStatus, ScanUpdate, WeightFilter,
+};
+use milkdrop_vj::preset_meta::PresetComplexity;
 use milkdrop_vj::test_audio::TestAudioGenerator;
 
 use crate::egui_renderer::EguiGlRenderer;
@@ -73,7 +76,7 @@ use crate::mixer::{step_blackout_alpha, BlendMode, DeckAirState, GpuMixer};
 use crate::render_deck::RenderDeck;
 use crate::ui::{
     apply_dark_venue_style, draw_console_ui, AudioBadgeState, ConsoleUiState, DeckUiSnapshot,
-    LastLoadSummary, LoadGuardState, StarterPresetRow, UiInteractionState,
+    LastLoadSummary, LoadGuardState, UiInteractionState,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,15 +94,6 @@ struct CliConfig {
     measure_gpu: bool,
     auto_exit_secs: Option<f64>,
     log_path: PathBuf,
-}
-
-/// Metadata cached at startup for each starter `.milk` preset in `C:\dev\vj\presets\`.
-#[derive(Clone, Debug)]
-struct PresetEntry {
-    path: PathBuf,
-    display_name: String,
-    folder: String,
-    complexity: PresetComplexity,
 }
 
 /// Tracks the preset-load frame (`+0`) and the next two frames (`+1`, `+2`) for Risk 8 logging.
@@ -157,12 +151,19 @@ struct ConsoleState {
     silence_pcm_buf: Vec<f32>,
     device_lost_logged: bool,
 
-    // Presets
+    // Preset Library (background scanner + disk cache + live filtered view)
+    presets_root: PathBuf,
+    preset_cache_path: PathBuf,
     presets: Vec<PresetEntry>,
-    starter_rows: Vec<StarterPresetRow>,
+    folders: Vec<String>,
+    filtered_indices: Vec<usize>,
+    last_filter_sig: (String, WeightFilter, Option<String>, usize),
+    library_revision: usize,
+    scanner: Option<PresetScannerHandle>,
+    scan_status: ScanStatus,
     bad_shader_path: PathBuf,
-    deck_a_idx: usize,
-    deck_b_idx: usize,
+    deck_a_current: PresetEntry,
+    deck_b_current: PresetEntry,
     deck_a_override_name: Option<String>,
     last_load: Option<LastLoadSummary>,
     pending_stall_traces: Vec<PendingStallTrace>,
@@ -191,7 +192,9 @@ struct ConsoleState {
 impl ConsoleState {
     fn initialize(event_loop: &ActiveEventLoop, config: CliConfig) -> Result<Self, String> {
         let mut logger = GlErrorLogger::open(&config.log_path)?;
-        logger.log_info("Stage 2A-3: Remappable Keyboard Mapping via Control Bus + Focus Model + Keys Modal");
+        logger.log_info(
+            "Stage 2A-4: Preset Browser (Background Scanner + Disk Cache + Live Filters + Load Safety) & UK ISO Backslash Fix",
+        );
         logger.log_info(&format!(
             "Deck render resolution: {}x{} (default 1280x720 per Light-Load Rules) | measure_gpu={}",
             config.deck_width, config.deck_height, config.measure_gpu
@@ -215,22 +218,35 @@ impl ConsoleState {
         logger.log_info(&mappings_status);
         let bus = ControlBus::new(mappings_cfg);
 
-        // 2. Discover starter presets in `presets\` and compute calibrated static complexity.
-        let presets = discover_starter_presets(Path::new("presets"))?;
-        let starter_rows: Vec<StarterPresetRow> = presets
-            .iter()
-            .map(|p| StarterPresetRow {
-                name: p.display_name.clone(),
-                folder: p.folder.clone(),
-                complexity: p.complexity,
-            })
-            .collect();
-        let bad_shader_path = PathBuf::from("presets").join("_bad_shader_test.milk");
-        logger.log_info(&format!("Loaded {} starter presets from presets\\", presets.len()));
+        // 2. Discover immediate top-level starter presets for instant boot, then start the
+        //    non-blocking background scanner for the full `presets\` tree + `preset_cache.json`.
+        let presets_root = PathBuf::from("presets");
+        let preset_cache_path = PathBuf::from("preset_cache.json");
+        let presets = discover_immediate_starter_presets(&presets_root)?;
+        let folders = vec!["Starter".to_string()];
+        let filtered_indices: Vec<usize> = (0..presets.len()).collect();
+        let bad_shader_path = presets_root.join("_bad_shader_test.milk");
+        logger.log_info(&format!(
+            "Bootstrapped {} starter presets immediately; spawning background preset-scanner thread...",
+            presets.len()
+        ));
+        let scanner = Some(PresetScannerHandle::spawn(
+            presets_root.clone(),
+            preset_cache_path.clone(),
+        ));
+        let scan_status = ScanStatus {
+            scanning: true,
+            scanned: 0,
+            total: 0,
+            cache_hits: 0,
+            parsed: 0,
+            elapsed_ms: 0.0,
+            last_error: None,
+        };
 
         // 3. Create the main winit window with minimum 1280x720 pt logical size (Section 13).
         let window_attrs = Window::default_attributes()
-            .with_title("MilkDrop VJ — Stage 2A-3 Remappable Keyboard & Console (1280x720 decks)")
+            .with_title("MilkDrop VJ — Stage 2A-4 Preset Browser & Console (1280x720 decks)")
             .with_inner_size(LogicalSize::new(1440.0, 860.0))
             .with_min_inner_size(LogicalSize::new(1280.0, 720.0));
 
@@ -348,10 +364,10 @@ impl ConsoleState {
             &mut logger,
         )?;
 
-        let deck_a_idx = 0usize;
-        let deck_b_idx = 1usize.min(presets.len().saturating_sub(1));
-        deck_a.load_preset(&presets[deck_a_idx].path, false)?;
-        deck_b.load_preset(&presets[deck_b_idx].path, false)?;
+        let deck_a_current = presets[0].clone();
+        let deck_b_current = presets[1usize.min(presets.len().saturating_sub(1))].clone();
+        deck_a.load_preset(&deck_a_current.path, false)?;
+        deck_b.load_preset(&deck_b_current.path, false)?;
 
         // 7. Re-bind main window context and initialize `egui 0.37` + zero-reallocation GL renderer.
         main_context
@@ -465,11 +481,18 @@ impl ConsoleState {
             synth_pcm_buf: vec![0.0_f32; 800 * 2],
             silence_pcm_buf: vec![0.0_f32; 800 * 2],
             device_lost_logged: false,
+            presets_root,
+            preset_cache_path,
             presets,
-            starter_rows,
+            folders,
+            filtered_indices,
+            last_filter_sig: (String::new(), WeightFilter::All, None, 0),
+            library_revision: 0,
+            scanner,
+            scan_status,
             bad_shader_path,
-            deck_a_idx,
-            deck_b_idx,
+            deck_a_current,
+            deck_b_current,
             deck_a_override_name: None,
             last_load: None,
             pending_stall_traces: Vec::new(),
@@ -494,7 +517,162 @@ impl ConsoleState {
         })
     }
 
-    /// Executes any queued Control Bus triggers (preset switching, keyboard loads, test-blank).
+    /// Polls the background preset-scanner thread without ever blocking the render loop.
+    fn poll_preset_scanner(&mut self) {
+        if self.interact.request_rescan && self.scanner.is_none() {
+            self.interact.request_rescan = false;
+            self.scanner = Some(PresetScannerHandle::spawn(
+                self.presets_root.clone(),
+                self.preset_cache_path.clone(),
+            ));
+            self.scan_status.scanning = true;
+            self.scan_status.scanned = 0;
+            self.scan_status.total = 0;
+            self.scan_status.last_error = None;
+            self.logger
+                .log_info("[SCAN] User triggered background preset library rescan...");
+        }
+
+        let Some(handle) = self.scanner.as_ref() else {
+            return;
+        };
+        let updates = handle.poll_updates();
+        let mut finished = false;
+
+        for update in updates {
+            match update {
+                ScanUpdate::Progress {
+                    scanned,
+                    total,
+                    cache_hits,
+                    parsed,
+                } => {
+                    self.scan_status.scanning = true;
+                    self.scan_status.scanned = scanned;
+                    self.scan_status.total = total;
+                    self.scan_status.cache_hits = cache_hits;
+                    self.scan_status.parsed = parsed;
+                }
+                ScanUpdate::Finished(report) => {
+                    finished = true;
+                    if !report.entries.is_empty() {
+                        self.presets = report.entries;
+                        self.folders = report.folders;
+                        // Clear folder filter if the selected folder disappeared after a rescan.
+                        if let Some(ref f) = self.interact.folder_filter {
+                            if !self.folders.iter().any(|x| x == f) {
+                                self.interact.folder_filter = None;
+                            }
+                        }
+                        self.library_revision = self.library_revision.wrapping_add(1);
+                    }
+                    self.scan_status = ScanStatus {
+                        scanning: false,
+                        scanned: report.total,
+                        total: report.total,
+                        cache_hits: report.cache_hits,
+                        parsed: report.parsed,
+                        elapsed_ms: report.elapsed_ms,
+                        last_error: report.error.clone(),
+                    };
+                    let msg = format!(
+                        "[SCAN] Complete (provisional, laptop-limited): total={} | folders={} | cache_hits={} | parsed={} | elapsed={:.2} ms | cache_saved={}",
+                        report.total,
+                        self.folders.len(),
+                        report.cache_hits,
+                        report.parsed,
+                        report.elapsed_ms,
+                        report.cache_saved
+                    );
+                    println!("{msg}");
+                    self.logger.log_info(&msg);
+                    if let Some(err) = report.error {
+                        self.logger.log_info(&format!("[SCAN-ERROR] {err}"));
+                        self.interact
+                            .show_toast(format!("Preset scan warning: {err}"));
+                    }
+                }
+            }
+        }
+
+        if finished {
+            self.scanner = None;
+        }
+    }
+
+    /// Recomputes `filtered_indices` ONLY when search text, Weight, Folder, or library changes.
+    fn refresh_filtered_presets_if_needed(&mut self) {
+        let sig = (
+            self.interact.search_query.clone(),
+            self.interact.weight_filter,
+            self.interact.folder_filter.clone(),
+            self.library_revision,
+        );
+        if sig == self.last_filter_sig {
+            return;
+        }
+        self.last_filter_sig = sig;
+        self.filtered_indices = filter_preset_indices(
+            &self.presets,
+            &self.interact.search_query,
+            self.interact.weight_filter,
+            self.interact.folder_filter.as_deref(),
+        );
+        if self.filtered_indices.is_empty() {
+            self.interact.selected_preset_idx = 0;
+        } else if self.interact.selected_preset_idx >= self.filtered_indices.len() {
+            self.interact.selected_preset_idx = self.filtered_indices.len() - 1;
+        }
+    }
+
+    /// Computes the next or previous entry index for `< Prev` / `Next >`, stepping through the
+    /// currently filtered list (or falling back to the full list if the filter matches 0 rows).
+    fn step_deck_in_filtered_list(&self, current_path: &Path, forward: bool) -> Option<usize> {
+        if !self.filtered_indices.is_empty() {
+            let len = self.filtered_indices.len();
+            if let Some(pos) = self
+                .filtered_indices
+                .iter()
+                .position(|&entry_idx| self.presets[entry_idx].path == current_path)
+            {
+                let next_pos = if forward {
+                    (pos + 1) % len
+                } else if pos == 0 {
+                    len - 1
+                } else {
+                    pos - 1
+                };
+                return Some(self.filtered_indices[next_pos]);
+            }
+            // Current deck preset is outside the active filter: jump into the filtered list cleanly.
+            return Some(if forward {
+                self.filtered_indices[0]
+            } else {
+                self.filtered_indices[len - 1]
+            });
+        }
+
+        // Fallback if the active filter has 0 matches: step across the full library.
+        if self.presets.is_empty() {
+            return None;
+        }
+        let len = self.presets.len();
+        let pos = self
+            .presets
+            .iter()
+            .position(|p| p.path == current_path)
+            .unwrap_or(0);
+        let next_pos = if forward {
+            (pos + 1) % len
+        } else if pos == 0 {
+            len - 1
+        } else {
+            pos - 1
+        };
+        Some(next_pos)
+    }
+
+    /// Executes any queued Control Bus triggers (preset switching, keyboard/mouse loads, test-blank).
     fn process_bus_triggers(&mut self) {
         if self.interact.request_reset_defaults {
             self.interact.request_reset_defaults = false;
@@ -520,45 +698,58 @@ impl ConsoleState {
         let xfade = self.bus.get(param::MIXER_CROSSFADER);
         let air_a = DeckAirState::from_weight(1.0 - xfade);
         let air_b = DeckAirState::from_weight(xfade);
-        let sel_idx = self
-            .interact
-            .selected_preset_idx
-            .min(self.presets.len().saturating_sub(1));
+        let selected_entry_idx = self
+            .filtered_indices
+            .get(self.interact.selected_preset_idx)
+            .copied();
 
         for trig in triggers {
             match trig.target.as_str() {
                 param::DECK_A_PREV_PRESET => {
-                    let next = if self.deck_a_idx == 0 {
-                        self.presets.len().saturating_sub(1)
-                    } else {
-                        self.deck_a_idx - 1
-                    };
-                    let smooth = !trig.hard_cut && self.bus.get_bool(param::DECK_A_TRANSITION_SMOOTH);
-                    self.load_deck_preset(true, next, smooth);
+                    if let Some(next_idx) =
+                        self.step_deck_in_filtered_list(&self.deck_a_current.path, false)
+                    {
+                        let smooth =
+                            !trig.hard_cut && self.bus.get_bool(param::DECK_A_TRANSITION_SMOOTH);
+                        self.load_deck_preset(true, next_idx, smooth);
+                    }
                 }
                 param::DECK_A_NEXT_PRESET => {
-                    let next = (self.deck_a_idx + 1) % self.presets.len().max(1);
-                    let smooth = !trig.hard_cut && self.bus.get_bool(param::DECK_A_TRANSITION_SMOOTH);
-                    self.load_deck_preset(true, next, smooth);
+                    if let Some(next_idx) =
+                        self.step_deck_in_filtered_list(&self.deck_a_current.path, true)
+                    {
+                        let smooth =
+                            !trig.hard_cut && self.bus.get_bool(param::DECK_A_TRANSITION_SMOOTH);
+                        self.load_deck_preset(true, next_idx, smooth);
+                    }
                 }
                 param::DECK_B_PREV_PRESET => {
-                    let next = if self.deck_b_idx == 0 {
-                        self.presets.len().saturating_sub(1)
-                    } else {
-                        self.deck_b_idx - 1
-                    };
-                    let smooth = !trig.hard_cut && self.bus.get_bool(param::DECK_B_TRANSITION_SMOOTH);
-                    self.load_deck_preset(false, next, smooth);
+                    if let Some(next_idx) =
+                        self.step_deck_in_filtered_list(&self.deck_b_current.path, false)
+                    {
+                        let smooth =
+                            !trig.hard_cut && self.bus.get_bool(param::DECK_B_TRANSITION_SMOOTH);
+                        self.load_deck_preset(false, next_idx, smooth);
+                    }
                 }
                 param::DECK_B_NEXT_PRESET => {
-                    let next = (self.deck_b_idx + 1) % self.presets.len().max(1);
-                    let smooth = !trig.hard_cut && self.bus.get_bool(param::DECK_B_TRANSITION_SMOOTH);
-                    self.load_deck_preset(false, next, smooth);
+                    if let Some(next_idx) =
+                        self.step_deck_in_filtered_list(&self.deck_b_current.path, true)
+                    {
+                        let smooth =
+                            !trig.hard_cut && self.bus.get_bool(param::DECK_B_TRANSITION_SMOOTH);
+                        self.load_deck_preset(false, next_idx, smooth);
+                    }
                 }
                 param::DECK_A_TEST_BLANK => {
                     self.load_bad_shader_on_deck_a();
                 }
                 param::BROWSER_LOAD_OFF_AIR => {
+                    let Some(sel_idx) = selected_entry_idx else {
+                        self.interact
+                            .show_toast("No presets match the current filter — press Esc to clear");
+                        continue;
+                    };
                     // Section 13.3 Load Safety: `Enter` loads only into a `CUE` deck (<= 5% weight).
                     if !air_b.is_protected() {
                         let smooth =
@@ -575,6 +766,11 @@ impl ConsoleState {
                     }
                 }
                 param::DECK_A_LOAD_SELECTED => {
+                    let Some(sel_idx) = selected_entry_idx else {
+                        self.interact
+                            .show_toast("No presets match the current filter — press Esc to clear");
+                        continue;
+                    };
                     if air_a.is_protected() && !trig.force_on_air {
                         self.interact.show_toast(
                             "Deck A is ON-AIR/MIXED — press Ctrl+A to force load",
@@ -586,6 +782,11 @@ impl ConsoleState {
                     }
                 }
                 param::DECK_B_LOAD_SELECTED => {
+                    let Some(sel_idx) = selected_entry_idx else {
+                        self.interact
+                            .show_toast("No presets match the current filter — press Esc to clear");
+                        continue;
+                    };
                     if air_b.is_protected() && !trig.force_on_air {
                         self.interact.show_toast(
                             "Deck B is ON-AIR/MIXED — press Ctrl+B to force load",
@@ -624,7 +825,7 @@ impl ConsoleState {
                     self.interact.remap_feedback = Some("Remap cancelled.".to_string());
                     return true;
                 }
-                if let Some(key_name) = keycode_to_mapping_name(code) {
+                if let Some(key_name) = keycode_to_mapping_name(code, &event.logical_key) {
                     let mods = normalize_modifiers(shift, ctrl, alt);
                     let conflict = self.bus.mappings.remap_keyboard(idx, key_name, mods);
                     let badge = self
@@ -726,7 +927,7 @@ impl ConsoleState {
             }
         }
 
-        let Some(key_name) = keycode_to_mapping_name(code) else {
+        let Some(key_name) = keycode_to_mapping_name(code, &event.logical_key) else {
             return false;
         };
 
@@ -764,7 +965,7 @@ impl ConsoleState {
     }
 
     fn step_browser_selection(&mut self, delta: isize) {
-        let len = self.presets.len();
+        let len = self.filtered_indices.len();
         if len == 0 {
             return;
         }
@@ -790,10 +991,10 @@ impl ConsoleState {
         match result {
             Ok(()) => {
                 if is_deck_a {
-                    self.deck_a_idx = idx;
+                    self.deck_a_current = entry.clone();
                     self.deck_a_override_name = None;
                 } else {
-                    self.deck_b_idx = idx;
+                    self.deck_b_current = entry.clone();
                 }
                 self.last_load = Some(LastLoadSummary {
                     deck_label: deck_label.to_string(),
@@ -872,6 +1073,10 @@ impl ConsoleState {
             self.timing_frame_dt.record_ms(frame_dt_ms);
         }
         self.frame_count += 1;
+
+        // 0. Poll non-blocking background preset scanner and refresh filtered view if needed.
+        self.poll_preset_scanner();
+        self.refresh_filtered_presets_if_needed();
 
         // 1. Execute any Control Bus triggers queued on the previous UI frame.
         self.process_bus_triggers();
@@ -1004,12 +1209,17 @@ impl ConsoleState {
             self.main_gl.clear(glow::COLOR_BUFFER_BIT);
         }
 
-        let deck_a_entry = &self.presets[self.deck_a_idx];
-        let deck_b_entry = &self.presets[self.deck_b_idx];
+        let deck_a_entry = &self.deck_a_current;
+        let deck_b_entry = &self.deck_b_current;
         let deck_a_name = self
             .deck_a_override_name
             .as_deref()
             .unwrap_or(&deck_a_entry.display_name);
+        let deck_a_path: &Path = if self.deck_a_override_name.is_some() {
+            &self.bad_shader_path
+        } else {
+            &deck_a_entry.path
+        };
         let deck_a_comp = if self.deck_a_override_name.is_some() {
             PresetComplexity {
                 enabled_shape_instances: 0,
@@ -1044,6 +1254,7 @@ impl ConsoleState {
             deck_a: DeckUiSnapshot {
                 texture_id: self.deck_a_tex_id,
                 preset_name: deck_a_name,
+                preset_path: deck_a_path,
                 complexity: deck_a_comp,
                 render_ms_avg: self.deck_a_ms_ema,
                 blank: self.deck_a.blank_status(),
@@ -1051,11 +1262,15 @@ impl ConsoleState {
             deck_b: DeckUiSnapshot {
                 texture_id: self.deck_b_tex_id,
                 preset_name: &deck_b_entry.display_name,
+                preset_path: &deck_b_entry.path,
                 complexity: deck_b_entry.complexity,
                 render_ms_avg: self.deck_b_ms_ema,
                 blank: self.deck_b.blank_status(),
             },
-            starter_presets: &self.starter_rows,
+            all_presets: &self.presets,
+            filtered_indices: &self.filtered_indices,
+            folders: &self.folders,
+            scan_status: &self.scan_status,
         };
 
         let bus_ref = &mut self.bus;
@@ -1210,7 +1425,7 @@ impl ConsoleState {
         };
         let end_mem = current_process_memory_mb();
 
-        self.logger.log_info("=== Stage 2A-3 Shutdown Summary (provisional, laptop-limited) ===");
+        self.logger.log_info("=== Stage 2A-4 Shutdown Summary (provisional, laptop-limited) ===");
         self.logger.log_info(&format!(
             "Elapsed: {:.2}s | Frames: {} | Avg FPS: {:.2} | Total GL errors: {}",
             elapsed,
@@ -1264,9 +1479,10 @@ impl ConsoleState {
         self.live_capture.take();
 
         println!(
-            "Stage 2A-3 closed cleanly. Frames={}, Avg FPS={:.2}, BlankPBO avg={:.1} us, GL errors={}, log={}",
+            "Stage 2A-4 closed cleanly. Frames={}, Avg FPS={:.2}, Presets={}, BlankPBO avg={:.1} us, GL errors={}, log={}",
             self.frame_count,
             avg_fps,
+            self.presets.len(),
             self.blank_check_stats.avg_ms() * 1000.0,
             self.logger.total_errors(),
             self.logger.path().display()
@@ -1358,55 +1574,6 @@ impl ApplicationHandler for App {
     }
 }
 
-fn discover_starter_presets(dir: &Path) -> Result<Vec<PresetEntry>, String> {
-    let entries = fs::read_dir(dir)
-        .map_err(|e| format!("Failed to read presets folder {}: {e}", dir.display()))?;
-    let mut paths: Vec<PathBuf> = entries
-        .filter_map(|res| res.ok().map(|e| e.path()))
-        .filter(|p| {
-            let is_milk = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("milk"))
-                .unwrap_or(false);
-            let is_hidden_test = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with('_'))
-                .unwrap_or(false);
-            is_milk && !is_hidden_test
-        })
-        .collect();
-    paths.sort();
-
-    if paths.is_empty() {
-        return Err(format!("No .milk presets found in {}", dir.display()));
-    }
-
-    Ok(paths
-        .into_iter()
-        .map(|path| {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("<unnamed>")
-                .to_string();
-            let folder = stem
-                .split('_')
-                .nth(1)
-                .unwrap_or("Starter")
-                .to_string();
-            let complexity = estimate_complexity_from_file(&path);
-            PresetEntry {
-                path,
-                display_name: stem,
-                folder,
-                complexity,
-            }
-        })
-        .collect())
-}
-
 fn resolve_device_filter(filter: Option<&str>) -> Result<Option<String>, String> {
     let Some(f) = filter else {
         return Ok(None);
@@ -1427,7 +1594,7 @@ fn resolve_device_filter(filter: Option<&str>) -> Result<Option<String>, String>
     Err(format!("No active Windows output device matched `--audio-device {f}`"))
 }
 
-fn keycode_to_mapping_name(code: KeyCode) -> Option<String> {
+fn keycode_to_mapping_name(code: KeyCode, logical_key: &Key) -> Option<String> {
     let s = match code {
         KeyCode::KeyA => "A",
         KeyCode::KeyB => "B",
@@ -1465,6 +1632,16 @@ fn keycode_to_mapping_name(code: KeyCode) -> Option<String> {
         KeyCode::Digit7 => "7",
         KeyCode::Digit8 => "8",
         KeyCode::Digit9 => "9",
+        KeyCode::Numpad0 => "Numpad0",
+        KeyCode::Numpad1 => "Numpad1",
+        KeyCode::Numpad2 => "Numpad2",
+        KeyCode::Numpad3 => "Numpad3",
+        KeyCode::Numpad4 => "Numpad4",
+        KeyCode::Numpad5 => "Numpad5",
+        KeyCode::Numpad6 => "Numpad6",
+        KeyCode::Numpad7 => "Numpad7",
+        KeyCode::Numpad8 => "Numpad8",
+        KeyCode::Numpad9 => "Numpad9",
         KeyCode::F1 => "F1",
         KeyCode::F2 => "F2",
         KeyCode::F3 => "F3",
@@ -1479,12 +1656,28 @@ fn keycode_to_mapping_name(code: KeyCode) -> Option<String> {
         KeyCode::F12 => "F12",
         KeyCode::BracketLeft => "BracketLeft",
         KeyCode::BracketRight => "BracketRight",
-        KeyCode::Backslash => "Backslash",
+        // UK / European ISO keyboards place `\` between Left Shift and `Z` (`IntlBackslash`),
+        // while the physical key next to Enter (`Backslash` on US ANSI) produces `#` / `~`.
+        KeyCode::IntlBackslash => "Backslash",
+        KeyCode::Backslash => {
+            if matches!(logical_key, Key::Character(c) if c.as_str() == "#" || c.as_str() == "~") {
+                "Hash"
+            } else {
+                "Backslash"
+            }
+        }
+        KeyCode::Backquote => "Backquote",
         KeyCode::ArrowLeft => "ArrowLeft",
         KeyCode::ArrowRight => "ArrowRight",
         KeyCode::ArrowUp => "ArrowUp",
         KeyCode::ArrowDown => "ArrowDown",
         KeyCode::Backspace => "Backspace",
+        KeyCode::Delete => "Delete",
+        KeyCode::Insert => "Insert",
+        KeyCode::Home => "Home",
+        KeyCode::End => "End",
+        KeyCode::PageUp => "PageUp",
+        KeyCode::PageDown => "PageDown",
         KeyCode::Enter | KeyCode::NumpadEnter => "Enter",
         KeyCode::Space => "Space",
         KeyCode::Tab => "Tab",
@@ -1516,7 +1709,7 @@ fn parse_cli_args() -> Result<CliConfig, String> {
         deck_height: 720,
         measure_gpu: false,
         auto_exit_secs: None,
-        log_path: PathBuf::from("logs").join("stage_2a3.log"),
+        log_path: PathBuf::from("logs").join("stage_2a4.log"),
     };
 
     let mut args = std::env::args().skip(1);

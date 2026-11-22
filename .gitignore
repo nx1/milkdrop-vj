@@ -3,4 +3,5 @@
 /logs
 /presets
 /mappings.json
+/preset_cache.json
 *.pdb
