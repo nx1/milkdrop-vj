@@ -166,6 +166,7 @@ impl Deck {
     }
 
     /// Updates the rendering size (in pixels) for this deck.
+    #[allow(dead_code)]
     pub fn resize(&self, width: usize, height: usize) {
         unsafe {
             ffi::projectm_set_window_size(self.handle, width, height);
@@ -243,5 +244,18 @@ impl Drop for Deck {
             );
             ffi::projectm_destroy(self.handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies that `cargo test` (running from `target/<profile>/deps/`) can load
+    /// `projectM-4.dll` via `cargo:rustc-link-search=native=<vcpkg_bin>` and read
+    /// the runtime version string.
+    #[test]
+    fn runtime_version_is_4_1_8() {
+        assert_eq!(projectm_version_string(), "4.1.8");
     }
 }

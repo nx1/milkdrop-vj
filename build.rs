@@ -49,7 +49,10 @@ fn main() {
     // 1. Tell the linker where `projectM-4.lib` and `glew32.lib` live and link both dynamically.
     //    On Windows, `libprojectM` uses `glew32.dll` for its OpenGL calls and requires
     //    the host app to call `glewInit()` once after creating an OpenGL context.
+    //    We also emit `bin_dir` as a native link search path so `cargo test` (which runs
+    //    from `target/<profile>/deps/`) can find `projectM-4.dll` and `glew32.dll` on PATH.
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rustc-link-search=native={}", bin_dir.display());
     println!("cargo:rustc-link-lib=dylib=projectM-4");
     println!("cargo:rustc-link-lib=dylib=glew32");
 
