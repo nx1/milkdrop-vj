@@ -1,32 +1,22 @@
 //! Stage 3 of the Two-Instance Spike: Two Independent `libprojectM 4.1.8` Decks
-//! Side by Side at 1920x1080 Internal Resolution per Deck (Pattern 1).
+//! Side by Side (Pattern 1) with Diagnostic Benchmarks and Active Soak Runner.
 //!
-//! Why ALL rendering stays strictly on ONE thread (the main thread):
-//! - OpenGL is a thread-local state machine: an OpenGL context can only be current
-//!   on one thread at a time. Moving contexts across threads or sharing textures
-//!   without explicit fences easily causes driver stalls, black frames, or crashes.
-//! - `libprojectM` is not designed for concurrent cross-thread calls, and on Windows
-//!   it shares global `glew32.dll` state.
-//! - Switching between Deck A's shared context, Deck B's shared context, and the main
-//!   window context sequentially on ONE thread is simple, deterministic, and easily
-//!   fast enough for 60 FPS at 1080p x 2 on the Quadro RTX 3000.
-//!
-//! Modes:
-//! - Interactive mode (default):
-//!     `.\target\release\milkdrop-vj.exe`
-//!     Keys:
-//!       `1`        = Test 1 (Independence: Deck A = test audio, Deck B = silence)
-//!       `2`        = Both decks = test audio
-//!       `A` / `B`  = Toggle Deck A / Deck B audio individually
-//!       `S`        = Test 2 (No bleed: swap presets between Deck A and Deck B)
-//!       `E`        = Test 3 (Bad preset: load deliberately corrupt preset onto Deck A)
-//!       `P`        = Capture PNGs of Deck A & Deck B to `docs/spike/deck_a.png` & `deck_b.png`
-//!       `Left/Right` = Cycle Deck A preset
-//!       `Up/Down`    = Cycle Deck B preset
-//!       `Esc` / `X`  = Clean exit with full report
-//!
-//! - Automated soak mode (runs Tests 1, 2, 3, PNG capture, and timed stability test):
-//!     `.\target\release\milkdrop-vj.exe --soak-minutes 10`
+//! Supported command-line options:
+//! - Default (no flags): Interactive side-by-side mode (`1920x1080` per deck)
+//! - `--deck-size WxH`          Set internal render resolution per deck (default `1920x1080`,
+//!                              for example `--deck-size 1280x720`)
+//! - `--measure-gpu`            Diagnostic mode ONLY: calls `glFinish()` per deck so timers
+//!                              report true render cost without VSync wait mixed in
+//! - `--bad-preset-test`        Runs 3 bad-preset cases on Deck A (missing file, empty file,
+//!                              broken `shader_body`) while Deck B runs at 60 FPS (~15s)
+//! - `--preset-load-bench`      Measures cold and warm load + first-frame compile time (ms)
+//!                              for all 10 presets in `presets/` (~10s)
+//! - `--heavy-test-seconds N`   Loads `08_Reaction` (Deck A) and `09_Drawing` (Deck B) at once,
+//!                              reports first 5s warmup separately from N seconds steady state
+//! - `--soak-minutes N`         Active soak: swaps a preset every 10s (alternating decks,
+//!                              including heavy and bad presets), logs RAM + FPS min/avg/max
+//!                              + `nvidia-smi` GPU telemetry every 30s, reports frames < 55 FPS
+//! - `--log <path>`             Write log output to a specific file path
 
 mod compositor;
 mod deck;
@@ -64,25 +54,78 @@ use crate::deck::{
     init_gl_loader_for_projectm, max_pcm_samples_per_channel, projectm_version_string,
 };
 use crate::gl_log::GlErrorLogger;
-use crate::metrics::{current_process_memory_mb, MemorySnapshotMb, TimingStats};
+use crate::metrics::{
+    current_process_memory_mb, FpsBucketTracker, GpuTelemetry, GpuTelemetryMonitor,
+    MemorySnapshotMb, TimingStats,
+};
 use crate::render_deck::RenderDeck;
 use crate::test_audio::TestAudioGenerator;
 
-/// Internal rendering resolution per deck (1920x1080 = Full HD for BOTH decks).
-const DECK_WIDTH: u32 = 1920;
-const DECK_HEIGHT: u32 = 1080;
+/// Threshold for counting slow frames: 1 / 55 FPS = 18.1818 ms.
+const FRAME_BELOW_55_FPS_MS: f64 = 1000.0 / 55.0;
 
-/// Automated soak-test phases when `--soak-minutes N` is passed.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SoakPhase {
-    Off,
-    Independence,
-    Swapped,
-    BadPreset,
-    SteadySoak,
+#[derive(Clone, Debug)]
+enum RunMode {
+    Interactive,
+    BadPresetTest,
+    PresetLoadBench,
+    HeavyTest { steady_secs: u64 },
+    ActiveSoak { minutes: f64 },
+}
+
+#[derive(Clone, Debug)]
+struct CliConfig {
+    mode: RunMode,
+    deck_width: u32,
+    deck_height: u32,
+    measure_gpu: bool,
+    log_path: PathBuf,
+}
+
+/// Tracks the 3 sequential cases inside `--bad-preset-test`.
+struct BadPresetRunner {
+    step: usize, // 0=baseline(3s), 1=missing(4s), 2=empty(4s), 3=broken_shader(4s), 4=done
+    step_start: Instant,
+    step_frames: u64,
+}
+
+/// Tracks steady-state vs. warmup inside `--heavy-test-seconds`.
+struct HeavyTestRunner {
+    warmup_done: bool,
+    warmup_frames: u64,
+    warmup_start: Instant,
+    warmup_worst_ms: f64,
+    steady_start: Option<Instant>,
+    steady_frames: u64,
+    steady_below_55: u64,
+    steady_timing_a: TimingStats,
+    steady_timing_b: TimingStats,
+    steady_timing_total: TimingStats,
+    steady_fps_buckets: FpsBucketTracker,
+    last_bucket_time: Instant,
+    last_bucket_frames: u64,
+}
+
+/// Tracks active preset rotation and 30-second telemetry inside `--soak-minutes`.
+struct ActiveSoakRunner {
+    target_duration: Duration,
+    last_switch_time: Instant,
+    switch_count: usize,
+    next_preset_cursor: usize,
+    last_telemetry_time: Instant,
+    last_1s_time: Instant,
+    last_1s_frames: u64,
+    fps_window_30s: FpsBucketTracker,
+    fps_all_1s: FpsBucketTracker,
+    frames_below_55: u64,
+    min_gpu_clock: Option<u32>,
+    max_gpu_clock: Option<u32>,
+    max_gpu_temp: Option<u32>,
+    gpu_monitor: GpuTelemetryMonitor,
 }
 
 struct Stage3State {
+    config: CliConfig,
     deck_a: RenderDeck,
     deck_b: RenderDeck,
     compositor: SideBySideCompositor,
@@ -91,7 +134,6 @@ struct Stage3State {
     main_context: PossiblyCurrentContext,
     main_gl: glow::Context,
 
-    // Independent audio generators so Deck A and Deck B never share audio state.
     audio_a: TestAudioGenerator,
     audio_b: TestAudioGenerator,
     pcm_a: Vec<f32>,
@@ -99,63 +141,63 @@ struct Stage3State {
     deck_a_audio: bool,
     deck_b_audio: bool,
 
-    // Presets and bad-preset file path.
     presets: Vec<PathBuf>,
-    bad_preset_path: PathBuf,
+    bad_missing_path: PathBuf,
+    bad_empty_path: PathBuf,
+    bad_shader_path: PathBuf,
     deck_a_preset_idx: usize,
     deck_b_preset_idx: usize,
 
-    // Timing, FPS, and memory tracking.
     start_time: Instant,
+    last_frame_instant: Instant,
     last_report_time: Instant,
     last_report_frames: u64,
     frame_count: u64,
     timing_a: TimingStats,
     timing_b: TimingStats,
     timing_total: TimingStats,
+    frames_below_55: u64,
     start_memory: Option<MemorySnapshotMb>,
 
-    // Optional automated soak-test configuration.
-    soak_duration: Option<Duration>,
-    soak_phase: SoakPhase,
-    png_captured: bool,
+    bad_runner: Option<BadPresetRunner>,
+    heavy_runner: Option<HeavyTestRunner>,
+    soak_runner: Option<ActiveSoakRunner>,
+    load_bench_done: bool,
 }
 
 struct Stage3App {
     state: Option<Stage3State>,
     logger: GlErrorLogger,
     presets: Vec<PathBuf>,
-    bad_preset_path: PathBuf,
-    soak_duration: Option<Duration>,
+    config: CliConfig,
 }
 
 impl Stage3App {
-    fn new(
-        logger: GlErrorLogger,
-        presets: Vec<PathBuf>,
-        bad_preset_path: PathBuf,
-        soak_duration: Option<Duration>,
-    ) -> Self {
+    fn new(logger: GlErrorLogger, presets: Vec<PathBuf>, config: CliConfig) -> Self {
         Self {
             state: None,
             logger,
             presets,
-            bad_preset_path,
-            soak_duration,
+            config,
         }
     }
 
     fn init_all(&mut self, event_loop: &ActiveEventLoop) {
-        let title = if let Some(dur) = self.soak_duration {
-            format!(
-                "MilkDrop VJ — Stage 3 Two-Deck Soak ({:.1} min @ 1080p x2, Esc to abort)",
-                dur.as_secs_f64() / 60.0
-            )
-        } else {
-            "MilkDrop VJ — Stage 3 Two Decks @ 1080p x2 (1:Indep, S:Swap, E:BadPreset, P:PNG, Esc:Exit)".to_string()
+        let mode_label = match &self.config.mode {
+            RunMode::Interactive => "Interactive (1:Indep, S:Swap, E:BadPreset, P:PNG, Esc:Exit)".to_string(),
+            RunMode::BadPresetTest => "Test 3: Bad-Preset Cases (~15s)".to_string(),
+            RunMode::PresetLoadBench => "Preset Load-Time Benchmark (~10s)".to_string(),
+            RunMode::HeavyTest { steady_secs } => {
+                format!("Heavy Preset Test: 08+09 ({steady_secs}s steady)")
+            }
+            RunMode::ActiveSoak { minutes } => format!("Active Soak ({minutes:.1} min)"),
         };
+        let gpu_tag = if self.config.measure_gpu { " [measure-gpu]" } else { "" };
+        let title = format!(
+            "MilkDrop VJ — Stage 3 ({}x{} x2){} — {}",
+            self.config.deck_width, self.config.deck_height, gpu_tag, mode_label
+        );
 
-        // 1444x405 shows two exact 16:9 halves (720x405 each) plus a 4px divider.
         let window_attrs = Window::default_attributes()
             .with_title(title)
             .with_inner_size(LogicalSize::new(1444.0, 405.0));
@@ -184,7 +226,6 @@ impl Stage3App {
             .as_raw();
         let gl_display = gl_config.display();
 
-        // Main window OpenGL 3.3 Core context.
         let main_ctx_attrs = ContextAttributesBuilder::new()
             .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
             .build(Some(raw_window_handle));
@@ -226,15 +267,19 @@ impl Stage3App {
         let renderer = unsafe { main_gl.get_parameter_string(glow::RENDERER) };
         let version = unsafe { main_gl.get_parameter_string(glow::VERSION) };
 
-        println!("=== Stage 3 OpenGL Ready (Internal: {DECK_WIDTH}x{DECK_HEIGHT} per deck) ===");
+        let header = format!(
+            "=== Stage 3 Ready | deck_size={}x{} | measure_gpu={} | mode={:?} ===",
+            self.config.deck_width, self.config.deck_height, self.config.measure_gpu, self.config.mode
+        );
+        println!("{header}");
         println!("GL_VENDOR:   {vendor}");
         println!("GL_RENDERER: {renderer}");
         println!("GL_VERSION:  {version}");
+        self.logger.log_info(&header);
         self.logger.log_info(&format!("GL_VENDOR={vendor}"));
         self.logger.log_info(&format!("GL_RENDERER={renderer}"));
         self.logger.log_info(&format!("GL_VERSION={version}"));
 
-        // Initialize GLEW once on Windows before creating any libprojectM deck.
         init_gl_loader_for_projectm().expect("Failed to initialize GLEW for libprojectM");
         self.logger.log_info("GLEW initialized for libprojectM.");
 
@@ -242,11 +287,7 @@ impl Stage3App {
             SideBySideCompositor::new(&main_gl).expect("Failed to create side-by-side compositor");
         self.logger.check_frame(&main_gl, 0, "main-init");
 
-        // Find a WGL config supporting off-screen pbuffers (`WGL_ARB_pbuffer`).
-        // IMPORTANT (Windows WGL): `.compatible_with_native_window(raw_window_handle)` is
-        // required so glutin calls `GetDC(hwnd)` on our real window instead of `GetDC(0)`
-        // (desktop screen DC), which otherwise causes `wglCreatePbufferARB` to fail with
-        // OS error `0xC0070591` (ERROR_DC_NOT_FOUND = 1425).
+        // WGL pbuffer config bound to our real native window's HDC.
         let pbuffer_template = ConfigTemplateBuilder::new()
             .with_alpha_size(8)
             .with_surface_type(ConfigSurfaceTypes::PBUFFER)
@@ -266,14 +307,13 @@ impl Stage3App {
                 .expect("No pbuffer-capable OpenGL config found on this GPU")
         };
 
-        // Pattern 1: create TWO independent RenderDecks, each with its own shared GL context.
         let deck_a = RenderDeck::new(
             "DeckA",
             &gl_display,
             &pbuffer_config,
             &main_context,
-            DECK_WIDTH,
-            DECK_HEIGHT,
+            self.config.deck_width,
+            self.config.deck_height,
             &mut self.logger,
         )
         .expect("Failed to create Deck A");
@@ -283,31 +323,37 @@ impl Stage3App {
             &gl_display,
             &pbuffer_config,
             &main_context,
-            DECK_WIDTH,
-            DECK_HEIGHT,
+            self.config.deck_width,
+            self.config.deck_height,
             &mut self.logger,
         )
         .expect("Failed to create Deck B");
 
-        // Load two very different initial presets (index 0 = Fractal, index 1 = Geometric).
-        let deck_a_idx = 0;
-        let deck_b_idx = 1.min(self.presets.len().saturating_sub(1));
+        // Pick initial presets based on run mode.
+        let (deck_a_idx, deck_b_idx) = match self.config.mode {
+            RunMode::HeavyTest { .. } => {
+                // Find 08_Reaction and 09_Drawing explicitly.
+                let idx_08 = find_preset_by_prefix(&self.presets, "08_").unwrap_or(0);
+                let idx_09 = find_preset_by_prefix(&self.presets, "09_").unwrap_or(1);
+                (idx_08, idx_09)
+            }
+            _ => (0, 1.min(self.presets.len().saturating_sub(1))),
+        };
 
         let label_a = preset_label(&self.presets[deck_a_idx]);
         let label_b = preset_label(&self.presets[deck_b_idx]);
         deck_a
             .load_preset(&self.presets[deck_a_idx], false)
-            .unwrap_or_else(|e| self.logger.log_info(&format!("Deck A initial load err: {e}")));
+            .unwrap_or_else(|e| self.logger.log_info(&format!("Deck A init err: {e}")));
         deck_b
             .load_preset(&self.presets[deck_b_idx], false)
-            .unwrap_or_else(|e| self.logger.log_info(&format!("Deck B initial load err: {e}")));
+            .unwrap_or_else(|e| self.logger.log_info(&format!("Deck B init err: {e}")));
 
         println!("Deck A initial preset: {label_a}");
         println!("Deck B initial preset: {label_b}");
         self.logger.log_info(&format!("Deck A initial preset: {label_a}"));
         self.logger.log_info(&format!("Deck B initial preset: {label_b}"));
 
-        // Return focus to the main context and show the window.
         main_context
             .make_current(&main_surface)
             .expect("Failed to restore main context after deck init");
@@ -325,18 +371,81 @@ impl Stage3App {
             self.logger.log_info(&msg);
         }
 
-        let max_samples = max_pcm_samples_per_channel();
-        let initial_phase = if self.soak_duration.is_some() {
-            println!("[Soak Test 1/4] INDEPENDENCE: Deck A = TEST_AUDIO, Deck B = SILENCE (10s)...");
-            self.logger.log_info("[Soak Test 1/4] INDEPENDENCE started: Deck A=AUDIO, Deck B=SILENCE");
-            SoakPhase::Independence
-        } else {
-            SoakPhase::Off
-        };
-        let deck_b_starts_silent = initial_phase == SoakPhase::Independence;
-
         let now = Instant::now();
+        let bad_runner = matches!(self.config.mode, RunMode::BadPresetTest).then(|| {
+            println!("[Bad-Preset Test] Step 0/3: 3s baseline with valid presets on both decks...");
+            self.logger
+                .log_info("[Bad-Preset Test] Step 0/3: 3s baseline started");
+            BadPresetRunner {
+                step: 0,
+                step_start: now,
+                step_frames: 0,
+            }
+        });
+
+        let heavy_runner = matches!(self.config.mode, RunMode::HeavyTest { .. }).then(|| {
+            println!("[Heavy Test] First 5s = warmup/shader compile (tracked separately from steady state)...");
+            self.logger
+                .log_info("[Heavy Test] Warmup 5s started (08_Reaction on A + 09_Drawing on B)");
+            HeavyTestRunner {
+                warmup_done: false,
+                warmup_frames: 0,
+                warmup_start: now,
+                warmup_worst_ms: 0.0,
+                steady_start: None,
+                steady_frames: 0,
+                steady_below_55: 0,
+                steady_timing_a: TimingStats::default(),
+                steady_timing_b: TimingStats::default(),
+                steady_timing_total: TimingStats::default(),
+                steady_fps_buckets: FpsBucketTracker::default(),
+                last_bucket_time: now,
+                last_bucket_frames: 0,
+            }
+        });
+
+        let soak_runner = match self.config.mode {
+            RunMode::ActiveSoak { minutes } => {
+                let gpu_monitor = GpuTelemetryMonitor::start(Duration::from_secs(30));
+                if let Some(gpu) = gpu_monitor.latest() {
+                    let msg = format!(
+                        "Start GPU (nvidia-smi): VRAM={}/{} MiB, Temp={}C, Clock={} MHz",
+                        gpu.vram_used_mib, gpu.vram_total_mib, gpu.temp_c, gpu.graphics_clock_mhz
+                    );
+                    println!("{msg}");
+                    self.logger.log_info(&msg);
+                }
+                println!(
+                    "[Active Soak] Running for {:.1} minutes: rotating presets every 10s (alternating decks, incl. heavy + bad), telemetry every 30s...",
+                    minutes
+                );
+                self.logger.log_info(&format!(
+                    "[Active Soak] Started ({:.1} minutes, 10s preset rotation, 30s telemetry)",
+                    minutes
+                ));
+                Some(ActiveSoakRunner {
+                    target_duration: Duration::from_secs_f64(minutes * 60.0),
+                    last_switch_time: now,
+                    switch_count: 0,
+                    next_preset_cursor: 2,
+                    last_telemetry_time: now,
+                    last_1s_time: now,
+                    last_1s_frames: 0,
+                    fps_window_30s: FpsBucketTracker::default(),
+                    fps_all_1s: FpsBucketTracker::default(),
+                    frames_below_55: 0,
+                    min_gpu_clock: None,
+                    max_gpu_clock: None,
+                    max_gpu_temp: None,
+                    gpu_monitor,
+                })
+            }
+            _ => None,
+        };
+
+        let max_samples = max_pcm_samples_per_channel();
         self.state = Some(Stage3State {
+            config: self.config.clone(),
             deck_a,
             deck_b,
             compositor,
@@ -349,215 +458,191 @@ impl Stage3App {
             pcm_a: vec![0.0_f32; max_samples * 2],
             pcm_b: vec![0.0_f32; max_samples * 2],
             deck_a_audio: true,
-            deck_b_audio: !deck_b_starts_silent,
+            deck_b_audio: true,
             presets: self.presets.clone(),
-            bad_preset_path: self.bad_preset_path.clone(),
+            bad_missing_path: PathBuf::from("presets/_does_not_exist.milk"),
+            bad_empty_path: PathBuf::from("presets/_bad_empty_test.milk"),
+            bad_shader_path: PathBuf::from("presets/_bad_shader_test.milk"),
             deck_a_preset_idx: deck_a_idx,
             deck_b_preset_idx: deck_b_idx,
             start_time: now,
+            last_frame_instant: now,
             last_report_time: now,
             last_report_frames: 0,
             frame_count: 0,
             timing_a: TimingStats::default(),
             timing_b: TimingStats::default(),
             timing_total: TimingStats::default(),
+            frames_below_55: 0,
             start_memory,
-            soak_duration: self.soak_duration,
-            soak_phase: initial_phase,
-            png_captured: false,
+            bad_runner,
+            heavy_runner,
+            soak_runner,
+            load_bench_done: false,
         });
     }
 
-    fn set_independence_mode(&mut self) {
+    /// Runs `--preset-load-bench` once after 10 warmup frames, measuring cold and warm
+    /// `load_preset()` duration + first-frame compile duration for each of the 10 presets.
+    fn run_preset_load_benchmark(&mut self) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
-        state.deck_a_audio = true;
-        state.deck_b_audio = false;
-        let msg = "Test 1 (Independence): Deck A = TEST_AUDIO, Deck B = SILENCE";
-        println!("{msg}");
-        self.logger.log_info(msg);
+        if state.load_bench_done || state.frame_count < 10 {
+            return;
+        }
+        state.load_bench_done = true;
+
+        let header = "=== Preset Load-Time Benchmark (Deck A @ 1920x1080 or --deck-size) ===";
+        println!("\n{header}");
+        self.logger.log_info(header);
+        let col_hdr = format!(
+            "{:<4} | {:<42} | {:>10} | {:>11} | {:>10} | {:>11}",
+            "#", "Preset", "ColdLoadMs", "Cold1stFrMs", "WarmLoadMs", "Warm1stFrMs"
+        );
+        println!("{col_hdr}");
+        self.logger.log_info(&col_hdr);
+
+        let presets = state.presets.clone();
+        let mut cold_loads = Vec::with_capacity(presets.len());
+        let mut cold_firsts = Vec::with_capacity(presets.len());
+
+        // Pass 1 (Cold load for each preset)
+        for path in &presets {
+            let t0 = Instant::now();
+            let load_res = state.deck_a.load_preset(path, false);
+            let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if let Err(e) = load_res {
+                self.logger
+                    .log_info(&format!("Bench cold load err for {}: {e}", preset_label(path)));
+            }
+
+            state.audio_a.fill_stereo(&mut state.pcm_a, true);
+            let t1 = Instant::now();
+            let _ = state
+                .deck_a
+                .render_to_texture(&state.pcm_a, state.frame_count, true, &mut self.logger);
+            let first_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+            cold_loads.push(load_ms);
+            cold_firsts.push(first_ms);
+        }
+
+        // Pass 2 (Warm load for each preset — tests NVIDIA driver shader cache)
+        for (i, path) in presets.iter().enumerate() {
+            let t0 = Instant::now();
+            let _ = state.deck_a.load_preset(path, false);
+            let warm_load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            state.audio_a.fill_stereo(&mut state.pcm_a, true);
+            let t1 = Instant::now();
+            let _ = state
+                .deck_a
+                .render_to_texture(&state.pcm_a, state.frame_count, true, &mut self.logger);
+            let warm_first_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+            let mut name = preset_label(path);
+            if name.len() > 42 {
+                name.truncate(39);
+                name.push_str("...");
+            }
+            let row = format!(
+                "{:<4} | {:<42} | {:>8.2}ms | {:>9.2}ms | {:>8.2}ms | {:>9.2}ms",
+                i + 1,
+                name,
+                cold_loads[i],
+                cold_firsts[i],
+                warm_load_ms,
+                warm_first_ms
+            );
+            println!("{row}");
+            self.logger.log_info(&row);
+        }
+
+        println!("=== Benchmark complete. Closing cleanly. ===");
+        self.logger.log_info("=== Preset Load-Time Benchmark complete ===");
     }
 
-    fn swap_presets(&mut self) {
+    /// Drives the 3-case `--bad-preset-test` sequence. Returns `true` when finished.
+    fn step_bad_preset_test(&mut self) -> bool {
         let Some(state) = self.state.as_mut() else {
-            return;
+            return false;
         };
-        std::mem::swap(&mut state.deck_a_preset_idx, &mut state.deck_b_preset_idx);
-        let path_a = state.presets[state.deck_a_preset_idx].clone();
-        let path_b = state.presets[state.deck_b_preset_idx].clone();
-        let label_a = preset_label(&path_a);
-        let label_b = preset_label(&path_b);
+        let Some(runner) = state.bad_runner.as_mut() else {
+            return false;
+        };
 
-        if let Err(err) = state.deck_a.load_preset(&path_a, false) {
-            eprintln!("Deck A swap load error: {err}");
-            self.logger.log_info(&format!("Deck A swap load error: {err}"));
-        }
-        if let Err(err) = state.deck_b.load_preset(&path_b, false) {
-            eprintln!("Deck B swap load error: {err}");
-            self.logger.log_info(&format!("Deck B swap load error: {err}"));
+        runner.step_frames += 1;
+        let elapsed = runner.step_start.elapsed();
+        let target_secs = if runner.step == 0 { 3.0 } else { 4.0 };
+        if elapsed.as_secs_f64() < target_secs {
+            return false;
         }
 
-        let msg = format!("Test 2 (Swap): Deck A -> `{label_a}` | Deck B -> `{label_b}`");
+        let step_fps = runner.step_frames as f64 / elapsed.as_secs_f64();
+        let brightness_a = state
+            .deck_a
+            .sample_center_brightness(&mut self.logger)
+            .unwrap_or(-1.0);
+        let prev_step = runner.step;
+        let msg = format!(
+            "[Bad-Preset Test] Step {prev_step} window complete: avg_fps={step_fps:.1} (Deck B live), DeckA_center_luma={brightness_a:.1}/255"
+        );
         println!("{msg}");
         self.logger.log_info(&msg);
-    }
 
-    fn trigger_bad_preset_on_deck_a(&mut self) {
-        let Some(state) = self.state.as_mut() else {
-            return;
+        runner.step += 1;
+        runner.step_start = Instant::now();
+        runner.step_frames = 0;
+
+        let next_step = runner.step;
+        let (case_name, test_path) = match next_step {
+            1 => ("Case 1/3: Missing file path", state.bad_missing_path.clone()),
+            2 => ("Case 2/3: Empty 0-byte file", state.bad_empty_path.clone()),
+            3 => (
+                "Case 3/3: Broken shader_body",
+                state.bad_shader_path.clone(),
+            ),
+            _ => return true,
         };
-        let bad_path = state.bad_preset_path.clone();
-        println!(
-            "Test 3 (Bad preset): Loading deliberately broken preset `{}` onto Deck A...",
-            bad_path.display()
-        );
-        match state.deck_a.load_preset(&bad_path, false) {
+
+        // Reload valid preset 01 before each case so we know what was on Deck A beforehand.
+        let valid_preset = state.presets[0].clone();
+        let _ = state.deck_a.load_preset(&valid_preset, false);
+
+        println!("\n[Bad-Preset Test] Triggering {case_name}: `{}`", test_path.display());
+        match state.deck_a.load_preset(&test_path, false) {
             Ok(()) => {
-                let msg = "Test 3 result: libprojectM accepted the broken/empty preset without firing an error callback (no crash; Deck B unaffected).";
-                println!("{msg}");
-                self.logger.log_info(msg);
-            }
-            Err(err) => {
-                let msg = format!("Test 3 result (PASS - caught cleanly, no crash): {err}");
-                println!("{msg}");
-                self.logger.log_info(&msg);
-            }
-        }
-    }
-
-    fn capture_both_pngs(&mut self) {
-        let Some(state) = self.state.as_mut() else {
-            return;
-        };
-        let path_a = Path::new("docs/spike/deck_a.png");
-        let path_b = Path::new("docs/spike/deck_b.png");
-
-        match state.deck_a.capture_png(path_a, &mut self.logger) {
-            Ok(()) => {
-                let msg = format!("Saved Deck A PNG capture -> {}", path_a.display());
-                println!("{msg}");
-                self.logger.log_info(&msg);
-            }
-            Err(err) => {
-                eprintln!("Deck A PNG capture error: {err}");
-                self.logger.log_info(&format!("Deck A PNG capture error: {err}"));
-            }
-        }
-
-        match state.deck_b.capture_png(path_b, &mut self.logger) {
-            Ok(()) => {
-                let msg = format!("Saved Deck B PNG capture -> {}", path_b.display());
-                println!("{msg}");
-                self.logger.log_info(&msg);
-            }
-            Err(err) => {
-                eprintln!("Deck B PNG capture error: {err}");
-                self.logger.log_info(&format!("Deck B PNG capture error: {err}"));
-            }
-        }
-
-        state.png_captured = true;
-    }
-
-    fn cycle_preset(&mut self, is_deck_a: bool, delta: isize) {
-        let Some(state) = self.state.as_mut() else {
-            return;
-        };
-        let count = state.presets.len() as isize;
-        if count == 0 {
-            return;
-        }
-        let idx = if is_deck_a {
-            state.deck_a_preset_idx =
-                ((state.deck_a_preset_idx as isize + delta).rem_euclid(count)) as usize;
-            state.deck_a_preset_idx
-        } else {
-            state.deck_b_preset_idx =
-                ((state.deck_b_preset_idx as isize + delta).rem_euclid(count)) as usize;
-            state.deck_b_preset_idx
-        };
-
-        let path = state.presets[idx].clone();
-        let label = preset_label(&path);
-        let deck_name = if is_deck_a { "Deck A" } else { "Deck B" };
-        let res = if is_deck_a {
-            state.deck_a.load_preset(&path, true)
-        } else {
-            state.deck_b.load_preset(&path, true)
-        };
-        match res {
-            Ok(()) => {
-                let msg = format!("{deck_name} preset -> [{}/{}] {label}", idx + 1, count);
-                println!("{msg}");
-                self.logger.log_info(&msg);
-            }
-            Err(err) => {
-                eprintln!("{deck_name} preset load error: {err}");
-                self.logger.log_info(&format!("{deck_name} preset load error: {err}"));
-            }
-        }
-    }
-
-    /// Drives the automated soak sequence when `--soak-minutes` is active.
-    /// Returns `true` when the soak timer has completed and the app should exit.
-    fn advance_soak_schedule(&mut self) -> bool {
-        let (elapsed, target_dur, phase, png_captured) = {
-            let Some(state) = &self.state else {
-                return false;
-            };
-            let Some(dur) = state.soak_duration else {
-                return false;
-            };
-            (state.start_time.elapsed(), dur, state.soak_phase, state.png_captured)
-        };
-
-        if elapsed >= target_dur {
-            return true;
-        }
-
-        match phase {
-            SoakPhase::Independence if elapsed >= Duration::from_secs(5) && !png_captured => {
-                // Capture PNG evidence mid-way through Test 1 so both distinct presets are vivid.
-                self.capture_both_pngs();
-            }
-            SoakPhase::Independence if elapsed >= Duration::from_secs(10) => {
-                if let Some(s) = self.state.as_mut() {
-                    s.deck_b_audio = true;
-                    s.soak_phase = SoakPhase::Swapped;
-                }
-                println!("[Soak Test 2/4] NO BLEED (SWAP): Both decks active, swapping presets (10s)...");
-                self.logger.log_info("[Soak Test 2/4] NO BLEED (SWAP) started");
-                self.swap_presets();
-            }
-            SoakPhase::Swapped if elapsed >= Duration::from_secs(20) => {
-                if let Some(s) = self.state.as_mut() {
-                    s.soak_phase = SoakPhase::BadPreset;
-                }
-                println!("[Soak Test 3/4] BAD PRESET: Loading broken preset onto Deck A (10s)...");
-                self.logger.log_info("[Soak Test 3/4] BAD PRESET started");
-                self.trigger_bad_preset_on_deck_a();
-            }
-            SoakPhase::BadPreset if elapsed >= Duration::from_secs(30) => {
-                if let Some(s) = self.state.as_mut() {
-                    s.soak_phase = SoakPhase::SteadySoak;
-                }
-                println!(
-                    "[Soak Test 4/4] STEADY STABILITY SOAK: Both decks rendering @ {DECK_WIDTH}x{DECK_HEIGHT} until {:.1} min...",
-                    target_dur.as_secs_f64() / 60.0
+                let line = format!(
+                    "[Bad-Preset Test] {case_name} -> callback_fired=NO | error_text=<none> | no crash"
                 );
-                self.logger.log_info("[Soak Test 4/4] STEADY STABILITY SOAK started");
-                // Reload a valid preset onto Deck A for the long soak.
-                self.cycle_preset(true, 1);
+                println!("{line}");
+                self.logger.log_info(&line);
             }
-            _ => {}
+            Err(err) => {
+                let line = format!(
+                    "[Bad-Preset Test] {case_name} -> callback_fired=YES | error_text=`{err}` | no crash"
+                );
+                println!("{line}");
+                self.logger.log_info(&line);
+            }
         }
-
         false
     }
 
     fn render_frame(&mut self, event_loop: &ActiveEventLoop) {
-        if self.advance_soak_schedule() {
+        // Handle one-shot preset load benchmark mode.
+        if matches!(self.config.mode, RunMode::PresetLoadBench) {
+            self.run_preset_load_benchmark();
+            if self.state.as_ref().map(|s| s.load_bench_done).unwrap_or(false) {
+                self.shutdown();
+                event_loop.exit();
+                return;
+            }
+        }
+
+        // Handle 3-case bad-preset test progression.
+        if self.step_bad_preset_test() {
             self.shutdown();
             event_loop.exit();
             return;
@@ -567,35 +652,51 @@ impl Stage3App {
             return;
         };
 
+        let now = Instant::now();
+        let frame_delta_ms = now.duration_since(state.last_frame_instant).as_secs_f64() * 1000.0;
+        state.last_frame_instant = now;
+
         state.frame_count += 1;
         let frame_idx = state.frame_count;
-        let frame_start = Instant::now();
+        if frame_idx > 5 && frame_delta_ms > FRAME_BELOW_55_FPS_MS {
+            state.frames_below_55 += 1;
+        }
 
-        // 1. Render Deck A (1920x1080) inside Deck A's shared OpenGL context.
+        let measure_gpu = state.config.measure_gpu;
+
+        // If `--measure-gpu` is active, start the total work timer AFTER the previous
+        // frame's VSync wait has already finished (at the end of swap_buffers below).
+        let work_start = Instant::now();
+
+        // 1. Render Deck A inside Deck A's shared OpenGL context.
         state
             .audio_a
             .fill_stereo(&mut state.pcm_a, state.deck_a_audio);
         let t_a = Instant::now();
         state
             .deck_a
-            .render_to_texture(&state.pcm_a, frame_idx, &mut self.logger)
+            .render_to_texture(&state.pcm_a, frame_idx, measure_gpu, &mut self.logger)
             .expect("Deck A render failed");
         let a_ms = t_a.elapsed().as_secs_f64() * 1000.0;
-        state.timing_a.record_ms(a_ms);
+        if frame_idx > 5 {
+            state.timing_a.record_ms(a_ms);
+        }
 
-        // 2. Render Deck B (1920x1080) inside Deck B's shared OpenGL context.
+        // 2. Render Deck B inside Deck B's shared OpenGL context.
         state
             .audio_b
             .fill_stereo(&mut state.pcm_b, state.deck_b_audio);
         let t_b = Instant::now();
         state
             .deck_b
-            .render_to_texture(&state.pcm_b, frame_idx, &mut self.logger)
+            .render_to_texture(&state.pcm_b, frame_idx, measure_gpu, &mut self.logger)
             .expect("Deck B render failed");
         let b_ms = t_b.elapsed().as_secs_f64() * 1000.0;
-        state.timing_b.record_ms(b_ms);
+        if frame_idx > 5 {
+            state.timing_b.record_ms(b_ms);
+        }
 
-        // 3. Switch back to the main window context and draw Deck A (left) and Deck B (right).
+        // 3. Composite side-by-side on the main window context.
         state
             .main_context
             .make_current(&state.main_surface)
@@ -612,47 +713,211 @@ impl Stage3App {
         self.logger
             .check_frame(&state.main_gl, frame_idx, "main-composite");
 
+        let total_work_ms = if measure_gpu {
+            // Measure pure GPU+CPU work before VSync swap.
+            unsafe {
+                state.main_gl.finish();
+            }
+            work_start.elapsed().as_secs_f64() * 1000.0
+        } else {
+            0.0
+        };
+
         state
             .main_surface
             .swap_buffers(&state.main_context)
             .expect("Failed to swap main window buffers");
 
-        let total_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
-        // Skip first 5 warmup frames when recording worst-case spikes (shader compile warmup).
+        // In `--measure-gpu` ONLY: drain VSync right here *outside* Deck A's timer so the
+        // next frame's Deck A timer measures pure Deck A work instead of idle VSync wait.
+        let total_recorded_ms = if measure_gpu {
+            unsafe {
+                state.main_gl.finish();
+            }
+            total_work_ms
+        } else {
+            work_start.elapsed().as_secs_f64() * 1000.0
+        };
+
         if frame_idx > 5 {
-            state.timing_total.record_ms(total_ms);
+            state.timing_total.record_ms(total_recorded_ms);
         }
 
-        // 4. Print a 1-second (or 15-second in soak mode) heartbeat.
-        let report_interval = if state.soak_duration.is_some() { 15.0 } else { 2.0 };
-        let since_report = state.last_report_time.elapsed().as_secs_f64();
-        if since_report >= report_interval {
-            let delta_frames = state.frame_count - state.last_report_frames;
-            let fps = delta_frames as f64 / since_report;
-            state.deck_a.set_fps(fps.round() as i32);
-            state.deck_b.set_fps(fps.round() as i32);
+        // 4. Update Heavy-Test tracker if running `--heavy-test-seconds`.
+        let mut should_exit = false;
+        if let (RunMode::HeavyTest { steady_secs }, Some(heavy)) =
+            (&state.config.mode, state.heavy_runner.as_mut())
+        {
+            if !heavy.warmup_done {
+                heavy.warmup_frames += 1;
+                if frame_delta_ms > heavy.warmup_worst_ms {
+                    heavy.warmup_worst_ms = frame_delta_ms;
+                }
+                if heavy.warmup_start.elapsed() >= Duration::from_secs(5) {
+                    let secs = heavy.warmup_start.elapsed().as_secs_f64();
+                    let w_fps = heavy.warmup_frames as f64 / secs;
+                    let msg = format!(
+                        "[Heavy Test] Warmup (first {:.2}s) done: {} frames, avg {:.1} FPS, worst frame delta {:.2} ms. Starting {}s steady-state window...",
+                        secs, heavy.warmup_frames, w_fps, heavy.warmup_worst_ms, steady_secs
+                    );
+                    println!("{msg}");
+                    self.logger.log_info(&msg);
+                    heavy.warmup_done = true;
+                    heavy.steady_start = Some(Instant::now());
+                    heavy.last_bucket_time = Instant::now();
+                    heavy.last_bucket_frames = 0;
+                }
+            } else if let Some(steady_start) = heavy.steady_start {
+                heavy.steady_frames += 1;
+                if frame_delta_ms > FRAME_BELOW_55_FPS_MS {
+                    heavy.steady_below_55 += 1;
+                }
+                heavy.steady_timing_a.record_ms(a_ms);
+                heavy.steady_timing_b.record_ms(b_ms);
+                heavy.steady_timing_total.record_ms(total_recorded_ms);
 
-            let mem_str = current_process_memory_mb()
-                .map(|m| format!("mem={:.1}MiB", m.working_set_mb))
-                .unwrap_or_else(|| "mem=n/a".to_string());
+                let b_secs = heavy.last_bucket_time.elapsed().as_secs_f64();
+                if b_secs >= 1.0 {
+                    let df = heavy.steady_frames - heavy.last_bucket_frames;
+                    let fps = df as f64 / b_secs;
+                    heavy.steady_fps_buckets.push(fps);
+                    heavy.last_bucket_time = Instant::now();
+                    heavy.last_bucket_frames = heavy.steady_frames;
+                }
 
-            let line = format!(
-                "[Stage 3 | {:.0}s] fps={:.1} | A={:.2}ms(max {:.2}) | B={:.2}ms(max {:.2}) | total={:.2}ms(max {:.2}) | {} | gl_err={}",
-                state.start_time.elapsed().as_secs_f64(),
-                fps,
-                state.timing_a.avg_ms(),
-                state.timing_a.max_ms(),
-                state.timing_b.avg_ms(),
-                state.timing_b.max_ms(),
-                state.timing_total.avg_ms(),
-                state.timing_total.max_ms(),
-                mem_str,
-                self.logger.total_errors()
-            );
-            println!("{line}");
-            self.logger.log_info(&line);
-            state.last_report_time = Instant::now();
-            state.last_report_frames = state.frame_count;
+                if steady_start.elapsed() >= Duration::from_secs(*steady_secs) {
+                    should_exit = true;
+                }
+            }
+        }
+
+        // 5. Update Active-Soak tracker if running `--soak-minutes`.
+        if let Some(soak) = state.soak_runner.as_mut() {
+            if frame_idx > 5 && frame_delta_ms > FRAME_BELOW_55_FPS_MS {
+                soak.frames_below_55 += 1;
+            }
+
+            // 1-second FPS bucket update.
+            let sec_dt = soak.last_1s_time.elapsed().as_secs_f64();
+            if sec_dt >= 1.0 {
+                let df = state.frame_count - soak.last_1s_frames;
+                let fps = df as f64 / sec_dt;
+                soak.fps_window_30s.push(fps);
+                soak.fps_all_1s.push(fps);
+                state.deck_a.set_fps(fps.round() as i32);
+                state.deck_b.set_fps(fps.round() as i32);
+                soak.last_1s_time = Instant::now();
+                soak.last_1s_frames = state.frame_count;
+            }
+
+            // Rotate preset every 10 seconds, alternating Deck A and Deck B.
+            // Every 6th rotation injects the bad shader preset to prove continuous resilience.
+            if soak.last_switch_time.elapsed() >= Duration::from_secs(10) {
+                soak.last_switch_time = Instant::now();
+                soak.switch_count += 1;
+                let use_deck_a = soak.switch_count % 2 == 1;
+                let deck_label = if use_deck_a { "DeckA" } else { "DeckB" };
+
+                let target_path = if soak.switch_count % 6 == 0 {
+                    state.bad_shader_path.clone()
+                } else {
+                    let idx = soak.next_preset_cursor % state.presets.len();
+                    soak.next_preset_cursor += 1;
+                    state.presets[idx].clone()
+                };
+
+                let label = preset_label(&target_path);
+                let res = if use_deck_a {
+                    state.deck_a.load_preset(&target_path, false)
+                } else {
+                    state.deck_b.load_preset(&target_path, false)
+                };
+                match res {
+                    Ok(()) => {
+                        self.logger.log_info(&format!(
+                            "[Soak switch #{}] {} -> `{}` (ok)",
+                            soak.switch_count, deck_label, label
+                        ));
+                    }
+                    Err(e) => {
+                        self.logger.log_info(&format!(
+                            "[Soak switch #{}] {} -> `{}` (caught error, no crash: {})",
+                            soak.switch_count, deck_label, label, e
+                        ));
+                    }
+                }
+            }
+
+            // Every 30 seconds: log RAM, FPS min/avg/max, and nvidia-smi GPU telemetry.
+            if soak.last_telemetry_time.elapsed() >= Duration::from_secs(30) {
+                soak.last_telemetry_time = Instant::now();
+                let elapsed_s = state.start_time.elapsed().as_secs();
+                let mem = current_process_memory_mb();
+                let fps_str = match soak.fps_window_30s.summary_and_clear() {
+                    Some((mn, av, mx)) => format!("fps(min/avg/max)={mn:.1}/{av:.1}/{mx:.1}"),
+                    None => "fps=n/a".to_string(),
+                };
+                let gpu_str = match soak.gpu_monitor.latest() {
+                    Some(g) => {
+                        update_gpu_extremes(soak, g);
+                        format!(
+                            "GPU(vram={}/{}MiB, temp={}C, clk={}MHz)",
+                            g.vram_used_mib, g.vram_total_mib, g.temp_c, g.graphics_clock_mhz
+                        )
+                    }
+                    None => "GPU=n/a".to_string(),
+                };
+                let line = format!(
+                    "[Soak {:>3}s] {} | {} | {} | below55={} | gl_err={}",
+                    elapsed_s,
+                    fps_str,
+                    format_mem_short(mem),
+                    gpu_str,
+                    soak.frames_below_55,
+                    self.logger.total_errors()
+                );
+                println!("{line}");
+                self.logger.log_info(&line);
+            }
+
+            if state.start_time.elapsed() >= soak.target_duration {
+                should_exit = true;
+            }
+        }
+
+        // 6. Standard periodic console heartbeat for Interactive / Heavy modes.
+        if state.soak_runner.is_none() && state.bad_runner.is_none() {
+            let since_report = state.last_report_time.elapsed().as_secs_f64();
+            if since_report >= 5.0 {
+                let df = state.frame_count - state.last_report_frames;
+                let fps = df as f64 / since_report;
+                state.deck_a.set_fps(fps.round() as i32);
+                state.deck_b.set_fps(fps.round() as i32);
+                let line = format!(
+                    "[Stage 3 | {:.0}s] fps={:.1} | A={:.2}ms(max {:.2}) | B={:.2}ms(max {:.2}) | total={:.2}ms(max {:.2}) | {} | below55={} | gl_err={}",
+                    state.start_time.elapsed().as_secs_f64(),
+                    fps,
+                    state.timing_a.avg_ms(),
+                    state.timing_a.max_ms(),
+                    state.timing_b.avg_ms(),
+                    state.timing_b.max_ms(),
+                    state.timing_total.avg_ms(),
+                    state.timing_total.max_ms(),
+                    format_mem_short(current_process_memory_mb()),
+                    state.frames_below_55,
+                    self.logger.total_errors()
+                );
+                println!("{line}");
+                self.logger.log_info(&line);
+                state.last_report_time = Instant::now();
+                state.last_report_frames = state.frame_count;
+            }
+        }
+
+        if should_exit {
+            self.shutdown();
+            event_loop.exit();
+            return;
         }
 
         state.window.request_redraw();
@@ -668,19 +933,24 @@ impl Stage3App {
             };
             let end_mem = current_process_memory_mb();
 
-            let summary = format!(
-                "=== Stage 3 Summary ===\n\
-                 Duration:        {:.2}s ({} frames, avg {:.2} FPS)\n\
-                 Resolution:      {DECK_WIDTH}x{DECK_HEIGHT} per deck (x2)\n\
-                 Deck A render:   avg {:.2} ms | worst {:.2} ms ({} frames)\n\
-                 Deck B render:   avg {:.2} ms | worst {:.2} ms ({} frames)\n\
-                 Total frame:     avg {:.2} ms | worst {:.2} ms (after 5-frame warmup)\n\
-                 Start memory:    {}\n\
-                 End memory:      {}\n\
-                 Total GL errors: {}",
+            let mut summary = format!(
+                "=== Stage 3 Summary ({:?}) ===\n\
+                 Duration:         {:.2}s ({} frames, overall avg {:.2} FPS)\n\
+                 Deck resolution:  {}x{} per deck (x2) | measure_gpu={}\n\
+                 Deck A render:    avg {:.2} ms | worst {:.2} ms ({} frames)\n\
+                 Deck B render:    avg {:.2} ms | worst {:.2} ms ({} frames)\n\
+                 Total work/frame: avg {:.2} ms | worst {:.2} ms\n\
+                 Frames < 55 FPS:  {}\n\
+                 Start memory:     {}\n\
+                 End memory:       {}\n\
+                 Total GL errors:  {}",
+                state.config.mode,
                 secs,
                 state.frame_count,
                 avg_fps,
+                state.config.deck_width,
+                state.config.deck_height,
+                state.config.measure_gpu,
                 state.timing_a.avg_ms(),
                 state.timing_a.max_ms(),
                 state.timing_a.samples(),
@@ -689,21 +959,154 @@ impl Stage3App {
                 state.timing_b.samples(),
                 state.timing_total.avg_ms(),
                 state.timing_total.max_ms(),
+                state.frames_below_55,
                 format_mem(state.start_memory),
                 format_mem(end_mem),
                 self.logger.total_errors()
             );
+
+            if let Some(mut heavy) = state.heavy_runner.take() {
+                let steady_secs = heavy
+                    .steady_start
+                    .map(|s| s.elapsed().as_secs_f64())
+                    .unwrap_or(0.0);
+                let steady_avg_fps = if steady_secs > 0.0 {
+                    heavy.steady_frames as f64 / steady_secs
+                } else {
+                    0.0
+                };
+                let bucket_line = match heavy.steady_fps_buckets.summary_and_clear() {
+                    Some((mn, av, mx)) => format!("min={mn:.1} / avg={av:.1} / max={mx:.1}"),
+                    None => "n/a".to_string(),
+                };
+                summary.push_str(&format!(
+                    "\n--- Heavy-Preset Steady State (08_Reaction + 09_Drawing, AFTER 5s warmup) ---\n\
+                     Steady duration:  {:.2}s ({} frames, avg {:.2} FPS | 1s buckets: {})\n\
+                     Steady Deck A:    avg {:.2} ms | worst {:.2} ms\n\
+                     Steady Deck B:    avg {:.2} ms | worst {:.2} ms\n\
+                     Steady Total:     avg {:.2} ms | worst {:.2} ms\n\
+                     Steady < 55 FPS:  {} frames",
+                    steady_secs,
+                    heavy.steady_frames,
+                    steady_avg_fps,
+                    bucket_line,
+                    heavy.steady_timing_a.avg_ms(),
+                    heavy.steady_timing_a.max_ms(),
+                    heavy.steady_timing_b.avg_ms(),
+                    heavy.steady_timing_b.max_ms(),
+                    heavy.steady_timing_total.avg_ms(),
+                    heavy.steady_timing_total.max_ms(),
+                    heavy.steady_below_55
+                ));
+            }
+
+            if let Some(mut soak) = state.soak_runner.take() {
+                if let Some(g) = soak.gpu_monitor.latest() {
+                    update_gpu_extremes(&mut soak, g);
+                }
+                let fps_all = match soak.fps_all_1s.summary_and_clear() {
+                    Some((mn, av, mx)) => format!("min={mn:.1} / avg={av:.1} / max={mx:.1}"),
+                    None => "n/a".to_string(),
+                };
+                summary.push_str(&format!(
+                    "\n--- Active Soak Totals ---\n\
+                     Preset switches:  {}\n\
+                     1s FPS overall:   {}\n\
+                     Frames < 55 FPS:  {}\n\
+                     GPU Clock range:  {:?}..={:?} MHz | Peak GPU Temp: {:?} C",
+                    soak.switch_count,
+                    fps_all,
+                    soak.frames_below_55,
+                    soak.min_gpu_clock,
+                    soak.max_gpu_clock,
+                    soak.max_gpu_temp
+                ));
+            }
+
             println!("\n{summary}");
             println!("Log file saved to: {}", self.logger.path().display());
             self.logger.log_info(&summary);
 
-            // Destroy decks while their own contexts are current, then compositor on main context.
             state.deck_a.destroy();
             state.deck_b.destroy();
             if state.main_context.make_current(&state.main_surface).is_ok() {
                 state.compositor.destroy(&state.main_gl);
             }
             drop(state);
+        }
+    }
+
+    fn interactive_key(&mut self, key: Key) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        if !matches!(state.config.mode, RunMode::Interactive) {
+            return;
+        }
+        match key {
+            Key::Character(ref ch) if ch == "1" => {
+                state.deck_a_audio = true;
+                state.deck_b_audio = false;
+                println!("Test 1 (Independence): Deck A = AUDIO, Deck B = SILENCE");
+            }
+            Key::Character(ref ch) if ch == "2" => {
+                state.deck_a_audio = true;
+                state.deck_b_audio = true;
+                println!("Both decks = AUDIO");
+            }
+            Key::Character(ref ch) if ch.eq_ignore_ascii_case("s") => {
+                std::mem::swap(&mut state.deck_a_preset_idx, &mut state.deck_b_preset_idx);
+                let _ = state
+                    .deck_a
+                    .load_preset(&state.presets[state.deck_a_preset_idx], false);
+                let _ = state
+                    .deck_b
+                    .load_preset(&state.presets[state.deck_b_preset_idx], false);
+                println!("Swapped presets between Deck A and Deck B.");
+            }
+            Key::Character(ref ch) if ch.eq_ignore_ascii_case("e") => {
+                let bad = state.bad_shader_path.clone();
+                match state.deck_a.load_preset(&bad, false) {
+                    Ok(()) => println!("Bad shader preset returned Ok (no crash)."),
+                    Err(e) => println!("Bad shader preset caught error (no crash): {e}"),
+                }
+            }
+            Key::Character(ref ch) if ch.eq_ignore_ascii_case("p") => {
+                let _ = state
+                    .deck_a
+                    .capture_png(Path::new("docs/spike/deck_a.png"), &mut self.logger);
+                let _ = state
+                    .deck_b
+                    .capture_png(Path::new("docs/spike/deck_b.png"), &mut self.logger);
+                println!("Captured docs/spike/deck_a.png and deck_b.png");
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                state.deck_a_preset_idx = (state.deck_a_preset_idx + 1) % state.presets.len();
+                let _ = state
+                    .deck_a
+                    .load_preset(&state.presets[state.deck_a_preset_idx], true);
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                state.deck_a_preset_idx =
+                    (state.deck_a_preset_idx + state.presets.len() - 1) % state.presets.len();
+                let _ = state
+                    .deck_a
+                    .load_preset(&state.presets[state.deck_a_preset_idx], true);
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                state.deck_b_preset_idx = (state.deck_b_preset_idx + 1) % state.presets.len();
+                let _ = state
+                    .deck_b
+                    .load_preset(&state.presets[state.deck_b_preset_idx], true);
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                state.deck_b_preset_idx =
+                    (state.deck_b_preset_idx + state.presets.len() - 1) % state.presets.len();
+                let _ = state
+                    .deck_b
+                    .load_preset(&state.presets[state.deck_b_preset_idx], true);
+            }
+            _ => {}
         }
     }
 }
@@ -737,43 +1140,14 @@ impl ApplicationHandler for Stage3App {
                         ..
                     },
                 ..
-            } => match logical_key {
-                Key::Named(NamedKey::Escape) => {
+            } => {
+                if matches!(logical_key, Key::Named(NamedKey::Escape)) {
                     self.shutdown();
                     event_loop.exit();
+                } else {
+                    self.interactive_key(logical_key);
                 }
-                Key::Named(NamedKey::ArrowRight) => self.cycle_preset(true, 1),
-                Key::Named(NamedKey::ArrowLeft) => self.cycle_preset(true, -1),
-                Key::Named(NamedKey::ArrowUp) => self.cycle_preset(false, 1),
-                Key::Named(NamedKey::ArrowDown) => self.cycle_preset(false, -1),
-                Key::Character(ref ch) if ch == "1" => self.set_independence_mode(),
-                Key::Character(ref ch) if ch == "2" => {
-                    if let Some(s) = self.state.as_mut() {
-                        s.deck_a_audio = true;
-                        s.deck_b_audio = true;
-                        println!("Audio: Both Deck A and Deck B = TEST_AUDIO");
-                        self.logger.log_info("Audio: Both decks = TEST_AUDIO");
-                    }
-                }
-                Key::Character(ref ch) if ch.eq_ignore_ascii_case("a") => {
-                    if let Some(s) = self.state.as_mut() {
-                        s.deck_a_audio = !s.deck_a_audio;
-                        println!("Deck A audio -> {}", s.deck_a_audio);
-                    }
-                }
-                Key::Character(ref ch) if ch.eq_ignore_ascii_case("b") => {
-                    if let Some(s) = self.state.as_mut() {
-                        s.deck_b_audio = !s.deck_b_audio;
-                        println!("Deck B audio -> {}", s.deck_b_audio);
-                    }
-                }
-                Key::Character(ref ch) if ch.eq_ignore_ascii_case("s") => self.swap_presets(),
-                Key::Character(ref ch) if ch.eq_ignore_ascii_case("e") => {
-                    self.trigger_bad_preset_on_deck_a()
-                }
-                Key::Character(ref ch) if ch.eq_ignore_ascii_case("p") => self.capture_both_pngs(),
-                _ => {}
-            },
+            }
             WindowEvent::Resized(new_size) => {
                 if let Some(state) = &self.state {
                     if let (Some(w), Some(h)) = (
@@ -794,6 +1168,21 @@ impl ApplicationHandler for Stage3App {
     }
 }
 
+fn update_gpu_extremes(soak: &mut ActiveSoakRunner, g: GpuTelemetry) {
+    soak.min_gpu_clock = Some(match soak.min_gpu_clock {
+        Some(prev) => prev.min(g.graphics_clock_mhz),
+        None => g.graphics_clock_mhz,
+    });
+    soak.max_gpu_clock = Some(match soak.max_gpu_clock {
+        Some(prev) => prev.max(g.graphics_clock_mhz),
+        None => g.graphics_clock_mhz,
+    });
+    soak.max_gpu_temp = Some(match soak.max_gpu_temp {
+        Some(prev) => prev.max(g.temp_c),
+        None => g.temp_c,
+    });
+}
+
 fn format_mem(mem: Option<MemorySnapshotMb>) -> String {
     match mem {
         Some(m) => format!(
@@ -802,6 +1191,22 @@ fn format_mem(mem: Option<MemorySnapshotMb>) -> String {
         ),
         None => "unavailable".to_string(),
     }
+}
+
+fn format_mem_short(mem: Option<MemorySnapshotMb>) -> String {
+    match mem {
+        Some(m) => format!("WS={:.1}MiB/Priv={:.1}MiB", m.working_set_mb, m.private_commit_mb),
+        None => "mem=n/a".to_string(),
+    }
+}
+
+fn find_preset_by_prefix(presets: &[PathBuf], prefix: &str) -> Option<usize> {
+    presets.iter().position(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with(prefix))
+            .unwrap_or(false)
+    })
 }
 
 fn discover_valid_presets(dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -818,7 +1223,6 @@ fn discover_valid_presets(dir: &Path) -> Result<Vec<PathBuf>, String> {
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.eq_ignore_ascii_case("milk"))
             .unwrap_or(false);
-        // Skip our deliberately broken test preset (prefixed with `_bad_`) from the normal playlist.
         if is_milk && !name.starts_with("_bad_") {
             presets.push(path);
         }
@@ -841,56 +1245,115 @@ fn preset_label(path: &Path) -> String {
         .to_string()
 }
 
-/// Parses optional `--soak-minutes <float>` from command-line arguments.
-fn parse_soak_minutes() -> Option<Duration> {
-    let args: Vec<String> = std::env::args().collect();
-    for i in 1..args.len() {
-        if args[i] == "--soak-minutes" {
-            if let Some(val) = args.get(i + 1) {
-                if let Ok(mins) = val.parse::<f64>() {
-                    if mins > 0.0 {
-                        return Some(Duration::from_secs_f64(mins * 60.0));
-                    }
-                }
-            }
-        }
+fn parse_deck_size(val: &str) -> Result<(u32, u32), String> {
+    let parts: Vec<&str> = val.split(['x', 'X']).collect();
+    if parts.len() != 2 {
+        return Err(format!("Invalid --deck-size `{val}` (expected WxH like 1280x720)"));
     }
-    None
+    let w: u32 = parts[0]
+        .parse()
+        .map_err(|_| format!("Invalid width in --deck-size `{val}`"))?;
+    let h: u32 = parts[1]
+        .parse()
+        .map_err(|_| format!("Invalid height in --deck-size `{val}`"))?;
+    if w < 64 || h < 64 || w > 4096 || h > 4096 {
+        return Err(format!("--deck-size `{val}` out of safe range (64..=4096)"));
+    }
+    Ok((w, h))
+}
+
+fn parse_cli() -> CliConfig {
+    let args: Vec<String> = std::env::args().collect();
+    let mut mode = RunMode::Interactive;
+    let mut deck_width = 1920_u32;
+    let mut deck_height = 1080_u32;
+    let mut measure_gpu = false;
+    let mut custom_log: Option<PathBuf> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--measure-gpu" => measure_gpu = true,
+            "--bad-preset-test" => mode = RunMode::BadPresetTest,
+            "--preset-load-bench" => mode = RunMode::PresetLoadBench,
+            "--deck-size" => {
+                i += 1;
+                let val = args.get(i).expect("--deck-size requires WxH (e.g. 1280x720)");
+                let (w, h) = parse_deck_size(val).expect("Invalid --deck-size");
+                deck_width = w;
+                deck_height = h;
+            }
+            "--heavy-test-seconds" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .expect("--heavy-test-seconds requires a positive integer");
+                let secs: u64 = val
+                    .parse()
+                    .expect("--heavy-test-seconds must be a positive integer");
+                mode = RunMode::HeavyTest { steady_secs: secs };
+            }
+            "--soak-minutes" => {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .expect("--soak-minutes requires a positive number");
+                let mins: f64 = val
+                    .parse()
+                    .expect("--soak-minutes must be a positive number");
+                mode = RunMode::ActiveSoak { minutes: mins };
+            }
+            "--log" => {
+                i += 1;
+                let val = args.get(i).expect("--log requires a file path");
+                custom_log = Some(PathBuf::from(val));
+            }
+            other => panic!("Unknown CLI flag: `{other}`"),
+        }
+        i += 1;
+    }
+
+    let default_log = match &mode {
+        RunMode::Interactive => PathBuf::from("logs/stage3_spike.log"),
+        RunMode::BadPresetTest => PathBuf::from("logs/test_bad_presets.log"),
+        RunMode::PresetLoadBench => PathBuf::from("logs/test_preset_loads.log"),
+        RunMode::HeavyTest { .. } => {
+            PathBuf::from(format!("logs/test_heavy_{deck_width}x{deck_height}.log"))
+        }
+        RunMode::ActiveSoak { .. } => {
+            PathBuf::from(format!("logs/test_soak_{deck_width}x{deck_height}.log"))
+        }
+    };
+
+    CliConfig {
+        mode,
+        deck_width,
+        deck_height,
+        measure_gpu,
+        log_path: custom_log.unwrap_or(default_log),
+    }
 }
 
 fn main() {
     let pm_version = projectm_version_string();
-    println!("libprojectM runtime version: {pm_version}");
+    let config = parse_cli();
 
+    println!("libprojectM runtime version: {pm_version}");
     let presets = discover_valid_presets(Path::new("presets"))
         .expect("Failed to load presets from C:\\dev\\vj\\presets\\");
-    let bad_preset_path = PathBuf::from("presets/_bad_corrupt_test.milk");
-
-    let soak_duration = parse_soak_minutes();
     println!(
-        "Loaded {} valid presets. Bad preset test file: {}",
+        "Loaded {} valid presets | log file: {}",
         presets.len(),
-        bad_preset_path.display()
+        config.log_path.display()
     );
-    if let Some(dur) = soak_duration {
-        println!(
-            "Mode: AUTOMATED SOAK ({:.2} minutes). Will run Tests 1-3, save PNGs to docs/spike/, and measure stability.",
-            dur.as_secs_f64() / 60.0
-        );
-    } else {
-        println!("Mode: INTERACTIVE.");
-        println!("  1 = Test 1 Independence (Deck A audio, Deck B silence) | 2 = Both audio");
-        println!("  S = Test 2 Swap presets | E = Test 3 Bad preset on Deck A | P = Save PNGs");
-        println!("  Left/Right = Deck A preset | Up/Down = Deck B preset | Esc = Exit");
-    }
 
-    let logger = GlErrorLogger::open("logs/stage3_spike.log")
+    let logger = GlErrorLogger::open(&config.log_path)
         .expect("Could not initialize Stage 3 log file");
 
     let event_loop = EventLoop::new().expect("Failed to create winit event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = Stage3App::new(logger, presets, bad_preset_path, soak_duration);
+    let mut app = Stage3App::new(logger, presets, config);
     event_loop
         .run_app(&mut app)
         .expect("Event loop exited with an error");

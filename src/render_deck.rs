@@ -189,10 +189,16 @@ impl RenderDeck {
     /// Feeds PCM audio, renders one frame inside this deck's shared context with full
     /// OpenGL state save/restore, copies the pbuffer GPU-to-GPU into `output_texture`,
     /// and logs any OpenGL errors.
+    ///
+    /// When `measure_gpu` is `true` (diagnostic `--measure-gpu` mode ONLY), calls
+    /// `glFinish()` before returning so the caller's timer measures this deck's true
+    /// GPU render cost. In normal live rendering (`measure_gpu == false`), we only call
+    /// `glFlush()` and never stall the CPU.
     pub fn render_to_texture(
         &self,
         interleaved_lr_pcm: &[f32],
         frame_index: u64,
+        measure_gpu: bool,
         logger: &mut GlErrorLogger,
     ) -> Result<(), String> {
         self.make_current()?;
@@ -227,15 +233,69 @@ impl RenderDeck {
             self.gl.bind_texture(glow::TEXTURE_2D, None);
         }
 
-        // Restore GL state cleanly and flush GPU commands so the shared texture is ready
-        // when the main window context samples it.
+        // Restore GL state cleanly. In diagnostic `--measure-gpu` mode we wait for GPU
+        // completion (`glFinish`); in normal mode we only `glFlush` so the CPU never stalls.
         saved.restore(&self.gl);
         unsafe {
-            self.gl.flush();
+            if measure_gpu {
+                self.gl.finish();
+            } else {
+                self.gl.flush();
+            }
         }
 
         logger.check_frame(&self.gl, frame_index, &self.name);
         Ok(())
+    }
+
+    /// Samples a small 32x32 center patch of `output_texture` and returns average RGB
+    /// brightness (`0.0` = pure black/blank, `255.0` = pure white). Used only by the
+    /// diagnostic bad-preset test to report whether the deck went blank or stayed visible.
+    pub fn sample_center_brightness(&self, logger: &mut GlErrorLogger) -> Result<f64, String> {
+        self.make_current()?;
+        let patch = 32_i32;
+        let x0 = ((self.width as i32 - patch) / 2).max(0);
+        let y0 = ((self.height as i32 - patch) / 2).max(0);
+        let mut rgba = vec![0u8; (patch * patch * 4) as usize];
+
+        let saved = GlStateSnapshot::save(&self.gl);
+        unsafe {
+            let fbo = self
+                .gl
+                .create_framebuffer()
+                .map_err(|e| format!("[{}] Failed to create brightness FBO: {e}", self.name))?;
+            self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fbo));
+            self.gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(self.output_texture),
+                0,
+            );
+            self.gl.read_buffer(glow::COLOR_ATTACHMENT0);
+            self.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            self.gl.read_pixels(
+                x0,
+                y0,
+                patch,
+                patch,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut rgba)),
+            );
+            self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+            self.gl.delete_framebuffer(fbo);
+        }
+        saved.restore(&self.gl);
+        logger.check_frame(&self.gl, 0, &format!("{}-brightness", self.name));
+
+        let mut sum = 0u64;
+        let mut count = 0u64;
+        for px in rgba.chunks_exact(4) {
+            sum += px[0] as u64 + px[1] as u64 + px[2] as u64;
+            count += 3;
+        }
+        Ok(if count > 0 { sum as f64 / count as f64 } else { 0.0 })
     }
 
     /// Reads this deck's `output_texture` via `glReadPixels` (attached to a temporary FBO)
