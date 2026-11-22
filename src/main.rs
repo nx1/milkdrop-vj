@@ -40,7 +40,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::deck::{max_pcm_samples_per_channel, projectm_version_string, Deck};
+use crate::deck::{
+    init_gl_loader_for_projectm, max_pcm_samples_per_channel, projectm_version_string, Deck,
+};
 use crate::gl_log::GlErrorLogger;
 use crate::test_audio::TestAudioGenerator;
 
@@ -167,6 +169,20 @@ impl Stage2App {
         let size = window.inner_size();
         let width = size.width.max(1) as usize;
         let height = size.height.max(1) as usize;
+
+        // Initialize GLEW on Windows before creating the first libprojectM instance.
+        init_gl_loader_for_projectm().expect("Failed to initialize GLEW for libprojectM");
+        println!("GLEW initialized for libprojectM.");
+        self.logger.log_info("GLEW initialized for libprojectM.");
+
+        // Clear any benign GL_INVALID_ENUM that legacy GLEW probes may leave on Core profiles,
+        // and log if one occurred so nothing is hidden.
+        let glew_probe_errs = self.logger.check_frame(&gl, 0, "post-glew-init");
+        if glew_probe_errs > 0 {
+            self.logger.log_info(&format!(
+                "Note: drained {glew_probe_errs} GL flag(s) left by glewInit() probe on Core profile."
+            ));
+        }
 
         // Create our safe Deck wrapper on the active OpenGL context.
         let deck = Deck::new(width, height).expect("Failed to create libprojectM Deck");

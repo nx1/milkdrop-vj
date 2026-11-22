@@ -46,9 +46,12 @@ fn main() {
     );
     println!("cargo:rerun-if-changed={}", projectm_header.display());
 
-    // 1. Tell the linker where `projectM-4.lib` lives and link dynamically against it.
+    // 1. Tell the linker where `projectM-4.lib` and `glew32.lib` live and link both dynamically.
+    //    On Windows, `libprojectM` uses `glew32.dll` for its OpenGL calls and requires
+    //    the host app to call `glewInit()` once after creating an OpenGL context.
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=projectM-4");
+    println!("cargo:rustc-link-lib=dylib=glew32");
 
     // 2. Generate Rust bindings for the libprojectM C API using bindgen + libclang.
     let bindings = bindgen::Builder::default()

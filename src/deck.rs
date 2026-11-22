@@ -24,6 +24,43 @@ mod ffi {
     include!(concat!(env!("OUT_DIR"), "/projectm_bindings.rs"));
 }
 
+/// Minimal Windows GLEW C bindings from `glew32.dll` (verified against `GL/glew.h`).
+///
+/// Why this is required on Windows:
+/// `libprojectM 4.1.8` compiles its OpenGL calls against `glew32.dll` (`projectM-opengl.h`),
+/// and expects the host app to call `glewInit()` once on an active OpenGL context before
+/// calling `projectm_create()` (confirmed in `projectM`'s own `src/sdl-test-ui/setup.cpp`).
+/// Without `glewInit()`, every GLEW function pointer stays null (`0x0`), causing an
+/// immediate `0xC0000005` access violation inside `projectm_create()`.
+#[cfg(target_os = "windows")]
+mod glew_ffi {
+    pub const GLEW_OK: u32 = 0;
+
+    extern "C" {
+        pub fn glewInit() -> u32;
+        pub fn glewGetErrorString(error: u32) -> *const std::os::raw::c_char;
+    }
+}
+
+/// Initializes GLEW's OpenGL function table on the currently active OpenGL context.
+/// Must be called once on Windows before the first `Deck::new()`.
+pub fn init_gl_loader_for_projectm() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        let err = glew_ffi::glewInit();
+        if err != glew_ffi::GLEW_OK {
+            let msg_ptr = glew_ffi::glewGetErrorString(err);
+            let msg = if msg_ptr.is_null() {
+                format!("GLEW error code {err}")
+            } else {
+                CStr::from_ptr(msg_ptr).to_string_lossy().into_owned()
+            };
+            return Err(format!("glewInit() failed (code {err}): {msg}"));
+        }
+    }
+    Ok(())
+}
+
 /// Returns the runtime `libprojectM` version string (for example `"4.1.8"`).
 /// Safely frees the C-allocated string via `projectm_free_string()`.
 pub fn projectm_version_string() -> String {
