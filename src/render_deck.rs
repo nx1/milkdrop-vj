@@ -3,24 +3,30 @@
 //! How Pattern 1 works:
 //! - Each `RenderDeck` owns its own OpenGL 3.3 Core context that **shares its
 //!   texture namespace** with the main window's OpenGL context (`.with_sharing(...)`).
-//! - Each `RenderDeck` also owns an off-screen 1920x1080 WGL pbuffer surface and
-//!   a 1920x1080 shared `GL_TEXTURE_2D` (`output_texture`).
-//! - On every frame (all on ONE thread — see `src/main.rs` for why):
-//!   1. Make this deck's context current on its pbuffer.
-//!   2. Save OpenGL state (`GlStateSnapshot::save`).
-//!   3. Feed PCM audio and call `projectm_opengl_render_frame()`.
-//!   4. Reset `READ_FRAMEBUFFER` to FBO 0 (the pbuffer) and copy the 1920x1080 image
-//!      GPU-to-GPU into `output_texture` (`glCopyTexSubImage2D`).
-//!   5. Restore OpenGL state and check `glGetError()`.
-//! - Back on the main window context, the compositor reads both decks' shared
-//!   `output_texture` handles and draws them side by side.
+//! - Each `RenderDeck` also owns an off-screen WGL pbuffer surface (default `1280x720`
+//!   during development on this laptop) and a shared `GL_TEXTURE_2D` (`output_texture`).
+//! - Cross-context synchronization (OpenGL 3.3 Core Spec, Chapter 5 / Section 5.3):
+//!   Shared textures are visible across contexts in the same share group, but each
+//!   context has an independent GPU command stream. `glFlush()` alone does NOT guarantee
+//!   that this deck's `glCopyTexSubImage2D` finishes before the main window samples the
+//!   texture. Therefore, after copying into `output_texture`, we insert a GPU fence sync
+//!   (`glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0)`) followed immediately by `glFlush()`.
+//!   Before sampling `output_texture`, the main context calls `glWaitSync` (GPU-side wait
+//!   only — zero CPU stall) and deletes the sync object.
+//! - Blank-deck detection (`2A-1`):
+//!   Instead of reading back full 720p/1080p frames every frame, each deck maintains a tiny
+//!   reusable `32x18` FBO and a `2,304`-byte Pixel Buffer Object (`GL_PIXEL_PACK_BUFFER`).
+//!   Every `500 ms` (`2x/sec`), it reads the *previous* asynchronous PBO transfer (already
+//!   complete — zero GPU stall) and starts the next `32x18` blit + async PBO readback.
+//!   If Rec. 709 average luma stays below `3.0 / 255.0` continuously for `>= 2.0 seconds`,
+//!   `is_blank_warning` becomes `true`.
 
 use std::ffi::CStr;
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use glow::HasContext;
 use glutin::config::Config;
@@ -31,31 +37,276 @@ use glutin::display::Display;
 use glutin::prelude::*;
 use glutin::surface::{PbufferSurface, Surface, SurfaceAttributesBuilder};
 
-use milkdrop_vj::deck::Deck;
 use crate::gl_log::GlErrorLogger;
 use crate::gl_state::{reset_read_to_default_fbo, GlStateSnapshot};
+use milkdrop_vj::deck::Deck;
+
+/// Downscaled sample dimensions for asynchronous blank-deck detection (`32x18` = 576 pixels).
+const BLANK_SAMPLE_W: i32 = 32;
+const BLANK_SAMPLE_H: i32 = 18;
+const BLANK_SAMPLE_BYTES: usize = (BLANK_SAMPLE_W * BLANK_SAMPLE_H * 4) as usize;
+/// Sample blank-deck luma twice per second (`500 ms` interval).
+const BLANK_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+/// Rec. 709 average luma (`0.0..=255.0`) below which a frame counts as "dark".
+/// Broken `shader_body` presets measured `0.0/255`; `3.0` catches pure black plus
+/// tiny dithering/rounding noise without false-triggering dim valid presets.
+pub const BLANK_LUMA_THRESHOLD: f32 = 3.0;
+/// How long average luma must stay below `BLANK_LUMA_THRESHOLD` before warning (`2.0 s`),
+/// so legitimate brief fade-to-black transitions do not trigger false alarms.
+pub const BLANK_HOLD_SECONDS: f32 = 2.0;
 
 /// Split timing returned by `RenderDeck::render_to_texture()` for one frame.
-///
-/// - `cpu_submit_ms`: Time spent on the CPU inside `add_pcm_stereo()`,
-///   `projectm_opengl_render_frame()`, and `glCopyTexSubImage2D` **before** `glFinish()`.
-/// - `gpu_wait_ms`: Extra time spent waiting inside `glFinish()` (only non-zero when
-///   `measure_gpu == true`). Comparing these two numbers separates CPU-side cost from
-///   GPU-side cost.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DeckRenderTiming {
+    /// CPU time spent inside `add_pcm_stereo()`, `projectm_opengl_render_frame()`,
+    /// `glCopyTexSubImage2D`, and fence insertion (before any optional `glFinish`).
     pub cpu_submit_ms: f64,
+    /// Extra time waiting inside `glFinish()` (only non-zero when `--measure-gpu` is active).
     pub gpu_wait_ms: f64,
+    /// CPU time spent in the `500 ms` async downscaled blank-deck check, when it ran this frame.
+    pub blank_check_ms: Option<f64>,
 }
 
 impl DeckRenderTiming {
+    #[allow(dead_code)]
     pub fn total_ms(self) -> f64 {
         self.cpu_submit_ms + self.gpu_wait_ms
     }
 }
 
+/// Snapshot of a deck's asynchronous blank-deck detector state for UI display.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BlankDeckStatus {
+    /// Most recent Rec. 709 average luma (`0.0..=255.0`) across the `32x18` sample.
+    pub avg_luma: f32,
+    /// True once a first async readback sample has completed.
+    pub has_sample: bool,
+    /// Seconds the deck has stayed continuously below `BLANK_LUMA_THRESHOLD`.
+    pub dark_seconds: f32,
+    /// True when `dark_seconds >= BLANK_HOLD_SECONDS` (`2.0 s`).
+    pub is_blank_warning: bool,
+}
+
+/// Reusable GPU resources for zero-stall `32x18` PBO blank-deck detection.
+struct BlankDetector {
+    src_fbo: glow::NativeFramebuffer,
+    dst_fbo: glow::NativeFramebuffer,
+    dst_tex: glow::NativeTexture,
+    pbo: glow::NativeBuffer,
+    pbo_in_flight: bool,
+    last_sample_time: Instant,
+    avg_luma: f32,
+    has_sample: bool,
+    dark_since: Option<Instant>,
+}
+
+impl BlankDetector {
+    fn new(
+        gl: &glow::Context,
+        output_texture: glow::NativeTexture,
+        name: &str,
+    ) -> Result<Self, String> {
+        unsafe {
+            let src_fbo = gl
+                .create_framebuffer()
+                .map_err(|e| format!("[{name}] Failed to create blank src FBO: {e}"))?;
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(src_fbo));
+            gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(output_texture),
+                0,
+            );
+
+            let dst_tex = gl
+                .create_texture()
+                .map_err(|e| format!("[{name}] Failed to create blank 32x18 texture: {e}"))?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(dst_tex));
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::LINEAR as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::LINEAR as i32,
+            );
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                BLANK_SAMPLE_W,
+                BLANK_SAMPLE_H,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            gl.bind_texture(glow::TEXTURE_2D, None);
+
+            let dst_fbo = gl
+                .create_framebuffer()
+                .map_err(|e| format!("[{name}] Failed to create blank 32x18 FBO: {e}"))?;
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(dst_fbo));
+            gl.framebuffer_texture_2d(
+                glow::DRAW_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(dst_tex),
+                0,
+            );
+
+            let pbo = gl
+                .create_buffer()
+                .map_err(|e| format!("[{name}] Failed to create blank PBO: {e}"))?;
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(pbo));
+            gl.buffer_data_size(
+                glow::PIXEL_PACK_BUFFER,
+                BLANK_SAMPLE_BYTES as i32,
+                glow::STREAM_READ,
+            );
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+
+            Ok(Self {
+                src_fbo,
+                dst_fbo,
+                dst_tex,
+                pbo,
+                pbo_in_flight: false,
+                // Trigger first sample quickly (~100 ms after startup) instead of waiting 500 ms.
+                last_sample_time: Instant::now()
+                    .checked_sub(Duration::from_millis(400))
+                    .unwrap_or_else(Instant::now),
+                avg_luma: 255.0,
+                has_sample: false,
+                dark_since: None,
+            })
+        }
+    }
+
+    fn reset_dark_timer(&mut self) {
+        self.dark_since = None;
+    }
+
+    fn status(&self) -> BlankDeckStatus {
+        let dark_seconds = self
+            .dark_since
+            .map(|t| t.elapsed().as_secs_f32())
+            .unwrap_or(0.0);
+        BlankDeckStatus {
+            avg_luma: self.avg_luma,
+            has_sample: self.has_sample,
+            dark_seconds,
+            is_blank_warning: self.has_sample && dark_seconds >= BLANK_HOLD_SECONDS,
+        }
+    }
+
+    /// Runs once every `500 ms`: reads the previous async PBO transfer (already finished on GPU)
+    /// and kicks off a new downscaled `32x18` blit + async PBO `glReadPixels`.
+    fn maybe_sample(
+        &mut self,
+        gl: &glow::Context,
+        src_width: u32,
+        src_height: u32,
+    ) -> Option<f64> {
+        let now = Instant::now();
+        if now.duration_since(self.last_sample_time) < BLANK_SAMPLE_INTERVAL {
+            return None;
+        }
+        self.last_sample_time = now;
+
+        let t0 = Instant::now();
+        unsafe {
+            // 1. Collect previous sample from PBO (500 ms old -> DMA already finished, zero stall).
+            if self.pbo_in_flight {
+                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(self.pbo));
+                let ptr = gl.map_buffer_range(
+                    glow::PIXEL_PACK_BUFFER,
+                    0,
+                    BLANK_SAMPLE_BYTES as i32,
+                    glow::MAP_READ_BIT,
+                );
+                if !ptr.is_null() {
+                    let bytes = std::slice::from_raw_parts(ptr, BLANK_SAMPLE_BYTES);
+                    let mut luma_sum = 0.0_f64;
+                    let pixel_count = (BLANK_SAMPLE_W * BLANK_SAMPLE_H) as f64;
+                    for px in bytes.chunks_exact(4) {
+                        // Rec. 709 perceived luminance on 0..=255 RGB.
+                        luma_sum +=
+                            0.2126 * px[0] as f64 + 0.7152 * px[1] as f64 + 0.0722 * px[2] as f64;
+                    }
+                    self.avg_luma = (luma_sum / pixel_count) as f32;
+                    self.has_sample = true;
+                    if self.avg_luma < BLANK_LUMA_THRESHOLD {
+                        if self.dark_since.is_none() {
+                            self.dark_since = Some(now);
+                        }
+                    } else {
+                        self.dark_since = None;
+                    }
+                    gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
+                }
+                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            }
+
+            // 2. Downscale full output_texture -> 32x18 FBO using hardware linear blit.
+            // Disable scissor test so a preset's scissor box can never clip the 32x18 blit
+            // (`saved.restore()` restores the deck's original scissor state right afterward).
+            gl.disable(glow::SCISSOR_TEST);
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.src_fbo));
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.dst_fbo));
+            gl.blit_framebuffer(
+                0,
+                0,
+                src_width as i32,
+                src_height as i32,
+                0,
+                0,
+                BLANK_SAMPLE_W,
+                BLANK_SAMPLE_H,
+                glow::COLOR_BUFFER_BIT,
+                glow::LINEAR,
+            );
+
+            // 3. Kick off asynchronous GPU -> PBO readback of the tiny 32x18 image (returns immediately).
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.dst_fbo));
+            gl.read_buffer(glow::COLOR_ATTACHMENT0);
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(self.pbo));
+            gl.read_pixels(
+                0,
+                0,
+                BLANK_SAMPLE_W,
+                BLANK_SAMPLE_H,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::BufferOffset(0),
+            );
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+            self.pbo_in_flight = true;
+        }
+
+        Some(t0.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    fn destroy(&self, gl: &glow::Context) {
+        unsafe {
+            gl.delete_buffer(self.pbo);
+            gl.delete_framebuffer(self.dst_fbo);
+            gl.delete_framebuffer(self.src_fbo);
+            gl.delete_texture(self.dst_tex);
+        }
+    }
+}
+
 /// One isolated MilkDrop deck owning its own shared OpenGL context, off-screen
-/// pbuffer surface, shared output texture, and `libprojectM` instance.
+/// pbuffer surface, shared output texture, fence sync, blank detector, and `libprojectM` instance.
 pub struct RenderDeck {
     name: String,
     width: u32,
@@ -65,6 +316,11 @@ pub struct RenderDeck {
     deck: Option<Deck>,
     /// Shared `GL_TEXTURE_2D` visible to BOTH this deck's context and the main window context.
     output_texture: glow::NativeTexture,
+    /// Pending GPU fence inserted after `glCopyTexSubImage2D` + `glFlush()` so the main/projector
+    /// context can call `glWaitSync` before sampling `output_texture`.
+    pending_sync: Option<glow::NativeFence>,
+    /// Asynchronous `32x18` PBO blank-deck detector (`2x/sec`, zero CPU/GPU stall).
+    blank_detector: BlankDetector,
     pbuffer: Surface<PbufferSurface>,
     context: PossiblyCurrentContext,
     gl: glow::Context,
@@ -87,7 +343,7 @@ impl RenderDeck {
         let w_nz = NonZeroU32::new(width).ok_or_else(|| "Deck width must be > 0".to_string())?;
         let h_nz = NonZeroU32::new(height).ok_or_else(|| "Deck height must be > 0".to_string())?;
 
-        // 1. Create the off-screen 1920x1080 WGL pbuffer surface.
+        // 1. Create the off-screen WGL pbuffer surface.
         let pbuffer_attrs = SurfaceAttributesBuilder::<PbufferSurface>::new().build(w_nz, h_nz);
         let pbuffer = unsafe {
             gl_display
@@ -118,7 +374,7 @@ impl RenderDeck {
             })
         };
 
-        // 4. Allocate the shared 1920x1080 RGBA8 texture that the main compositor will sample.
+        // 4. Allocate the shared RGBA8 texture that the main window / compositor will sample.
         let output_texture = unsafe {
             let tex = gl
                 .create_texture()
@@ -159,7 +415,10 @@ impl RenderDeck {
             tex
         };
 
-        // 5. Create this deck's own independent `libprojectM` instance on this context.
+        // 5. Create reusable async 32x18 PBO blank-deck detector on this context.
+        let blank_detector = BlankDetector::new(&gl, output_texture, name)?;
+
+        // 6. Create this deck's own independent `libprojectM` instance on this context.
         let deck = Deck::new(width as usize, height as usize)?;
 
         // Check GL errors right after deck initialization.
@@ -171,6 +430,8 @@ impl RenderDeck {
             height,
             deck: Some(deck),
             output_texture,
+            pending_sync: None,
+            blank_detector,
             pbuffer,
             context,
             gl,
@@ -182,6 +443,17 @@ impl RenderDeck {
         self.output_texture
     }
 
+    /// Takes the pending cross-context GPU fence (inserted after `glCopyTexSubImage2D` + `glFlush`),
+    /// transferring ownership so the main context can call `glWaitSync` + `glDeleteSync`.
+    pub fn take_pending_sync(&mut self) -> Option<glow::NativeFence> {
+        self.pending_sync.take()
+    }
+
+    /// Returns the latest asynchronous blank-deck detector status for UI display.
+    pub fn blank_status(&self) -> BlankDeckStatus {
+        self.blank_detector.status()
+    }
+
     /// Makes this deck's OpenGL context current on the calling thread.
     pub fn make_current(&self) -> Result<(), String> {
         self.context
@@ -190,8 +462,9 @@ impl RenderDeck {
     }
 
     /// Loads a `.milk` preset onto this deck (making its context current first).
-    pub fn load_preset(&self, path: &Path, smooth_transition: bool) -> Result<(), String> {
+    pub fn load_preset(&mut self, path: &Path, smooth_transition: bool) -> Result<(), String> {
         self.make_current()?;
+        self.blank_detector.reset_dark_timer();
         let deck = self
             .deck
             .as_ref()
@@ -208,13 +481,10 @@ impl RenderDeck {
 
     /// Feeds PCM audio, renders one frame inside this deck's shared context with full
     /// OpenGL state save/restore, copies the pbuffer GPU-to-GPU into `output_texture`,
-    /// and logs any OpenGL errors.
-    ///
-    /// Returns split timing (`cpu_submit_ms` before `glFinish` and `gpu_wait_ms` inside
-    /// `glFinish` when `measure_gpu == true`). In normal live rendering (`measure_gpu == false`),
-    /// we only call `glFlush()` and never stall the CPU.
+    /// runs the `500 ms` async blank-deck PBO check, inserts an OpenGL 5.3 fence sync +
+    /// `glFlush()`, and logs any OpenGL errors.
     pub fn render_to_texture(
-        &self,
+        &mut self,
         interleaved_lr_pcm: &[f32],
         frame_index: u64,
         measure_gpu: bool,
@@ -222,6 +492,14 @@ impl RenderDeck {
     ) -> Result<DeckRenderTiming, String> {
         let t_start = Instant::now();
         self.make_current()?;
+
+        // If a previous frame's sync was never consumed (for example minimized window), free it.
+        if let Some(old_sync) = self.pending_sync.take() {
+            unsafe {
+                self.gl.delete_sync(old_sync);
+            }
+        }
+
         let deck = self
             .deck
             .as_ref()
@@ -253,11 +531,25 @@ impl RenderDeck {
             self.gl.bind_texture(glow::TEXTURE_2D, None);
         }
 
+        // Periodic (500 ms) asynchronous 32x18 PBO blank-deck check (zero pipeline stall).
+        let blank_check_ms = self
+            .blank_detector
+            .maybe_sample(&self.gl, self.width, self.height);
+
+        // OpenGL 3.3 Core Spec (Section 5.3): insert a fence sync after writing the shared
+        // texture and immediately flush so the fence is queued for the main context's glWaitSync.
+        let fence = unsafe {
+            self.gl
+                .fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)
+                .map_err(|e| format!("[{}] glFenceSync failed: {e}", self.name))?
+        };
+        self.pending_sync = Some(fence);
+
         saved.restore(&self.gl);
         let cpu_submit_ms = t_start.elapsed().as_secs_f64() * 1000.0;
 
-        // In diagnostic `--measure-gpu` mode we time the extra wait inside `glFinish()`;
-        // in normal mode we only `glFlush` so the CPU never stalls.
+        // Always flush so `fence` enters the GPU command stream before another context calls glWaitSync.
+        // In diagnostic `--measure-gpu` mode we also time `glFinish()`; normal mode never stalls CPU.
         let gpu_wait_ms = if measure_gpu {
             let t_gpu = Instant::now();
             unsafe {
@@ -275,62 +567,12 @@ impl RenderDeck {
         Ok(DeckRenderTiming {
             cpu_submit_ms,
             gpu_wait_ms,
+            blank_check_ms,
         })
     }
 
-    /// Samples a small 32x32 center patch of `output_texture` and returns average RGB
-    /// brightness (`0.0` = pure black/blank, `255.0` = pure white). Used by bad-preset
-    /// and Milestone 2 blank-deck detection.
+    /// Reads this deck's `output_texture` via `glReadPixels` and saves it as a PNG file.
     #[allow(dead_code)]
-    pub fn sample_center_brightness(&self, logger: &mut GlErrorLogger) -> Result<f64, String> {
-        self.make_current()?;
-        let patch = 32_i32;
-        let x0 = ((self.width as i32 - patch) / 2).max(0);
-        let y0 = ((self.height as i32 - patch) / 2).max(0);
-        let mut rgba = vec![0u8; (patch * patch * 4) as usize];
-
-        let saved = GlStateSnapshot::save(&self.gl);
-        unsafe {
-            let fbo = self
-                .gl
-                .create_framebuffer()
-                .map_err(|e| format!("[{}] Failed to create brightness FBO: {e}", self.name))?;
-            self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fbo));
-            self.gl.framebuffer_texture_2d(
-                glow::READ_FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D,
-                Some(self.output_texture),
-                0,
-            );
-            self.gl.read_buffer(glow::COLOR_ATTACHMENT0);
-            self.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
-            self.gl.read_pixels(
-                x0,
-                y0,
-                patch,
-                patch,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut rgba)),
-            );
-            self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
-            self.gl.delete_framebuffer(fbo);
-        }
-        saved.restore(&self.gl);
-        logger.check_frame(&self.gl, 0, &format!("{}-brightness", self.name));
-
-        let mut sum = 0u64;
-        let mut count = 0u64;
-        for px in rgba.chunks_exact(4) {
-            sum += px[0] as u64 + px[1] as u64 + px[2] as u64;
-            count += 3;
-        }
-        Ok(if count > 0 { sum as f64 / count as f64 } else { 0.0 })
-    }
-
-    /// Reads this deck's `output_texture` via `glReadPixels` (attached to a temporary FBO)
-    /// and saves it as a PNG file (flipped vertically so top-of-screen is top-of-PNG).
     pub fn capture_png(&self, out_path: &Path, logger: &mut GlErrorLogger) -> Result<(), String> {
         self.make_current()?;
 
@@ -374,8 +616,6 @@ impl RenderDeck {
         saved.restore(&self.gl);
         logger.check_frame(&self.gl, 0, &format!("{}-capture-png", self.name));
 
-        // Flip rows vertically (OpenGL origin is bottom-left; PNG origin is top-left)
-        // and force alpha=255 so the captured image is fully opaque.
         let row_bytes = w * 4;
         let mut flipped = vec![0u8; rgba.len()];
         for y in 0..h {
@@ -402,11 +642,17 @@ impl RenderDeck {
         Ok(())
     }
 
-    /// Cleanly destroys `libprojectM` and the shared texture while this deck's context is current.
+    /// Cleanly destroys `libprojectM`, blank detector resources, pending fence, and the shared texture.
     pub fn destroy(&mut self) {
         if self.make_current().is_ok() {
             // Drop `Deck` (calls `projectm_destroy`) while this context is current.
             self.deck.take();
+            if let Some(fence) = self.pending_sync.take() {
+                unsafe {
+                    self.gl.delete_sync(fence);
+                }
+            }
+            self.blank_detector.destroy(&self.gl);
             unsafe {
                 self.gl.delete_texture(self.output_texture);
             }

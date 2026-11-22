@@ -2,4 +2,5 @@
 /vcpkg_installed
 /logs
 /presets
+/mappings.json
 *.pdb

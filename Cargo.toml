@@ -15,6 +15,12 @@ glutin-winit = "0.5.0"
 raw-window-handle = "0.6.2"
 # Thin, clean Rust bindings to OpenGL functions (matches egui_glow 0.37 for Milestone 2).
 glow = "0.17"
+# Immediate-mode UI framework and winit/glow integration (re-verified compatible with glow 0.17).
+egui = "0.37.0"
+egui_glow = { version = "0.37.0", features = ["winit"] }
+# JSON serialization for `mappings.json` (Control Bus) and preset scan cache.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # Pure-Rust PNG encoder used to save glReadPixels evidence captures in Stage 3.
 png = "0.18"
 # Native Windows WASAPI audio capture (supports loopback on Render devices, event timeouts,

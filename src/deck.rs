@@ -148,8 +148,10 @@ impl Deck {
             ffi::projectm_set_window_size(handle, width, height);
             ffi::projectm_set_fps(handle, 60);
             ffi::projectm_set_aspect_correction(handle, true);
-            // Human-in-the-loop: lock preset so libprojectM never switches behind our back.
+            // Human-in-the-loop (verified in ProjectM.cpp lines 108-125 and ProjectM.hpp line 195):
+            // Lock preset and disable beat-triggered hard cuts so ONLY user actions can change presets.
             ffi::projectm_set_preset_locked(handle, true);
+            ffi::projectm_set_hard_cut_enabled(handle, false);
             ffi::projectm_set_soft_cut_duration(handle, 1.5);
             ffi::projectm_set_beat_sensitivity(handle, 1.0);
             ffi::projectm_set_preset_switch_failed_event_callback(

@@ -1,5 +1,7 @@
 //! Frame timing statistics, FPS buckets, Windows process memory, and background
-//! `nvidia-smi` GPU telemetry for Stage 3 diagnostics and the 10-minute soak test.
+//! `nvidia-smi` GPU telemetry for diagnostics and Retest on Better Hardware runs.
+
+#![allow(dead_code)]
 
 use std::ffi::c_void;
 use std::process::Command;

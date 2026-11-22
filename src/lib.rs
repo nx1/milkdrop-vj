@@ -5,5 +5,7 @@
 //! visualizer (`src/main.rs`) and console tools (`src/bin/audio_test.rs`) share code.
 
 pub mod audio;
+pub mod control;
 pub mod deck;
+pub mod preset_meta;
 pub mod test_audio;

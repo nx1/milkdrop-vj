@@ -1,49 +1,38 @@
-//! Milestone 1 Part 2 — Stage B: Two `libprojectM 4.1.8` Decks Driven by Live
-//! Windows WASAPI Loopback Audio via a Lock-Free Ring Buffer.
+//! Milestone 2 — Stage `2A-1`: Dark-Venue `egui` Console, Control Bus (`mappings.json`),
+//! OpenGL 5.3 Cross-Context Sync, Async Blank-Deck Warning, and Preset-Load Stall Logging.
 //!
-//! Threading model:
-//! - **Background thread (`wasapi-loopback-capture`):** Owns `WasapiLoopbackSource`,
-//!   reads native Windows loopback packets, converts/downmixes to stereo `f32`, and
-//!   pushes timestamped frames into a lock-free SPSC ring buffer (`RingProducer`).
-//! - **Main thread:** Owns all OpenGL contexts (`Deck A`, `Deck B`, `main window`),
-//!   pops audio from `RingConsumer` without blocking, measures the age of the oldest
-//!   sample reaching `libprojectM`, feeds both decks, and composites side by side.
+//! Architecture:
+//! - **Control Bus (`src/control/mod.rs`):** Normalized `0.0..=1.0` parameter store and trigger
+//!   queue backed by `mappings.json`, built first so `egui` widgets (`2A-1`), GPU mixer (`2A-2`),
+//!   remappable keyboard shortcuts (`2A-3`), and future MIDI (Milestone 4) share one bus.
+//! - **Background thread (`wasapi-loopback-capture`):** Streams native Windows WASAPI loopback
+//!   audio into a lock-free SPSC ring buffer (or falls back to Synthetic Test Audio via CLI).
+//! - **Main thread (single-threaded OpenGL):**
+//!   1. Renders Deck A and Deck B in their shared OpenGL 3.3 Core pbuffer contexts (`1280x720`
+//!      default per Light-Load Rules).
+//!   2. Each deck inserts a `glFenceSync` + `glFlush()` after `glCopyTexSubImage2D` and runs an
+//!      asynchronous `32x18` PBO blank-deck luma sample twice per second (zero stall).
+//!   3. Main window context executes GPU-only `glWaitSync` + `glDeleteSync` for both decks
+//!      (OpenGL 3.3 Core Spec, Chapter 5 / Section 5.3) before `egui_glow` draws Deck A and Deck B.
 //!
 //! CLI flags:
 //! - `--audio-source live|test`   Select Live WASAPI Loopback (default) or Synthetic Test Audio
 //! - `--audio-device <filter>`    Select output device by 1-based index or name substring
-//! - `--deck-size WxH`            Internal render resolution per deck (default `1920x1080`)
-//! - `--measure-gpu`              Diagnostic `glFinish()` split timing (OFF in live runs)
-//! - `--soak-minutes N`           Active soak with 10s preset rotation & 30s full telemetry
-//! - `--log <path>`               Custom log file path
-//!
-//! Interactive keys:
-//! - `L`          Toggle Live WASAPI Loopback vs. Synthetic Test Audio
-//! - `R`          Reconnect Live WASAPI Loopback to current Windows default output device
-//! - `1` / `2`    Deck A active + Deck B silent (Independence) / Both decks active
-//! - `S`          Swap presets between Deck A and Deck B
-//! - `E`          Load broken shader preset onto Deck A
-//! - `P`          Capture 1080p PNGs to `docs/spike/`
-//! - `Left/Right` Cycle Deck A preset | `Up/Down` Cycle Deck B preset | `Esc` Clean exit
+//! - `--deck-size WxH`            Internal render resolution per deck (default `1280x720`)
+//! - `--measure-gpu`              Diagnostic `glFinish()` split timing (OFF in normal runs)
+//! - `--log <path>`               Custom log file path (default `logs/stage_2a1.log`)
 
-mod compositor;
 mod gl_log;
 mod gl_state;
 mod metrics;
 mod render_deck;
-
-use milkdrop_vj::audio::capture_thread::LiveAudioCapture;
-use milkdrop_vj::audio::wasapi_loopback::WasapiLoopbackSource;
-use milkdrop_vj::audio::AudioSource;
-use milkdrop_vj::deck::{
-    init_gl_loader_for_projectm, max_pcm_samples_per_channel, projectm_version_string,
-};
-use milkdrop_vj::test_audio::TestAudioGenerator;
+mod ui;
 
 use std::ffi::CStr;
 use std::fs;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glow::HasContext;
@@ -58,21 +47,27 @@ use glutin_winit::{DisplayBuilder, GlWindow};
 use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::compositor::SideBySideCompositor;
-use crate::gl_log::GlErrorLogger;
-use crate::metrics::{
-    current_process_memory_mb, FpsBucketTracker, GpuTelemetry, GpuTelemetryMonitor,
-    MemorySnapshotMb, TimingStats,
+use milkdrop_vj::audio::capture_thread::LiveAudioCapture;
+use milkdrop_vj::audio::wasapi_loopback::WasapiLoopbackSource;
+use milkdrop_vj::audio::AudioSource;
+use milkdrop_vj::control::{param, ControlBus, MappingsConfig};
+use milkdrop_vj::deck::{
+    init_gl_loader_for_projectm, max_pcm_samples_per_channel, projectm_version_string,
 };
-use crate::render_deck::RenderDeck;
+use milkdrop_vj::preset_meta::{estimate_complexity_from_file, PresetComplexity};
+use milkdrop_vj::test_audio::TestAudioGenerator;
 
-/// Threshold for counting slow frames: 1 / 55 FPS = 18.1818 ms.
-const FRAME_BELOW_55_FPS_MS: f64 = 1000.0 / 55.0;
+use crate::gl_log::GlErrorLogger;
+use crate::metrics::{current_process_memory_mb, MemorySnapshotMb, TimingStats};
+use crate::render_deck::RenderDeck;
+use crate::ui::{
+    apply_dark_venue_style, draw_console_ui, AudioBadgeState, ConsoleUiState, DeckUiSnapshot,
+    LastLoadSummary, StarterPresetRow,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AudioMode {
@@ -81,14 +76,7 @@ enum AudioMode {
 }
 
 #[derive(Clone, Debug)]
-enum RunMode {
-    Interactive,
-    ActiveSoak { minutes: f64 },
-}
-
-#[derive(Clone, Debug)]
 struct CliConfig {
-    mode: RunMode,
     audio_mode: AudioMode,
     audio_device_filter: Option<String>,
     deck_width: u32,
@@ -97,1146 +85,1105 @@ struct CliConfig {
     log_path: PathBuf,
 }
 
-struct ActiveSoakRunner {
-    target_duration: Duration,
-    last_switch_time: Instant,
-    switch_count: usize,
-    next_preset_cursor: usize,
-    last_telemetry_time: Instant,
-    last_1s_time: Instant,
-    last_1s_frames: u64,
-    fps_window_30s: FpsBucketTracker,
-    fps_all_1s: FpsBucketTracker,
-    frames_below_55: u64,
-    min_gpu_clock: Option<u32>,
-    max_gpu_clock: Option<u32>,
-    max_gpu_temp: Option<u32>,
-    gpu_monitor: GpuTelemetryMonitor,
+/// Metadata cached at startup for each starter `.milk` preset in `C:\dev\vj\presets\`.
+#[derive(Clone, Debug)]
+struct PresetEntry {
+    path: PathBuf,
+    display_name: String,
+    folder: String,
+    complexity: PresetComplexity,
 }
 
-struct StageBState {
+/// Tracks the preset-load frame (`+0`) and the next two frames (`+1`, `+2`) for Risk 8 logging.
+#[derive(Clone, Debug)]
+struct PendingStallTrace {
+    deck_label: String,
+    preset_name: String,
+    load_call_ms: f64,
+    smooth: bool,
+    step: u8,
+}
+
+struct ConsoleState {
     config: CliConfig,
+    // Drop order matters: destroy `egui_glow`, `deck_a`, `deck_b` explicitly in `shutdown()`
+    // while their respective OpenGL contexts are current.
+    egui_glow: egui_glow::EguiGlow,
+    deck_a_tex_id: egui::TextureId,
+    deck_b_tex_id: egui::TextureId,
     deck_a: RenderDeck,
     deck_b: RenderDeck,
-    compositor: SideBySideCompositor,
     window: Window,
     main_surface: Surface<WindowSurface>,
     main_context: PossiblyCurrentContext,
-    main_gl: glow::Context,
+    main_gl: Arc<glow::Context>,
 
-    // Swappable live vs. synthetic audio pipeline.
+    // Unified Control Bus + mappings.json
+    bus: ControlBus,
+    mappings_status: String,
+
+    // GPU info
+    gpu_label: String,
+    gpu_is_intel: bool,
+
+    // Audio pipeline
     audio_mode: AudioMode,
     live_capture: Option<LiveAudioCapture>,
+    audio_device_name: String,
+    audio_sample_rate: u32,
     last_wasapi_packets: u64,
+    last_packet_time: Instant,
+    audio_peak_db: f32,
     audio_age_stats: TimingStats,
-    audio_a_gen: TestAudioGenerator,
-    max_pcm_samples: usize,
+    synth_gen: TestAudioGenerator,
     live_pcm_buf: Vec<f32>,
     synth_pcm_buf: Vec<f32>,
     silence_pcm_buf: Vec<f32>,
-    deck_a_audio: bool,
-    deck_b_audio: bool,
     device_lost_logged: bool,
 
     // Presets
-    presets: Vec<PathBuf>,
+    presets: Vec<PresetEntry>,
+    starter_rows: Vec<StarterPresetRow>,
     bad_shader_path: PathBuf,
-    deck_a_preset_idx: usize,
-    deck_b_preset_idx: usize,
+    deck_a_idx: usize,
+    deck_b_idx: usize,
+    deck_a_override_name: Option<String>,
+    last_load: Option<LastLoadSummary>,
+    pending_stall_traces: Vec<PendingStallTrace>,
 
-    // Timing, FPS, and memory tracking
+    // Timing, FPS, and telemetry
     start_time: Instant,
     last_frame_instant: Instant,
-    last_report_time: Instant,
-    last_report_frames: u64,
+    last_fps_sample_time: Instant,
+    last_fps_sample_frames: u64,
+    global_fps: f64,
+    deck_a_ms_ema: f64,
+    deck_b_ms_ema: f64,
     frame_count: u64,
     timing_a_cpu: TimingStats,
-    timing_a_gpu: TimingStats,
-    timing_a: TimingStats,
     timing_b_cpu: TimingStats,
-    timing_b_gpu: TimingStats,
-    timing_b: TimingStats,
-    timing_total: TimingStats,
-    frames_below_55: u64,
+    timing_frame_dt: TimingStats,
+    blank_check_stats: TimingStats,
     start_memory: Option<MemorySnapshotMb>,
-
-    soak_runner: Option<ActiveSoakRunner>,
-}
-
-struct StageBApp {
-    state: Option<StageBState>,
+    last_periodic_log: Instant,
     logger: GlErrorLogger,
-    presets: Vec<PathBuf>,
-    config: CliConfig,
+    shut_down: bool,
 }
 
-impl StageBApp {
-    fn new(logger: GlErrorLogger, presets: Vec<PathBuf>, config: CliConfig) -> Self {
-        Self {
-            state: None,
-            logger,
-            presets,
-            config,
-        }
-    }
+impl ConsoleState {
+    fn initialize(event_loop: &ActiveEventLoop, config: CliConfig) -> Result<Self, String> {
+        let mut logger = GlErrorLogger::open(&config.log_path)?;
+        logger.log_info("Stage 2A-1: Dark-venue egui Console + Control Bus + GL 5.3 Sync + Async Blank Check");
+        logger.log_info(&format!(
+            "Deck render resolution: {}x{} (default 1280x720 per Light-Load Rules) | measure_gpu={}",
+            config.deck_width, config.deck_height, config.measure_gpu
+        ));
+        logger.log_info(&format!("libprojectM runtime version: {}", projectm_version_string()));
 
-    fn init_all(&mut self, event_loop: &ActiveEventLoop) {
-        let mode_label = match self.config.mode {
-            RunMode::Interactive => {
-                "Interactive (L:Live/Test, R:Reconnect, 1/2:Audio, S:Swap, Left/Right/Up/Down:Preset, Esc:Exit)"
-                    .to_string()
-            }
-            RunMode::ActiveSoak { minutes } => format!("Live Audio Soak ({minutes:.1} min)"),
+        // 1. Control Bus FIRST (`mappings.json` loaded or created before any UI widgets exist).
+        let mappings_path = Path::new("mappings.json");
+        let (mappings_cfg, created_new) = MappingsConfig::load_or_create_default(mappings_path)?;
+        let mappings_status = if created_new {
+            format!(
+                "Bus: mappings.json created ({} keys)",
+                mappings_cfg.keyboard.len()
+            )
+        } else {
+            format!(
+                "Bus: mappings.json loaded ({} keys)",
+                mappings_cfg.keyboard.len()
+            )
         };
-        let title = format!(
-            "MilkDrop VJ — Stage B ({}x{} x2) — {}",
-            self.config.deck_width, self.config.deck_height, mode_label
-        );
+        logger.log_info(&mappings_status);
+        let bus = ControlBus::new(mappings_cfg);
 
+        // 2. Discover starter presets in `presets\` and compute calibrated static complexity.
+        let presets = discover_starter_presets(Path::new("presets"))?;
+        let starter_rows: Vec<StarterPresetRow> = presets
+            .iter()
+            .map(|p| StarterPresetRow {
+                name: p.display_name.clone(),
+                folder: p.folder.clone(),
+                complexity: p.complexity,
+            })
+            .collect();
+        let bad_shader_path = PathBuf::from("presets").join("_bad_shader_test.milk");
+        logger.log_info(&format!("Loaded {} starter presets from presets\\", presets.len()));
+
+        // 3. Create the main winit window with minimum 1280x720 pt logical size (Section 13).
         let window_attrs = Window::default_attributes()
-            .with_title(title)
-            .with_inner_size(LogicalSize::new(1444.0, 405.0));
+            .with_title("MilkDrop VJ — Stage 2A-1 Console (1280x720 decks)")
+            .with_inner_size(LogicalSize::new(1440.0, 860.0))
+            .with_min_inner_size(LogicalSize::new(1280.0, 720.0));
 
-        let template = ConfigTemplateBuilder::new().with_alpha_size(8);
-        let display_builder = DisplayBuilder::new().with_window_attributes(Some(window_attrs));
+        let template = ConfigTemplateBuilder::new()
+            .with_alpha_size(8)
+            .with_depth_size(24);
 
-        let (window, gl_config) = display_builder
+        let (window_opt, gl_config) = DisplayBuilder::new()
+            .with_window_attributes(Some(window_attrs))
             .build(event_loop, template, |configs| {
                 configs
-                    .reduce(|accum, config| {
-                        if config.num_samples() < accum.num_samples() {
-                            config
+                    .reduce(|best, candidate| {
+                        if candidate.num_samples() < best.num_samples() {
+                            candidate
                         } else {
-                            accum
+                            best
                         }
                     })
-                    .expect("No compatible OpenGL pixel format found")
+                    .expect("No suitable OpenGL pixel format found")
             })
-            .expect("Failed to create winit window and glutin GL display");
+            .map_err(|e| format!("Failed to create main OpenGL window: {e}"))?;
 
-        let window = window.expect("DisplayBuilder did not return a window");
+        let window = window_opt.ok_or_else(|| "DisplayBuilder returned no window".to_string())?;
         let raw_window_handle = window
             .window_handle()
-            .expect("Failed to obtain native window handle")
+            .map_err(|e| format!("Failed to get raw window handle: {e}"))?
             .as_raw();
         let gl_display = gl_config.display();
 
-        let main_ctx_attrs = ContextAttributesBuilder::new()
+        // 4. Create the main OpenGL 3.3 Core context and window surface.
+        let ctx_attrs = ContextAttributesBuilder::new()
             .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
             .build(Some(raw_window_handle));
-
-        let main_not_current = unsafe {
+        let not_current = unsafe {
             gl_display
-                .create_context(&gl_config, &main_ctx_attrs)
-                .expect("Failed to create main OpenGL 3.3 Core context")
+                .create_context(&gl_config, &ctx_attrs)
+                .map_err(|e| format!("Failed to create main OpenGL 3.3 Core context: {e}"))?
         };
-
         let surface_attrs = window
             .build_surface_attributes(Default::default())
-            .expect("Failed to build window surface attributes");
-
+            .map_err(|e| format!("Failed to build main window surface attributes: {e}"))?;
         let main_surface = unsafe {
             gl_display
                 .create_window_surface(&gl_config, &surface_attrs)
-                .expect("Failed to create main window surface")
+                .map_err(|e| format!("Failed to create main window surface: {e}"))?
         };
-
-        let main_context = main_not_current
+        let main_context = not_current
             .make_current(&main_surface)
-            .expect("Failed to make main OpenGL context current");
+            .map_err(|e| format!("Failed to make main context current: {e}"))?;
 
-        if let Err(err) = main_surface.set_swap_interval(
+        // Single-window mode: VSync `Wait(1)` on the main console window.
+        let _ = main_surface.set_swap_interval(
             &main_context,
             SwapInterval::Wait(NonZeroU32::new(1).unwrap()),
-        ) {
-            self.logger.log_info(&format!("Warning: VSync failed: {err}"));
-        }
+        );
 
-        let main_gl = unsafe {
+        let main_gl = Arc::new(unsafe {
             glow::Context::from_loader_function_cstr(|symbol: &CStr| {
                 gl_display.get_proc_address(symbol) as *const _
             })
-        };
+        });
 
         let vendor = unsafe { main_gl.get_parameter_string(glow::VENDOR) };
         let renderer = unsafe { main_gl.get_parameter_string(glow::RENDERER) };
         let version = unsafe { main_gl.get_parameter_string(glow::VERSION) };
+        let gpu_is_intel = renderer.to_lowercase().contains("intel")
+            || vendor.to_lowercase().contains("intel");
+        let gpu_label = shorten_gpu_name(&renderer);
+        logger.log_info(&format!("GL_VENDOR:   {vendor}"));
+        logger.log_info(&format!("GL_RENDERER: {renderer}"));
+        logger.log_info(&format!("GL_VERSION:  {version}"));
+        logger.log_info(&format!(
+            "Window scale_factor={:.2} | initial inner_size={}x{} px",
+            window.scale_factor(),
+            window.inner_size().width,
+            window.inner_size().height
+        ));
 
-        let max_pcm_samples = max_pcm_samples_per_channel();
-        let header = format!(
-            "=== Stage B Ready | deck_size={}x{} | audio={:?} | max_pcm_samples={} | mode={:?} ===",
-            self.config.deck_width,
-            self.config.deck_height,
-            self.config.audio_mode,
-            max_pcm_samples,
-            self.config.mode
-        );
-        println!("{header}");
-        println!("GL_VENDOR:   {vendor}");
-        println!("GL_RENDERER: {renderer}");
-        println!("GL_VERSION:  {version}");
-        self.logger.log_info(&header);
-        self.logger.log_info(&format!("GL_VENDOR={vendor}"));
-        self.logger.log_info(&format!("GL_RENDERER={renderer}"));
-        self.logger.log_info(&format!("GL_VERSION={version}"));
+        // Required on Windows before any `Deck::new()` so `projectM-4.dll`'s GLEW pointers load.
+        init_gl_loader_for_projectm()?;
+        logger.check_frame(&main_gl, 0, "main-init");
 
-        init_gl_loader_for_projectm().expect("Failed to initialize GLEW for libprojectM");
-        self.logger.log_info("GLEW initialized for libprojectM.");
-
-        let compositor =
-            SideBySideCompositor::new(&main_gl).expect("Failed to create side-by-side compositor");
-        self.logger.check_frame(&main_gl, 0, "main-init");
-
+        // 5. Find a WGL pbuffer config compatible with the native window DC (Stage 3 fix).
         let pbuffer_template = ConfigTemplateBuilder::new()
-            .with_alpha_size(8)
             .with_surface_type(ConfigSurfaceTypes::PBUFFER)
             .compatible_with_native_window(raw_window_handle)
+            .with_alpha_size(8)
+            .with_depth_size(24)
             .build();
         let pbuffer_config = unsafe {
             gl_display
                 .find_configs(pbuffer_template)
-                .expect("Failed to query pbuffer OpenGL configs")
-                .reduce(|accum, config| {
-                    if config.num_samples() < accum.num_samples() {
-                        config
-                    } else {
-                        accum
-                    }
-                })
-                .expect("No pbuffer-capable OpenGL config found on this GPU")
+                .map_err(|e| format!("Failed to query pbuffer configs: {e}"))?
+                .next()
+                .ok_or_else(|| "No WGL pbuffer OpenGL config found".to_string())?
         };
 
-        let deck_a = RenderDeck::new(
-            "DeckA",
+        // 6. Create Deck A and Deck B in shared OpenGL 3.3 Core contexts.
+        let mut deck_a = RenderDeck::new(
+            "Deck A",
             &gl_display,
             &pbuffer_config,
             &main_context,
-            self.config.deck_width,
-            self.config.deck_height,
-            &mut self.logger,
-        )
-        .expect("Failed to create Deck A");
-
-        let deck_b = RenderDeck::new(
-            "DeckB",
+            config.deck_width,
+            config.deck_height,
+            &mut logger,
+        )?;
+        let mut deck_b = RenderDeck::new(
+            "Deck B",
             &gl_display,
             &pbuffer_config,
             &main_context,
-            self.config.deck_width,
-            self.config.deck_height,
-            &mut self.logger,
-        )
-        .expect("Failed to create Deck B");
+            config.deck_width,
+            config.deck_height,
+            &mut logger,
+        )?;
 
-        let deck_a_idx = 0;
-        let deck_b_idx = 1.min(self.presets.len().saturating_sub(1));
-        deck_a
-            .load_preset(&self.presets[deck_a_idx], false)
-            .unwrap_or_else(|e| self.logger.log_info(&format!("Deck A init err: {e}")));
-        deck_b
-            .load_preset(&self.presets[deck_b_idx], false)
-            .unwrap_or_else(|e| self.logger.log_info(&format!("Deck B init err: {e}")));
+        let deck_a_idx = 0usize;
+        let deck_b_idx = 1usize.min(presets.len().saturating_sub(1));
+        deck_a.load_preset(&presets[deck_a_idx].path, false)?;
+        deck_b.load_preset(&presets[deck_b_idx].path, false)?;
 
+        // 7. Re-bind main window context and initialize `egui_glow 0.37` + native textures.
         main_context
             .make_current(&main_surface)
-            .expect("Failed to restore main context after deck init");
+            .map_err(|e| format!("Failed to re-bind main context after deck init: {e}"))?;
 
-        // Start the background WASAPI loopback capture thread if requested (or when Live mode is on).
-        let selected_device_id =
-            resolve_device_id(self.config.audio_device_filter.as_deref(), &mut self.logger);
-        let live_capture = match LiveAudioCapture::start(selected_device_id) {
-            Ok(cap) => {
-                let fmt = cap.format();
-                let msg = format!(
-                    "Live WASAPI Capture Started: `{}` | {} | Native: {} Hz, {} ch, {} -> Output: {} Hz stereo f32",
-                    fmt.device_name,
-                    fmt.capture_mode_label,
-                    fmt.native_sample_rate,
-                    fmt.native_channels,
-                    fmt.native_sample_type,
-                    fmt.output_sample_rate
-                );
-                println!("{msg}");
-                self.logger.log_info(&msg);
-                Some(cap)
-            }
-            Err(err) => {
-                let msg = format!(
-                    "WARNING: Could not start Live WASAPI Loopback ({err}). Falling back to Synthetic Test Audio."
-                );
-                eprintln!("{msg}");
-                self.logger.log_info(&msg);
-                None
-            }
-        };
+        let mut egui_glow = egui_glow::EguiGlow::new(
+            event_loop,
+            Arc::clone(&main_gl),
+            None,
+            Some(window.scale_factor() as f32),
+            true,
+        );
+        apply_dark_venue_style(&egui_glow.egui_ctx);
 
-        let active_audio_mode = if live_capture.is_some() {
-            self.config.audio_mode
-        } else {
-            AudioMode::SyntheticTest
-        };
+        let deck_a_tex_id = egui_glow
+            .painter
+            .register_native_texture(deck_a.output_texture());
+        let deck_b_tex_id = egui_glow
+            .painter
+            .register_native_texture(deck_b.output_texture());
+        logger.check_frame(&main_gl, 0, "egui-init");
 
-        window.set_visible(true);
-        window.focus_window();
+        // 8. Start Live WASAPI Loopback capture (or Synthetic Test audio if requested).
+        let (audio_mode, live_capture, audio_device_name, audio_sample_rate) =
+            match config.audio_mode {
+                AudioMode::LiveWasapi => {
+                    let chosen_id = resolve_device_filter(config.audio_device_filter.as_deref())?;
+                    match LiveAudioCapture::start(chosen_id) {
+                        Ok(cap) => {
+                            let fmt = cap.format().clone();
+                            logger.log_info(&format!(
+                                "WASAPI Loopback active: `{}` ({} Hz, {} ch native -> {} Hz stereo f32)",
+                                fmt.device_name,
+                                fmt.native_sample_rate,
+                                fmt.native_channels,
+                                fmt.output_sample_rate
+                            ));
+                            (AudioMode::LiveWasapi, Some(cap), fmt.device_name, fmt.output_sample_rate)
+                        }
+                        Err(err) => {
+                            logger.log_info(&format!(
+                                "WASAPI Loopback unavailable ({err}); falling back to Synthetic Test Audio"
+                            ));
+                            (
+                                AudioMode::SyntheticTest,
+                                None,
+                                "Synthetic Test Signal".to_string(),
+                                48_000,
+                            )
+                        }
+                    }
+                }
+                AudioMode::SyntheticTest => {
+                    logger.log_info("Audio mode: Synthetic Test Audio (--audio-source test)");
+                    (
+                        AudioMode::SyntheticTest,
+                        None,
+                        "Synthetic Test Signal".to_string(),
+                        48_000,
+                    )
+                }
+            };
+
+        let max_pcm = max_pcm_samples_per_channel();
+        logger.log_info(&format!("projectm_pcm_get_max_samples() = {max_pcm}"));
 
         let start_memory = current_process_memory_mb();
-        if let Some(mem) = start_memory {
-            let msg = format!(
-                "Start memory: WorkingSet={:.1} MiB, PrivateCommit={:.1} MiB",
-                mem.working_set_mb, mem.private_commit_mb
-            );
-            println!("{msg}");
-            self.logger.log_info(&msg);
+        if let Some(m) = start_memory {
+            logger.log_info(&format!(
+                "Startup memory: WorkingSet={:.1} MiB | PrivateCommit={:.1} MiB",
+                m.working_set_mb, m.private_commit_mb
+            ));
         }
 
         let now = Instant::now();
-        let soak_runner = match self.config.mode {
-            RunMode::ActiveSoak { minutes } => {
-                let gpu_monitor = GpuTelemetryMonitor::start(Duration::from_secs(30));
-                if let Some(gpu) = gpu_monitor.latest() {
-                    let msg = format!(
-                        "Start GPU (nvidia-smi): VRAM={}/{} MiB, Temp={}C, Clock={} MHz",
-                        gpu.vram_used_mib, gpu.vram_total_mib, gpu.temp_c, gpu.graphics_clock_mhz
-                    );
-                    println!("{msg}");
-                    self.logger.log_info(&msg);
-                }
-                let msg = format!(
-                    "[Stage B Soak] Running {:.1} minutes with {:?} audio, 10s preset rotation, 30s telemetry...",
-                    minutes, active_audio_mode
-                );
-                println!("{msg}");
-                self.logger.log_info(&msg);
-                Some(ActiveSoakRunner {
-                    target_duration: Duration::from_secs_f64(minutes * 60.0),
-                    last_switch_time: now,
-                    switch_count: 0,
-                    next_preset_cursor: 2,
-                    last_telemetry_time: now,
-                    last_1s_time: now,
-                    last_1s_frames: 0,
-                    fps_window_30s: FpsBucketTracker::default(),
-                    fps_all_1s: FpsBucketTracker::default(),
-                    frames_below_55: 0,
-                    min_gpu_clock: None,
-                    max_gpu_clock: None,
-                    max_gpu_temp: None,
-                    gpu_monitor,
-                })
-            }
-            RunMode::Interactive => None,
-        };
-
-        let synth_frames = max_pcm_samples.min(800);
-        self.state = Some(StageBState {
-            config: self.config.clone(),
+        Ok(Self {
+            config,
+            egui_glow,
+            deck_a_tex_id,
+            deck_b_tex_id,
             deck_a,
             deck_b,
-            compositor,
             window,
             main_surface,
             main_context,
             main_gl,
-            audio_mode: active_audio_mode,
+            bus,
+            mappings_status,
+            gpu_label,
+            gpu_is_intel,
+            audio_mode,
             live_capture,
+            audio_device_name,
+            audio_sample_rate,
             last_wasapi_packets: 0,
+            last_packet_time: now,
+            audio_peak_db: -100.0,
             audio_age_stats: TimingStats::default(),
-            audio_a_gen: TestAudioGenerator::new(48_000.0),
-            max_pcm_samples,
-            live_pcm_buf: Vec::with_capacity(max_pcm_samples * 2),
-            synth_pcm_buf: vec![0.0_f32; synth_frames * 2],
-            silence_pcm_buf: vec![0.0_f32; 512 * 2],
-            deck_a_audio: true,
-            deck_b_audio: true,
+            synth_gen: TestAudioGenerator::new(48_000.0),
+            live_pcm_buf: Vec::with_capacity(4096 * 2),
+            synth_pcm_buf: vec![0.0_f32; 800 * 2],
+            silence_pcm_buf: vec![0.0_f32; 800 * 2],
             device_lost_logged: false,
-            presets: self.presets.clone(),
-            bad_shader_path: PathBuf::from("presets/_bad_shader_test.milk"),
-            deck_a_preset_idx: deck_a_idx,
-            deck_b_preset_idx: deck_b_idx,
+            presets,
+            starter_rows,
+            bad_shader_path,
+            deck_a_idx,
+            deck_b_idx,
+            deck_a_override_name: None,
+            last_load: None,
+            pending_stall_traces: Vec::new(),
             start_time: now,
             last_frame_instant: now,
-            last_report_time: now,
-            last_report_frames: 0,
+            last_fps_sample_time: now,
+            last_fps_sample_frames: 0,
+            global_fps: 60.0,
+            deck_a_ms_ema: 2.0,
+            deck_b_ms_ema: 2.0,
             frame_count: 0,
             timing_a_cpu: TimingStats::default(),
-            timing_a_gpu: TimingStats::default(),
-            timing_a: TimingStats::default(),
             timing_b_cpu: TimingStats::default(),
-            timing_b_gpu: TimingStats::default(),
-            timing_b: TimingStats::default(),
-            timing_total: TimingStats::default(),
-            frames_below_55: 0,
+            timing_frame_dt: TimingStats::default(),
+            blank_check_stats: TimingStats::default(),
             start_memory,
-            soak_runner,
-        });
+            last_periodic_log: now,
+            logger,
+            shut_down: false,
+        })
     }
 
-    fn reconnect_live_audio(&mut self) {
-        let Some(state) = self.state.as_mut() else {
+    /// Executes any queued Control Bus triggers (preset switching, test-blank trigger).
+    fn process_bus_triggers(&mut self) {
+        let triggers = self.bus.drain_triggers();
+        for trig in triggers {
+            match trig.target.as_str() {
+                param::DECK_A_PREV_PRESET => {
+                    let next = if self.deck_a_idx == 0 {
+                        self.presets.len().saturating_sub(1)
+                    } else {
+                        self.deck_a_idx - 1
+                    };
+                    let smooth = !trig.hard_cut && self.bus.get_bool(param::DECK_A_TRANSITION_SMOOTH);
+                    self.load_deck_preset(true, next, smooth);
+                }
+                param::DECK_A_NEXT_PRESET => {
+                    let next = (self.deck_a_idx + 1) % self.presets.len().max(1);
+                    let smooth = !trig.hard_cut && self.bus.get_bool(param::DECK_A_TRANSITION_SMOOTH);
+                    self.load_deck_preset(true, next, smooth);
+                }
+                param::DECK_B_PREV_PRESET => {
+                    let next = if self.deck_b_idx == 0 {
+                        self.presets.len().saturating_sub(1)
+                    } else {
+                        self.deck_b_idx - 1
+                    };
+                    let smooth = !trig.hard_cut && self.bus.get_bool(param::DECK_B_TRANSITION_SMOOTH);
+                    self.load_deck_preset(false, next, smooth);
+                }
+                param::DECK_B_NEXT_PRESET => {
+                    let next = (self.deck_b_idx + 1) % self.presets.len().max(1);
+                    let smooth = !trig.hard_cut && self.bus.get_bool(param::DECK_B_TRANSITION_SMOOTH);
+                    self.load_deck_preset(false, next, smooth);
+                }
+                param::DECK_A_TEST_BLANK => {
+                    self.load_bad_shader_on_deck_a();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn load_deck_preset(&mut self, is_deck_a: bool, idx: usize, smooth: bool) {
+        let Some(entry) = self.presets.get(idx).cloned() else {
             return;
         };
-        println!("Reconnecting Live WASAPI Loopback to current Windows default output...");
-        state.live_capture.take(); // Drop old thread cleanly first.
-        match LiveAudioCapture::start(None) {
-            Ok(cap) => {
-                let msg = format!(
-                    "Reconnected Live WASAPI -> `{}` ({} Hz, {} ch, {})",
-                    cap.format().device_name,
-                    cap.format().native_sample_rate,
-                    cap.format().native_channels,
-                    cap.format().native_sample_type
-                );
-                println!("{msg}");
-                self.logger.log_info(&msg);
-                state.live_capture = Some(cap);
-                state.audio_mode = AudioMode::LiveWasapi;
-                state.device_lost_logged = false;
-                state.last_wasapi_packets = 0;
+        let deck_label = if is_deck_a { "Deck A" } else { "Deck B" };
+        let t0 = Instant::now();
+        let result = if is_deck_a {
+            self.deck_a.load_preset(&entry.path, smooth)
+        } else {
+            self.deck_b.load_preset(&entry.path, smooth)
+        };
+        let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        match result {
+            Ok(()) => {
+                if is_deck_a {
+                    self.deck_a_idx = idx;
+                    self.deck_a_override_name = None;
+                } else {
+                    self.deck_b_idx = idx;
+                }
+                self.last_load = Some(LastLoadSummary {
+                    deck_label: deck_label.to_string(),
+                    preset_name: entry.display_name.clone(),
+                    load_ms,
+                    error: None,
+                });
+                self.pending_stall_traces.push(PendingStallTrace {
+                    deck_label: deck_label.to_string(),
+                    preset_name: entry.display_name,
+                    load_call_ms: load_ms,
+                    smooth,
+                    step: 0,
+                });
             }
             Err(err) => {
-                let msg = format!("Reconnect failed: {err}");
-                eprintln!("{msg}");
-                self.logger.log_info(&msg);
+                self.logger
+                    .log_info(&format!("[LOAD-ERROR] {deck_label}: {err}"));
+                self.last_load = Some(LastLoadSummary {
+                    deck_label: deck_label.to_string(),
+                    preset_name: entry.display_name,
+                    load_ms,
+                    error: Some(err),
+                });
             }
         }
     }
 
-    fn render_frame(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(state) = self.state.as_mut() else {
+    fn load_bad_shader_on_deck_a(&mut self) {
+        let t0 = Instant::now();
+        let res = self.deck_a.load_preset(&self.bad_shader_path, false);
+        let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let label = "_bad_shader_test.milk".to_string();
+        match res {
+            Ok(()) => {
+                self.deck_a_override_name = Some(label.clone());
+                self.last_load = Some(LastLoadSummary {
+                    deck_label: "Deck A".to_string(),
+                    preset_name: label.clone(),
+                    load_ms,
+                    error: None,
+                });
+                self.pending_stall_traces.push(PendingStallTrace {
+                    deck_label: "Deck A".to_string(),
+                    preset_name: label,
+                    load_call_ms: load_ms,
+                    smooth: false,
+                    step: 0,
+                });
+            }
+            Err(err) => {
+                self.logger
+                    .log_info(&format!("[LOAD-ERROR] Deck A blank test: {err}"));
+                self.last_load = Some(LastLoadSummary {
+                    deck_label: "Deck A".to_string(),
+                    preset_name: label,
+                    load_ms,
+                    error: Some(err),
+                });
+            }
+        }
+    }
+
+    fn render_frame(&mut self) {
+        if self.shut_down {
             return;
-        };
-
-        let now = Instant::now();
-        let frame_delta_ms = now.duration_since(state.last_frame_instant).as_secs_f64() * 1000.0;
-        state.last_frame_instant = now;
-
-        state.frame_count += 1;
-        let frame_idx = state.frame_count;
-        if frame_idx > 5 && frame_delta_ms > FRAME_BELOW_55_FPS_MS {
-            state.frames_below_55 += 1;
         }
 
-        // 0. Pull the latest stereo audio from either the lock-free WASAPI ring buffer
-        //    or our swappable Synthetic Test Audio generator.
-        let active_pcm_slice: &[f32] = match state.audio_mode {
+        let frame_start = Instant::now();
+        let frame_dt_ms = frame_start
+            .duration_since(self.last_frame_instant)
+            .as_secs_f64()
+            * 1000.0;
+        self.last_frame_instant = frame_start;
+        if self.frame_count > 0 {
+            self.timing_frame_dt.record_ms(frame_dt_ms);
+        }
+        self.frame_count += 1;
+
+        // 1. Execute any Control Bus triggers queued on the previous UI frame.
+        self.process_bus_triggers();
+
+        // 2. Gather live audio (non-blocking ring drain) or synthetic test audio.
+        let (audio_slice_len, is_live_buf, audio_badge) = self.collect_audio_for_frame();
+        let pcm_slice: &[f32] = if is_live_buf {
+            &self.live_pcm_buf[..audio_slice_len]
+        } else if self.audio_mode == AudioMode::SyntheticTest {
+            &self.synth_pcm_buf
+        } else {
+            &self.silence_pcm_buf
+        };
+
+        // Update smooth top-bar peak level meter (`dBFS`).
+        let frame_peak = pcm_slice
+            .iter()
+            .fold(0.0_f32, |acc, &s| acc.max(s.abs()));
+        let instant_db = if frame_peak > 1e-5 {
+            20.0 * frame_peak.log10()
+        } else {
+            -100.0
+        };
+        if instant_db > self.audio_peak_db {
+            self.audio_peak_db = instant_db;
+        } else {
+            // Smooth ~40 dB/sec decay at 60 FPS so the meter stays readable.
+            self.audio_peak_db = (self.audio_peak_db - 0.7).max(instant_db);
+        }
+
+        // 3. Render Deck A and Deck B in their isolated shared OpenGL contexts.
+        let timing_a = match self.deck_a.render_to_texture(
+            pcm_slice,
+            self.frame_count,
+            self.config.measure_gpu,
+            &mut self.logger,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                self.logger.log_info(&format!("[ERROR] Deck A render failed: {e}"));
+                eprintln!("[ERROR] Deck A render failed: {e}");
+                return;
+            }
+        };
+        let timing_b = match self.deck_b.render_to_texture(
+            pcm_slice,
+            self.frame_count,
+            self.config.measure_gpu,
+            &mut self.logger,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                self.logger.log_info(&format!("[ERROR] Deck B render failed: {e}"));
+                eprintln!("[ERROR] Deck B render failed: {e}");
+                return;
+            }
+        };
+
+        self.timing_a_cpu.record_ms(timing_a.cpu_submit_ms);
+        self.timing_b_cpu.record_ms(timing_b.cpu_submit_ms);
+        self.deck_a_ms_ema = self.deck_a_ms_ema * 0.88 + timing_a.cpu_submit_ms * 0.12;
+        self.deck_b_ms_ema = self.deck_b_ms_ema * 0.88 + timing_b.cpu_submit_ms * 0.12;
+
+        if let Some(ms) = timing_a.blank_check_ms {
+            self.blank_check_stats.record_ms(ms);
+        }
+        if let Some(ms) = timing_b.blank_check_ms {
+            self.blank_check_stats.record_ms(ms);
+        }
+
+        // 4. Switch back to main window context and apply OpenGL 5.3 GPU-only `glWaitSync`.
+        if let Err(e) = self.main_context.make_current(&self.main_surface) {
+            self.logger
+                .log_info(&format!("[ERROR] Main context make_current failed: {e}"));
+            return;
+        }
+        for fence in [
+            self.deck_a.take_pending_sync(),
+            self.deck_b.take_pending_sync(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            unsafe {
+                // GPU-side synchronization only — guarantees Deck texture copy finished before
+                // egui samples it, with ZERO CPU stall.
+                self.main_gl.wait_sync(fence, 0, glow::TIMEOUT_IGNORED);
+                self.main_gl.delete_sync(fence);
+            }
+        }
+
+        // 5. Update rolling 0.5-second global FPS readout.
+        let fps_elapsed = self.last_fps_sample_time.elapsed().as_secs_f64();
+        if fps_elapsed >= 0.5 {
+            let df = self.frame_count - self.last_fps_sample_frames;
+            self.global_fps = df as f64 / fps_elapsed;
+            self.last_fps_sample_time = Instant::now();
+            self.last_fps_sample_frames = self.frame_count;
+            let fps_i32 = self.global_fps.round().clamp(15.0, 240.0) as i32;
+            self.deck_a.set_fps(fps_i32);
+            self.deck_b.set_fps(fps_i32);
+        }
+
+        // 6. Clear main window and render the `egui 0.37` dark-venue console.
+        let win_size = self.window.inner_size();
+        unsafe {
+            self.main_gl
+                .viewport(0, 0, win_size.width as i32, win_size.height as i32);
+            self.main_gl.clear_color(0.055, 0.063, 0.078, 1.0);
+            self.main_gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+
+        let deck_a_entry = &self.presets[self.deck_a_idx];
+        let deck_b_entry = &self.presets[self.deck_b_idx];
+        let deck_a_name = self
+            .deck_a_override_name
+            .as_deref()
+            .unwrap_or(&deck_a_entry.display_name);
+        let deck_a_comp = if self.deck_a_override_name.is_some() {
+            PresetComplexity {
+                enabled_shape_instances: 0,
+                tier: milkdrop_vj::preset_meta::ComplexityTier::Light,
+            }
+        } else {
+            deck_a_entry.complexity
+        };
+
+        let deck_res_label = format!("{}p", self.config.deck_height);
+        let audio_source_label = match self.audio_mode {
+            AudioMode::LiveWasapi => "Live WASAPI",
+            AudioMode::SyntheticTest => "Test Audio",
+        };
+
+        let ui_state = ConsoleUiState {
+            audio_source_label,
+            audio_device_name: &self.audio_device_name,
+            audio_sample_rate: self.audio_sample_rate,
+            audio_peak_db: self.audio_peak_db,
+            audio_state: audio_badge,
+            deck_res_label: &deck_res_label,
+            gpu_label: &self.gpu_label,
+            gpu_is_intel: self.gpu_is_intel,
+            global_fps: self.global_fps,
+            gl_errors: self.logger.total_errors(),
+            blank_check_avg_us: self.blank_check_stats.avg_ms() * 1000.0,
+            mappings_status: &self.mappings_status,
+            last_load: self.last_load.as_ref(),
+            deck_a: DeckUiSnapshot {
+                texture_id: self.deck_a_tex_id,
+                preset_name: deck_a_name,
+                complexity: deck_a_comp,
+                render_ms_avg: self.deck_a_ms_ema,
+                blank: self.deck_a.blank_status(),
+            },
+            deck_b: DeckUiSnapshot {
+                texture_id: self.deck_b_tex_id,
+                preset_name: &deck_b_entry.display_name,
+                complexity: deck_b_entry.complexity,
+                render_ms_avg: self.deck_b_ms_ema,
+                blank: self.deck_b.blank_status(),
+            },
+            starter_presets: &self.starter_rows,
+        };
+
+        let bus_ref = &mut self.bus;
+        self.egui_glow.run(&self.window, |ui| {
+            draw_console_ui(ui, &ui_state, bus_ref);
+        });
+        self.egui_glow.paint(&self.window);
+
+        self.logger
+            .check_frame(&self.main_gl, self.frame_count, "main-egui");
+
+        if let Err(e) = self.main_surface.swap_buffers(&self.main_context) {
+            self.logger
+                .log_info(&format!("[ERROR] swap_buffers failed: {e}"));
+        }
+
+        // 7. Log preset-load frame (+0) and next two frames (+1, +2) for Risk 8 stall visibility.
+        let total_frame_work_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+        self.record_pending_stall_traces(
+            frame_dt_ms,
+            total_frame_work_ms,
+            timing_a.cpu_submit_ms,
+            timing_b.cpu_submit_ms,
+        );
+
+        // 8. Periodic 5-second health log line.
+        if self.last_periodic_log.elapsed() >= Duration::from_secs(5) {
+            self.last_periodic_log = Instant::now();
+            let mem_str = current_process_memory_mb()
+                .map(|m| format!("WS={:.1}MiB PC={:.1}MiB", m.working_set_mb, m.private_commit_mb))
+                .unwrap_or_else(|| "mem=n/a".to_string());
+            self.logger.log_info(&format!(
+                "t={:5.1}s | FPS={:5.1} | DeckA={:4.2}ms | DeckB={:4.2}ms | BlankPBO={:5.1}us | GL_err={} | {}",
+                self.start_time.elapsed().as_secs_f64(),
+                self.global_fps,
+                self.deck_a_ms_ema,
+                self.deck_b_ms_ema,
+                self.blank_check_stats.avg_ms() * 1000.0,
+                self.logger.total_errors(),
+                mem_str
+            ));
+        }
+    }
+
+    /// Drains newly arrived WASAPI frames (non-blocking) or generates synthetic test audio.
+    fn collect_audio_for_frame(&mut self) -> (usize, bool, AudioBadgeState) {
+        match self.audio_mode {
             AudioMode::LiveWasapi => {
-                if let Some(cap) = state.live_capture.as_mut() {
-                    if !state.device_lost_logged && cap.device_lost_events() > 0 {
-                        state.device_lost_logged = true;
-                        let err_txt = cap.last_error().unwrap_or_else(|| "unknown error".into());
-                        let msg = format!(
-                            "[AUDIO EVENT] Device lost ({err_txt}). Visuals continue on silence; press `R` to reconnect."
-                        );
-                        println!("{msg}");
-                        self.logger.log_info(&msg);
+                if let Some(cap) = self.live_capture.as_mut() {
+                    let pop = cap.pop_stereo(&mut self.live_pcm_buf, 4096);
+                    if let Some(age_ms) = pop.oldest_sample_age_ms {
+                        self.audio_age_stats.record_ms(age_ms);
                     }
-
-                    // Drain ALL newly arrived frames from the ring buffer on each video frame
-                    // (at 48 kHz / 60 FPS, ~800 frames arrive per tick, which is larger than
-                    // `projectm_pcm_get_max_samples()` = 576). `Deck::add_pcm_stereo` feeds
-                    // them in chronological chunks of `<= 576` so the ring never backs up.
-                    let pop = cap.pop_stereo(&mut state.live_pcm_buf, 4096);
-                    let cur_pkts = cap.packets_received();
-                    let got_live_packet = cur_pkts > state.last_wasapi_packets;
-                    state.last_wasapi_packets = cur_pkts;
-
-                    // Record oldest-sample age only when real live audio packets arrived
-                    // (not during 20 ms silence-timeout padding between songs).
-                    if got_live_packet {
-                        if let Some(age_ms) = pop.oldest_sample_age_ms {
-                            if frame_idx > 10 {
-                                state.audio_age_stats.record_ms(age_ms);
-                            }
+                    let pkts = cap.packets_received();
+                    if pkts > self.last_wasapi_packets {
+                        self.last_wasapi_packets = pkts;
+                        self.last_packet_time = Instant::now();
+                    }
+                    let badge = if cap.device_lost_events() > 0 {
+                        if !self.device_lost_logged {
+                            self.device_lost_logged = true;
+                            let err = cap.last_error().unwrap_or_else(|| "unknown".to_string());
+                            self.logger
+                                .log_info(&format!("[AUDIO] DEVICE LOST detected: {err}"));
                         }
-                    }
+                        AudioBadgeState::DeviceLost
+                    } else if self.last_packet_time.elapsed() < Duration::from_millis(250) {
+                        AudioBadgeState::Live
+                    } else {
+                        AudioBadgeState::Silence
+                    };
 
                     if pop.frames_read > 0 {
-                        &state.live_pcm_buf
+                        (pop.frames_read * 2, true, badge)
                     } else {
-                        &state.silence_pcm_buf
+                        (0, false, badge)
                     }
                 } else {
-                    &state.silence_pcm_buf
+                    (0, false, AudioBadgeState::DeviceLost)
                 }
             }
             AudioMode::SyntheticTest => {
-                // Keep draining the live ring buffer silently if running so it never overruns
-                // while temporarily switched to Synthetic Test mode.
-                if let Some(cap) = state.live_capture.as_mut() {
-                    let _ = cap.pop_stereo(&mut state.live_pcm_buf, 4096);
-                }
-                state.audio_a_gen.fill_stereo(&mut state.synth_pcm_buf, true);
-                &state.synth_pcm_buf
-            }
-        };
-
-        let pcm_for_a: &[f32] = if state.deck_a_audio {
-            active_pcm_slice
-        } else {
-            &state.silence_pcm_buf
-        };
-        let pcm_for_b: &[f32] = if state.deck_b_audio {
-            active_pcm_slice
-        } else {
-            &state.silence_pcm_buf
-        };
-
-        let measure_gpu = state.config.measure_gpu;
-        let work_start = Instant::now();
-
-        // 1. Render Deck A (strictly on the main thread).
-        let timing_a_frame = state
-            .deck_a
-            .render_to_texture(pcm_for_a, frame_idx, measure_gpu, &mut self.logger)
-            .expect("Deck A render failed");
-        if frame_idx > 5 {
-            state.timing_a_cpu.record_ms(timing_a_frame.cpu_submit_ms);
-            state.timing_a_gpu.record_ms(timing_a_frame.gpu_wait_ms);
-            state.timing_a.record_ms(timing_a_frame.total_ms());
-        }
-
-        // 2. Render Deck B (strictly on the main thread).
-        let timing_b_frame = state
-            .deck_b
-            .render_to_texture(pcm_for_b, frame_idx, measure_gpu, &mut self.logger)
-            .expect("Deck B render failed");
-        if frame_idx > 5 {
-            state.timing_b_cpu.record_ms(timing_b_frame.cpu_submit_ms);
-            state.timing_b_gpu.record_ms(timing_b_frame.gpu_wait_ms);
-            state.timing_b.record_ms(timing_b_frame.total_ms());
-        }
-
-        // 3. Composite both decks side by side on the main window context.
-        state
-            .main_context
-            .make_current(&state.main_surface)
-            .expect("Failed to make main context current for compositing");
-
-        let win_size = state.window.inner_size();
-        state.compositor.draw(
-            &state.main_gl,
-            win_size.width.max(1) as i32,
-            win_size.height.max(1) as i32,
-            state.deck_a.output_texture(),
-            state.deck_b.output_texture(),
-        );
-        self.logger
-            .check_frame(&state.main_gl, frame_idx, "main-composite");
-
-        let total_work_ms = if measure_gpu {
-            unsafe {
-                state.main_gl.finish();
-            }
-            work_start.elapsed().as_secs_f64() * 1000.0
-        } else {
-            0.0
-        };
-
-        state
-            .main_surface
-            .swap_buffers(&state.main_context)
-            .expect("Failed to swap main window buffers");
-
-        let total_recorded_ms = if measure_gpu {
-            unsafe {
-                state.main_gl.finish();
-            }
-            total_work_ms
-        } else {
-            work_start.elapsed().as_secs_f64() * 1000.0
-        };
-        if frame_idx > 5 {
-            state.timing_total.record_ms(total_recorded_ms);
-        }
-
-        // 4. Active 10-minute soak schedule (with live music playing).
-        let mut should_exit = false;
-        if let Some(soak) = state.soak_runner.as_mut() {
-            if frame_idx > 5 && frame_delta_ms > FRAME_BELOW_55_FPS_MS {
-                soak.frames_below_55 += 1;
-            }
-
-            let sec_dt = soak.last_1s_time.elapsed().as_secs_f64();
-            if sec_dt >= 1.0 {
-                let df = state.frame_count - soak.last_1s_frames;
-                let fps = df as f64 / sec_dt;
-                soak.fps_window_30s.push(fps);
-                soak.fps_all_1s.push(fps);
-                state.deck_a.set_fps(fps.round() as i32);
-                state.deck_b.set_fps(fps.round() as i32);
-                soak.last_1s_time = Instant::now();
-                soak.last_1s_frames = state.frame_count;
-            }
-
-            // Switch a preset every 10 seconds, alternating Deck A and Deck B.
-            if soak.last_switch_time.elapsed() >= Duration::from_secs(10) {
-                soak.last_switch_time = Instant::now();
-                soak.switch_count += 1;
-                let use_deck_a = soak.switch_count % 2 == 1;
-                let deck_label = if use_deck_a { "DeckA" } else { "DeckB" };
-                let idx = soak.next_preset_cursor % state.presets.len();
-                soak.next_preset_cursor += 1;
-                let target_path = state.presets[idx].clone();
-                let label = preset_label(&target_path);
-
-                let res = if use_deck_a {
-                    state.deck_a.load_preset(&target_path, false)
-                } else {
-                    state.deck_b.load_preset(&target_path, false)
-                };
-                match res {
-                    Ok(()) => self.logger.log_info(&format!(
-                        "[Soak switch #{}] {} -> `{}` (ok)",
-                        soak.switch_count, deck_label, label
-                    )),
-                    Err(e) => self.logger.log_info(&format!(
-                        "[Soak switch #{}] {} -> `{}` (err: {})",
-                        soak.switch_count, deck_label, label, e
-                    )),
-                }
-            }
-
-            // Every 30 seconds: log FPS, RAM, GPU telemetry, and live audio latency/health.
-            if soak.last_telemetry_time.elapsed() >= Duration::from_secs(30) {
-                soak.last_telemetry_time = Instant::now();
-                let elapsed_s = state.start_time.elapsed().as_secs();
-                let mem = current_process_memory_mb();
-                let fps_str = match soak.fps_window_30s.summary_and_clear() {
-                    Some((mn, av, mx)) => format!("fps={mn:.1}/{av:.1}/{mx:.1}"),
-                    None => "fps=n/a".to_string(),
-                };
-                let gpu_str = match soak.gpu_monitor.latest() {
-                    Some(g) => {
-                        update_gpu_extremes(soak, g);
-                        format!(
-                            "GPU(vram={}MiB, {}C, {}MHz)",
-                            g.vram_used_mib, g.temp_c, g.graphics_clock_mhz
-                        )
-                    }
-                    None => "GPU=n/a".to_string(),
-                };
-                let audio_str = match &state.live_capture {
-                    Some(c) => format!(
-                        "audio_age={:.1}ms(max {:.1}) | ovr={} und={} pkts={}",
-                        state.audio_age_stats.avg_ms(),
-                        state.audio_age_stats.max_ms(),
-                        c.overrun_frames(),
-                        c.underrun_reads(),
-                        c.packets_received()
-                    ),
-                    None => "audio=SYNTH".to_string(),
-                };
-                let line = format!(
-                    "[Soak {:>3}s] {} | {} | {} | {} | below55={} | gl_err={}",
-                    elapsed_s,
-                    fps_str,
-                    format_mem_short(mem),
-                    gpu_str,
-                    audio_str,
-                    soak.frames_below_55,
-                    self.logger.total_errors()
-                );
-                println!("{line}");
-                self.logger.log_info(&line);
-            }
-
-            if state.start_time.elapsed() >= soak.target_duration {
-                should_exit = true;
-            }
-        } else {
-            // Interactive heartbeat every 3 seconds.
-            let since_report = state.last_report_time.elapsed().as_secs_f64();
-            if since_report >= 3.0 {
-                let df = state.frame_count - state.last_report_frames;
-                let fps = df as f64 / since_report;
-                state.deck_a.set_fps(fps.round() as i32);
-                state.deck_b.set_fps(fps.round() as i32);
-                let audio_str = match (&state.audio_mode, &state.live_capture) {
-                    (AudioMode::LiveWasapi, Some(c)) => format!(
-                        "LIVE age={:.1}ms(max {:.1}) ovr={} und={} pkts={}",
-                        state.audio_age_stats.avg_ms(),
-                        state.audio_age_stats.max_ms(),
-                        c.overrun_frames(),
-                        c.underrun_reads(),
-                        c.packets_received()
-                    ),
-                    _ => "SYNTH_TEST".to_string(),
-                };
-                let line = format!(
-                    "[Stage B | {:.0}s] fps={:.1} | {} | {} | gl_err={}",
-                    state.start_time.elapsed().as_secs_f64(),
-                    fps,
-                    audio_str,
-                    format_mem_short(current_process_memory_mb()),
-                    self.logger.total_errors()
-                );
-                println!("{line}");
-                self.logger.log_info(&line);
-                state.last_report_time = Instant::now();
-                state.last_report_frames = state.frame_count;
+                self.synth_gen.fill_stereo(&mut self.synth_pcm_buf, true);
+                (self.synth_pcm_buf.len(), false, AudioBadgeState::Test)
             }
         }
+    }
 
-        if should_exit {
-            self.shutdown();
-            event_loop.exit();
+    fn record_pending_stall_traces(
+        &mut self,
+        frame_dt_ms: f64,
+        frame_work_ms: f64,
+        deck_a_ms: f64,
+        deck_b_ms: f64,
+    ) {
+        if self.pending_stall_traces.is_empty() {
             return;
         }
-
-        state.window.request_redraw();
+        let mut keep = Vec::new();
+        for mut trace in self.pending_stall_traces.drain(..) {
+            let tag = match trace.step {
+                0 => "+0 (LOAD)",
+                1 => "+1       ",
+                _ => "+2       ",
+            };
+            let mode_str = if trace.smooth { "smooth" } else { "hard" };
+            let line = format!(
+                "[LOAD-STALL] {tag} | {} -> `{}` ({mode_str}, load_call={:.2} ms) | frame_work={:.2} ms | prev_frame_dt={:.2} ms | DeckA_cpu={:.2} ms | DeckB_cpu={:.2} ms",
+                trace.deck_label,
+                trace.preset_name,
+                trace.load_call_ms,
+                frame_work_ms,
+                frame_dt_ms,
+                deck_a_ms,
+                deck_b_ms
+            );
+            println!("{line}");
+            self.logger.log_info(&line);
+            trace.step += 1;
+            if trace.step < 3 {
+                keep.push(trace);
+            }
+        }
+        self.pending_stall_traces = keep;
     }
 
     fn shutdown(&mut self) {
-        if let Some(mut state) = self.state.take() {
-            let secs = state.start_time.elapsed().as_secs_f64();
-            let avg_fps = if secs > 0.0 {
-                state.frame_count as f64 / secs
-            } else {
-                0.0
-            };
-            let end_mem = current_process_memory_mb();
-
-            let audio_summary = match &state.live_capture {
-                Some(c) => format!(
-                    "Audio device:     {}\n\
-                     Audio age (in):   avg {:.2} ms | worst {:.2} ms ({} live frames)\n\
-                     Ring overruns:    {} dropped stereo frames\n\
-                     Ring underruns:   {} empty reads (incl. silence between tracks)\n\
-                     WASAPI packets:   {} | silence injections: {} | device-lost: {}",
-                    c.format().device_name,
-                    state.audio_age_stats.avg_ms(),
-                    state.audio_age_stats.max_ms(),
-                    state.audio_age_stats.samples(),
-                    c.overrun_frames(),
-                    c.underrun_reads(),
-                    c.packets_received(),
-                    c.silence_injections(),
-                    c.device_lost_events()
-                ),
-                None => "Audio device:     Synthetic Test Signal (no live capture)".to_string(),
-            };
-
-            let mut summary = format!(
-                "=== Stage B Summary ({:?}) ===\n\
-                 Duration:         {:.2}s ({} frames, overall avg {:.2} FPS)\n\
-                 Deck resolution:  {}x{} per deck (x2) | max_pcm_samples={}\n\
-                 {audio_summary}\n\
-                 Frames < 55 FPS:  {}\n\
-                 Start memory:     {}\n\
-                 End memory:       {}\n\
-                 Total GL errors:  {}",
-                state.config.mode,
-                secs,
-                state.frame_count,
-                avg_fps,
-                state.config.deck_width,
-                state.config.deck_height,
-                state.max_pcm_samples,
-                state.frames_below_55,
-                format_mem(state.start_memory),
-                format_mem(end_mem),
-                self.logger.total_errors()
-            );
-
-            if let Some(mut soak) = state.soak_runner.take() {
-                if let Some(g) = soak.gpu_monitor.latest() {
-                    update_gpu_extremes(&mut soak, g);
-                }
-                let fps_all = match soak.fps_all_1s.summary_and_clear() {
-                    Some((mn, av, mx)) => format!("min={mn:.1} / avg={av:.1} / max={mx:.1}"),
-                    None => "n/a".to_string(),
-                };
-                summary.push_str(&format!(
-                    "\n--- Stage B Soak Totals ---\n\
-                     Preset switches:  {}\n\
-                     1s FPS overall:   {}\n\
-                     Frames < 55 FPS:  {}\n\
-                     GPU Clock range:  {:?}..={:?} MHz | Peak GPU Temp: {:?} C",
-                    soak.switch_count,
-                    fps_all,
-                    soak.frames_below_55,
-                    soak.min_gpu_clock,
-                    soak.max_gpu_clock,
-                    soak.max_gpu_temp
-                ));
-            }
-
-            println!("\n{summary}");
-            println!("Log file saved to: {}", self.logger.path().display());
-            self.logger.log_info(&summary);
-
-            // Stop capture thread cleanly before tearing down OpenGL.
-            state.live_capture.take();
-            state.deck_a.destroy();
-            state.deck_b.destroy();
-            if state.main_context.make_current(&state.main_surface).is_ok() {
-                state.compositor.destroy(&state.main_gl);
-            }
-            drop(state);
-        }
-    }
-
-    fn handle_key(&mut self, key: Key) {
-        if matches!(&key, Key::Character(ch) if ch.eq_ignore_ascii_case("r")) {
-            self.reconnect_live_audio();
+        if self.shut_down {
             return;
         }
+        self.shut_down = true;
 
-        let Some(state) = self.state.as_mut() else {
-            return;
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let avg_fps = if elapsed > 0.0 {
+            self.frame_count as f64 / elapsed
+        } else {
+            0.0
         };
-        match key {
-            Key::Character(ref ch) if ch.eq_ignore_ascii_case("l") => {
-                state.audio_mode = match state.audio_mode {
-                    AudioMode::LiveWasapi => AudioMode::SyntheticTest,
-                    AudioMode::SyntheticTest => {
-                        if state.live_capture.is_some() {
-                            AudioMode::LiveWasapi
-                        } else {
-                            println!("No live WASAPI capture active — press `R` to connect.");
-                            AudioMode::SyntheticTest
-                        }
-                    }
-                };
-                let msg = format!("Audio source switched -> {:?}", state.audio_mode);
-                println!("{msg}");
-                self.logger.log_info(&msg);
-            }
-            Key::Character(ref ch) if ch == "1" => {
-                state.deck_a_audio = true;
-                state.deck_b_audio = false;
-                println!("Audio routing: Deck A = ACTIVE, Deck B = SILENCE");
-            }
-            Key::Character(ref ch) if ch == "2" => {
-                state.deck_a_audio = true;
-                state.deck_b_audio = true;
-                println!("Audio routing: Both Deck A and Deck B = ACTIVE");
-            }
-            Key::Character(ref ch) if ch.eq_ignore_ascii_case("s") => {
-                std::mem::swap(&mut state.deck_a_preset_idx, &mut state.deck_b_preset_idx);
-                let _ = state
-                    .deck_a
-                    .load_preset(&state.presets[state.deck_a_preset_idx], false);
-                let _ = state
-                    .deck_b
-                    .load_preset(&state.presets[state.deck_b_preset_idx], false);
-                println!("Swapped presets between Deck A and Deck B.");
-            }
-            Key::Character(ref ch) if ch.eq_ignore_ascii_case("e") => {
-                let bad = state.bad_shader_path.clone();
-                match state.deck_a.load_preset(&bad, false) {
-                    Ok(()) => println!("Bad shader preset returned Ok (no crash)."),
-                    Err(e) => println!("Bad shader preset caught error (no crash): {e}"),
-                }
-            }
-            Key::Character(ref ch) if ch.eq_ignore_ascii_case("p") => {
-                let _ = state
-                    .deck_a
-                    .capture_png(Path::new("docs/spike/deck_a.png"), &mut self.logger);
-                let _ = state
-                    .deck_b
-                    .capture_png(Path::new("docs/spike/deck_b.png"), &mut self.logger);
-                println!("Captured docs/spike/deck_a.png and deck_b.png");
-            }
-            Key::Named(NamedKey::ArrowRight) => {
-                state.deck_a_preset_idx = (state.deck_a_preset_idx + 1) % state.presets.len();
-                let p = state.presets[state.deck_a_preset_idx].clone();
-                let _ = state.deck_a.load_preset(&p, true);
-                println!("Deck A -> {}", preset_label(&p));
-            }
-            Key::Named(NamedKey::ArrowLeft) => {
-                state.deck_a_preset_idx =
-                    (state.deck_a_preset_idx + state.presets.len() - 1) % state.presets.len();
-                let p = state.presets[state.deck_a_preset_idx].clone();
-                let _ = state.deck_a.load_preset(&p, true);
-                println!("Deck A -> {}", preset_label(&p));
-            }
-            Key::Named(NamedKey::ArrowUp) => {
-                state.deck_b_preset_idx = (state.deck_b_preset_idx + 1) % state.presets.len();
-                let p = state.presets[state.deck_b_preset_idx].clone();
-                let _ = state.deck_b.load_preset(&p, true);
-                println!("Deck B -> {}", preset_label(&p));
-            }
-            Key::Named(NamedKey::ArrowDown) => {
-                state.deck_b_preset_idx =
-                    (state.deck_b_preset_idx + state.presets.len() - 1) % state.presets.len();
-                let p = state.presets[state.deck_b_preset_idx].clone();
-                let _ = state.deck_b.load_preset(&p, true);
-                println!("Deck B -> {}", preset_label(&p));
-            }
-            _ => {}
+        let end_mem = current_process_memory_mb();
+
+        self.logger.log_info("=== Stage 2A-1 Shutdown Summary (provisional, laptop-limited) ===");
+        self.logger.log_info(&format!(
+            "Elapsed: {:.2}s | Frames: {} | Avg FPS: {:.2} | Total GL errors: {}",
+            elapsed,
+            self.frame_count,
+            avg_fps,
+            self.logger.total_errors()
+        ));
+        self.logger.log_info(&format!(
+            "Deck A CPU submit: avg {:.2} ms (max {:.2} ms) | Deck B CPU submit: avg {:.2} ms (max {:.2} ms)",
+            self.timing_a_cpu.avg_ms(),
+            self.timing_a_cpu.max_ms(),
+            self.timing_b_cpu.avg_ms(),
+            self.timing_b_cpu.max_ms()
+        ));
+        self.logger.log_info(&format!(
+            "Async 32x18 Blank-Deck PBO check ({} samples): avg {:.1} us ({:.4} ms) | max {:.1} us ({:.4} ms)",
+            self.blank_check_stats.samples(),
+            self.blank_check_stats.avg_ms() * 1000.0,
+            self.blank_check_stats.avg_ms(),
+            self.blank_check_stats.max_ms() * 1000.0,
+            self.blank_check_stats.max_ms()
+        ));
+        if self.audio_age_stats.samples() > 0 {
+            self.logger.log_info(&format!(
+                "WASAPI internal audio_age (from packet arrival): avg {:.2} ms | max {:.2} ms",
+                self.audio_age_stats.avg_ms(),
+                self.audio_age_stats.max_ms()
+            ));
         }
+        if let (Some(s), Some(e)) = (self.start_memory, end_mem) {
+            self.logger.log_info(&format!(
+                "Memory: WorkingSet {:.1} -> {:.1} MiB | PrivateCommit {:.1} -> {:.1} MiB",
+                s.working_set_mb, e.working_set_mb, s.private_commit_mb, e.private_commit_mb
+            ));
+        }
+
+        // Clean GPU teardown: destroy egui_glow on main context, then destroy both decks.
+        if self.main_context.make_current(&self.main_surface).is_ok() {
+            self.egui_glow.painter.free_texture(self.deck_a_tex_id);
+            self.egui_glow.painter.free_texture(self.deck_b_tex_id);
+            self.egui_glow.destroy();
+        }
+        self.deck_a.destroy();
+        self.deck_b.destroy();
+        self.live_capture.take();
+
+        println!(
+            "Stage 2A-1 closed cleanly. Frames={}, Avg FPS={:.2}, BlankPBO avg={:.1} us, GL errors={}, log={}",
+            self.frame_count,
+            avg_fps,
+            self.blank_check_stats.avg_ms() * 1000.0,
+            self.logger.total_errors(),
+            self.logger.path().display()
+        );
     }
 }
 
-impl ApplicationHandler for StageBApp {
+struct App {
+    config: CliConfig,
+    state: Option<ConsoleState>,
+}
+
+impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_none() {
-            self.init_all(event_loop);
-            if let Some(state) = &self.state {
-                state.window.request_redraw();
+        if self.state.is_some() {
+            return;
+        }
+        match ConsoleState::initialize(event_loop, self.config.clone()) {
+            Ok(state) => {
+                self.state = Some(state);
+            }
+            Err(err) => {
+                eprintln!("[FATAL] Stage 2A-1 initialization failed: {err}");
+                event_loop.exit();
             }
         }
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+
+        let _ = state.egui_glow.on_window_event(&state.window, &event);
+
         match event {
             WindowEvent::CloseRequested => {
-                self.shutdown();
+                state.shutdown();
                 event_loop.exit();
             }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        logical_key,
-                        state: ElementState::Pressed,
-                        ..
-                    },
-                ..
-            } => {
-                if matches!(logical_key, Key::Named(NamedKey::Escape)) {
-                    self.shutdown();
-                    event_loop.exit();
-                } else {
-                    self.handle_key(logical_key);
-                }
-            }
             WindowEvent::Resized(new_size) => {
-                if let Some(state) = &self.state {
-                    if let (Some(w), Some(h)) = (
-                        NonZeroU32::new(new_size.width),
-                        NonZeroU32::new(new_size.height),
-                    ) {
-                        if state.main_context.make_current(&state.main_surface).is_ok() {
-                            state.main_surface.resize(&state.main_context, w, h);
-                        }
+                if let (Some(w), Some(h)) = (
+                    NonZeroU32::new(new_size.width),
+                    NonZeroU32::new(new_size.height),
+                ) {
+                    if state
+                        .main_context
+                        .make_current(&state.main_surface)
+                        .is_ok()
+                    {
+                        state.main_surface.resize(&state.main_context, w, h);
                     }
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.render_frame(event_loop);
+                state.render_frame();
             }
             _ => {}
         }
     }
-}
 
-fn resolve_device_id(filter: Option<&str>, logger: &mut GlErrorLogger) -> Option<String> {
-    let filter = filter?;
-    let src = WasapiLoopbackSource::new().ok()?;
-    let devices = src.list_devices().ok()?;
-    if let Ok(idx_1based) = filter.parse::<usize>() {
-        if let Some(dev) = devices.get(idx_1based.saturating_sub(1)) {
-            logger.log_info(&format!(
-                "Selected audio device #{idx_1based}: `{}`",
-                dev.name
-            ));
-            return Some(dev.id.clone());
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = self.state.as_ref() {
+            if !state.shut_down {
+                state.window.request_redraw();
+            }
         }
     }
-    let needle = filter.to_ascii_lowercase();
-    for dev in &devices {
-        if dev.name.to_ascii_lowercase().contains(&needle) {
-            logger.log_info(&format!(
-                "Selected audio device matching `{filter}`: `{}`",
-                dev.name
-            ));
-            return Some(dev.id.clone());
-        }
-    }
-    logger.log_info(&format!(
-        "Warning: No active output device matched `{filter}`; using Windows default."
-    ));
-    None
 }
 
-fn update_gpu_extremes(soak: &mut ActiveSoakRunner, g: GpuTelemetry) {
-    soak.min_gpu_clock = Some(match soak.min_gpu_clock {
-        Some(prev) => prev.min(g.graphics_clock_mhz),
-        None => g.graphics_clock_mhz,
-    });
-    soak.max_gpu_clock = Some(match soak.max_gpu_clock {
-        Some(prev) => prev.max(g.graphics_clock_mhz),
-        None => g.graphics_clock_mhz,
-    });
-    soak.max_gpu_temp = Some(match soak.max_gpu_temp {
-        Some(prev) => prev.max(g.temp_c),
-        None => g.temp_c,
-    });
-}
-
-fn format_mem(mem: Option<MemorySnapshotMb>) -> String {
-    match mem {
-        Some(m) => format!(
-            "WorkingSet={:.1} MiB, PrivateCommit={:.1} MiB",
-            m.working_set_mb, m.private_commit_mb
-        ),
-        None => "unavailable".to_string(),
-    }
-}
-
-fn format_mem_short(mem: Option<MemorySnapshotMb>) -> String {
-    match mem {
-        Some(m) => format!(
-            "WS={:.1}MiB/Priv={:.1}MiB",
-            m.working_set_mb, m.private_commit_mb
-        ),
-        None => "mem=n/a".to_string(),
-    }
-}
-
-fn discover_valid_presets(dir: &Path) -> Result<Vec<PathBuf>, String> {
+fn discover_starter_presets(dir: &Path) -> Result<Vec<PresetEntry>, String> {
     let entries = fs::read_dir(dir)
-        .map_err(|e| format!("Could not read preset folder `{}`: {e}", dir.display()))?;
+        .map_err(|e| format!("Failed to read presets folder {}: {e}", dir.display()))?;
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|res| res.ok().map(|e| e.path()))
+        .filter(|p| {
+            let is_milk = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("milk"))
+                .unwrap_or(false);
+            let is_hidden_test = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with('_'))
+                .unwrap_or(false);
+            is_milk && !is_hidden_test
+        })
+        .collect();
+    paths.sort();
 
-    let mut presets = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Error reading preset directory: {e}"))?;
-        let path = entry.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let is_milk = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("milk"))
-            .unwrap_or(false);
-        if is_milk && !name.starts_with('_') {
-            presets.push(path);
+    if paths.is_empty() {
+        return Err(format!("No .milk presets found in {}", dir.display()));
+    }
+
+    Ok(paths
+        .into_iter()
+        .map(|path| {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<unnamed>")
+                .to_string();
+            let folder = stem
+                .split('_')
+                .nth(1)
+                .unwrap_or("Starter")
+                .to_string();
+            let complexity = estimate_complexity_from_file(&path);
+            PresetEntry {
+                path,
+                display_name: stem,
+                folder,
+                complexity,
+            }
+        })
+        .collect())
+}
+
+fn resolve_device_filter(filter: Option<&str>) -> Result<Option<String>, String> {
+    let Some(f) = filter else {
+        return Ok(None);
+    };
+    let src = WasapiLoopbackSource::new()?;
+    let devices = src.list_devices()?;
+    if let Ok(idx) = f.parse::<usize>() {
+        if idx >= 1 && idx <= devices.len() {
+            return Ok(Some(devices[idx - 1].id.clone()));
         }
     }
-    presets.sort();
-
-    if presets.len() < 2 {
-        return Err(format!(
-            "Need at least 2 valid .milk presets in `{}`",
-            dir.display()
-        ));
+    let needle = f.to_lowercase();
+    for dev in devices {
+        if dev.name.to_lowercase().contains(&needle) {
+            return Ok(Some(dev.id));
+        }
     }
-    Ok(presets)
+    Err(format!("No active Windows output device matched `--audio-device {f}`"))
 }
 
-fn preset_label(path: &Path) -> String {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("<unknown>")
-        .to_string()
+fn shorten_gpu_name(renderer: &str) -> String {
+    let trimmed = renderer.split('/').next().unwrap_or(renderer).trim();
+    trimmed
+        .replace("NVIDIA ", "")
+        .replace("Quadro ", "")
 }
 
-fn parse_deck_size(val: &str) -> Result<(u32, u32), String> {
-    let parts: Vec<&str> = val.split(['x', 'X']).collect();
-    if parts.len() != 2 {
-        return Err(format!("Invalid --deck-size `{val}` (expected WxH like 1280x720)"));
-    }
-    let w: u32 = parts[0]
-        .parse()
-        .map_err(|_| format!("Invalid width in --deck-size `{val}`"))?;
-    let h: u32 = parts[1]
-        .parse()
-        .map_err(|_| format!("Invalid height in --deck-size `{val}`"))?;
-    if w < 64 || h < 64 || w > 4096 || h > 4096 {
-        return Err(format!("--deck-size `{val}` out of safe range (64..=4096)"));
-    }
-    Ok((w, h))
-}
+fn parse_cli_args() -> Result<CliConfig, String> {
+    let mut cfg = CliConfig {
+        audio_mode: AudioMode::LiveWasapi,
+        audio_device_filter: None,
+        // Light-Load Rules: default to 1280x720 per deck during development.
+        deck_width: 1280,
+        deck_height: 720,
+        measure_gpu: false,
+        log_path: PathBuf::from("logs").join("stage_2a1.log"),
+    };
 
-fn parse_cli() -> CliConfig {
-    let args: Vec<String> = std::env::args().collect();
-    let mut mode = RunMode::Interactive;
-    let mut audio_mode = AudioMode::LiveWasapi;
-    let mut audio_device_filter: Option<String> = None;
-    let mut deck_width = 1920_u32;
-    let mut deck_height = 1080_u32;
-    let mut measure_gpu = false;
-    let mut custom_log: Option<PathBuf> = None;
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--measure-gpu" => measure_gpu = true,
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
             "--audio-source" => {
-                i += 1;
-                let val = args.get(i).expect("--audio-source requires `live` or `test`");
-                audio_mode = match val.to_ascii_lowercase().as_str() {
-                    "live" | "wasapi" => AudioMode::LiveWasapi,
-                    "test" | "synth" => AudioMode::SyntheticTest,
-                    other => panic!("Invalid --audio-source `{other}` (expected `live` or `test`)"),
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--audio-source requires `live` or `test`".to_string())?;
+                cfg.audio_mode = match val.to_lowercase().as_str() {
+                    "live" => AudioMode::LiveWasapi,
+                    "test" => AudioMode::SyntheticTest,
+                    other => {
+                        return Err(format!(
+                            "Invalid --audio-source `{other}` (expected `live` or `test`)"
+                        ));
+                    }
                 };
             }
             "--audio-device" => {
-                i += 1;
                 let val = args
-                    .get(i)
-                    .expect("--audio-device requires a 1-based index or name substring");
-                audio_device_filter = Some(val.clone());
+                    .next()
+                    .ok_or_else(|| "--audio-device requires an index or name".to_string())?;
+                cfg.audio_device_filter = Some(val);
             }
             "--deck-size" => {
-                i += 1;
-                let val = args.get(i).expect("--deck-size requires WxH");
-                let (w, h) = parse_deck_size(val).expect("Invalid --deck-size");
-                deck_width = w;
-                deck_height = h;
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--deck-size requires WxH (e.g. 1280x720)".to_string())?;
+                let (w_str, h_str) = val
+                    .split_once('x')
+                    .or_else(|| val.split_once('X'))
+                    .ok_or_else(|| format!("Invalid --deck-size `{val}` (expected WxH)"))?;
+                cfg.deck_width = w_str
+                    .parse::<u32>()
+                    .map_err(|_| format!("Invalid width `{w_str}`"))?;
+                cfg.deck_height = h_str
+                    .parse::<u32>()
+                    .map_err(|_| format!("Invalid height `{h_str}`"))?;
             }
-            "--soak-minutes" => {
-                i += 1;
-                let val = args.get(i).expect("--soak-minutes requires a number");
-                let mins: f64 = val.parse().expect("--soak-minutes must be a number");
-                mode = RunMode::ActiveSoak { minutes: mins };
-            }
+            "--measure-gpu" => cfg.measure_gpu = true,
             "--log" => {
-                i += 1;
-                let val = args.get(i).expect("--log requires a file path");
-                custom_log = Some(PathBuf::from(val));
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--log requires a file path".to_string())?;
+                cfg.log_path = PathBuf::from(val);
             }
-            other => panic!("Unknown CLI flag: `{other}`"),
+            other => {
+                return Err(format!("Unknown CLI argument `{other}`"));
+            }
         }
-        i += 1;
     }
-
-    let default_log = match mode {
-        RunMode::Interactive => PathBuf::from("logs/stage_b_live.log"),
-        RunMode::ActiveSoak { .. } => PathBuf::from("logs/stage_b_soak_10m.log"),
-    };
-
-    CliConfig {
-        mode,
-        audio_mode,
-        audio_device_filter,
-        deck_width,
-        deck_height,
-        measure_gpu,
-        log_path: custom_log.unwrap_or(default_log),
-    }
+    Ok(cfg)
 }
 
 fn main() {
-    let pm_version = projectm_version_string();
-    let max_pcm = max_pcm_samples_per_channel();
-    let config = parse_cli();
-
-    println!(
-        "libprojectM runtime version: {pm_version} | projectm_pcm_get_max_samples() = {max_pcm}"
-    );
-    let presets = discover_valid_presets(Path::new("presets"))
-        .expect("Failed to load presets from C:\\dev\\vj\\presets\\");
-    println!(
-        "Loaded {} valid presets | log file: {}",
-        presets.len(),
-        config.log_path.display()
-    );
-    println!("Keys: L = Live/Test audio | R = Reconnect WASAPI | 1/2 = Independence/Both | S = Swap | Left/Right/Up/Down = Presets | Esc = Exit");
-
-    let logger = GlErrorLogger::open(&config.log_path)
-        .expect("Could not initialize Stage B log file");
+    let config = match parse_cli_args() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[ERROR] {e}");
+            std::process::exit(1);
+        }
+    };
 
     let event_loop = EventLoop::new().expect("Failed to create winit event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-
-    let mut app = StageBApp::new(logger, presets, config);
-    event_loop
-        .run_app(&mut app)
-        .expect("Event loop exited with an error");
+    let mut app = App {
+        config,
+        state: None,
+    };
+    if let Err(e) = event_loop.run_app(&mut app) {
+        eprintln!("[ERROR] Event loop exited with error: {e}");
+        std::process::exit(1);
+    }
 }
