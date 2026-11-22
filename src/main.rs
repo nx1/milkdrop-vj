@@ -62,6 +62,7 @@ use milkdrop_vj::control::{
 use milkdrop_vj::deck::{
     init_gl_loader_for_projectm, max_pcm_samples_per_channel, projectm_version_string,
 };
+use milkdrop_vj::playlists::{CollectionFilter, PlaylistStore};
 use milkdrop_vj::preset_browser::{
     discover_immediate_starter_presets, filter_preset_indices, PresetEntry, PresetScannerHandle,
     ScanStatus, ScanUpdate, WeightFilter,
@@ -76,7 +77,7 @@ use crate::mixer::{step_blackout_alpha, BlendMode, DeckAirState, GpuMixer};
 use crate::render_deck::RenderDeck;
 use crate::ui::{
     apply_dark_venue_style, draw_console_ui, AudioBadgeState, ConsoleUiState, DeckUiSnapshot,
-    LastLoadSummary, LoadGuardState, UiInteractionState,
+    LastLoadSummary, LoadGuardState, PlaylistAction, UiInteractionState,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,13 +152,16 @@ struct ConsoleState {
     silence_pcm_buf: Vec<f32>,
     device_lost_logged: bool,
 
-    // Preset Library (background scanner + disk cache + live filtered view)
+    // Preset Library (background scanner + disk cache + favorites/playlists + live filtered view)
     presets_root: PathBuf,
     preset_cache_path: PathBuf,
+    playlists_path: PathBuf,
+    playlists: PlaylistStore,
+    playlists_revision: usize,
     presets: Vec<PresetEntry>,
     folders: Vec<String>,
     filtered_indices: Vec<usize>,
-    last_filter_sig: (String, WeightFilter, Option<String>, usize),
+    last_filter_sig: (String, WeightFilter, Option<String>, CollectionFilter, usize, usize),
     library_revision: usize,
     scanner: Option<PresetScannerHandle>,
     scan_status: ScanStatus,
@@ -193,7 +197,7 @@ impl ConsoleState {
     fn initialize(event_loop: &ActiveEventLoop, config: CliConfig) -> Result<Self, String> {
         let mut logger = GlErrorLogger::open(&config.log_path)?;
         logger.log_info(
-            "Stage 2A-4: Preset Browser (Background Scanner + Disk Cache + Live Filters + Load Safety) & UK ISO Backslash Fix",
+            "Stage 2A-4b: Preset Browser + Favorites & Curated Playlists (playlists.json) + Full Library Support",
         );
         logger.log_info(&format!(
             "Deck render resolution: {}x{} (default 1280x720 per Light-Load Rules) | measure_gpu={}",
@@ -217,6 +221,20 @@ impl ConsoleState {
         };
         logger.log_info(&mappings_status);
         let bus = ControlBus::new(mappings_cfg);
+
+        // 1b. Load Favorites & Curated Playlists (`playlists.json`, gitignored).
+        let playlists_path = PathBuf::from("playlists.json");
+        let (playlists, playlists_existed) = PlaylistStore::load_or_empty(&playlists_path)?;
+        logger.log_info(&format!(
+            "Playlists ({}): {} favorites, {} curated lists",
+            if playlists_existed {
+                "loaded playlists.json"
+            } else {
+                "new empty store"
+            },
+            playlists.favorite_count(),
+            playlists.playlists().len()
+        ));
 
         // 2. Discover immediate top-level starter presets for instant boot, then start the
         //    non-blocking background scanner for the full `presets\` tree + `preset_cache.json`.
@@ -246,7 +264,7 @@ impl ConsoleState {
 
         // 3. Create the main winit window with minimum 1280x720 pt logical size (Section 13).
         let window_attrs = Window::default_attributes()
-            .with_title("MilkDrop VJ — Stage 2A-4 Preset Browser & Console (1280x720 decks)")
+            .with_title("MilkDrop VJ — Stage 2A-4b Preset Browser, Favorites & Playlists (1280x720 decks)")
             .with_inner_size(LogicalSize::new(1440.0, 860.0))
             .with_min_inner_size(LogicalSize::new(1280.0, 720.0));
 
@@ -483,10 +501,20 @@ impl ConsoleState {
             device_lost_logged: false,
             presets_root,
             preset_cache_path,
+            playlists_path,
+            playlists,
+            playlists_revision: 0,
             presets,
             folders,
             filtered_indices,
-            last_filter_sig: (String::new(), WeightFilter::All, None, 0),
+            last_filter_sig: (
+                String::new(),
+                WeightFilter::All,
+                None,
+                CollectionFilter::All,
+                0,
+                0,
+            ),
             library_revision: 0,
             scanner,
             scan_status,
@@ -600,13 +628,147 @@ impl ConsoleState {
         }
     }
 
-    /// Recomputes `filtered_indices` ONLY when search text, Weight, Folder, or library changes.
+    /// Applies queued Favorite & Playlist actions from the UI and saves `playlists.json` atomically.
+    fn process_playlist_actions(&mut self) {
+        if self.interact.playlist_actions.is_empty() {
+            return;
+        }
+        let actions: Vec<PlaylistAction> = std::mem::take(&mut self.interact.playlist_actions);
+        let mut dirty = false;
+
+        for action in actions {
+            match action {
+                PlaylistAction::ToggleFavorite {
+                    rel_path,
+                    display_name,
+                } => {
+                    let now_fav = self.playlists.toggle_favorite(&rel_path);
+                    dirty = true;
+                    let msg = if now_fav {
+                        format!("Starred `{display_name}` in Favorites")
+                    } else {
+                        format!("Removed `{display_name}` from Favorites")
+                    };
+                    self.interact.show_toast(msg);
+                }
+                PlaylistAction::ToggleInPlaylist {
+                    playlist_name,
+                    rel_path,
+                    display_name,
+                } => {
+                    let added = self
+                        .playlists
+                        .toggle_in_playlist(&playlist_name, &rel_path);
+                    dirty = true;
+                    let msg = if added {
+                        format!("Added `{display_name}` to playlist `{playlist_name}`")
+                    } else {
+                        format!("Removed `{display_name}` from playlist `{playlist_name}`")
+                    };
+                    self.interact.show_toast(msg);
+                }
+                PlaylistAction::MoveInPlaylist {
+                    playlist_name,
+                    rel_path,
+                    delta,
+                } => {
+                    if self
+                        .playlists
+                        .move_in_playlist(&playlist_name, &rel_path, delta)
+                    {
+                        dirty = true;
+                    }
+                }
+                PlaylistAction::RemoveFromPlaylist {
+                    playlist_name,
+                    rel_path,
+                } => {
+                    if self
+                        .playlists
+                        .remove_from_playlist(&playlist_name, &rel_path)
+                    {
+                        dirty = true;
+                        self.interact
+                            .show_toast(format!("Removed preset from playlist `{playlist_name}`"));
+                    }
+                }
+                PlaylistAction::CreatePlaylist { name, also_add } => {
+                    match self.playlists.create_playlist(&name) {
+                        Ok(created_name) => {
+                            if let Some((rel, _disp)) = also_add {
+                                self.playlists.toggle_in_playlist(&created_name, &rel);
+                            }
+                            dirty = true;
+                            let msg = format!("Created playlist `{created_name}`");
+                            self.interact.playlist_modal_feedback = Some(msg.clone());
+                            self.interact.show_toast(msg);
+                            self.logger
+                                .log_info(&format!("[PLAYLISTS] Created `{created_name}`"));
+                        }
+                        Err(e) => {
+                            self.interact.playlist_modal_feedback = Some(e);
+                        }
+                    }
+                }
+                PlaylistAction::RenamePlaylist { idx, new_name } => {
+                    match self.playlists.rename_playlist(idx, &new_name) {
+                        Ok((old_name, final_name)) => {
+                            if let CollectionFilter::Playlist(ref mut cur) =
+                                self.interact.collection_filter
+                            {
+                                if cur.eq_ignore_ascii_case(&old_name) {
+                                    *cur = final_name.clone();
+                                }
+                            }
+                            dirty = true;
+                            let msg = format!("Renamed `{old_name}` -> `{final_name}`");
+                            self.interact.playlist_modal_feedback = Some(msg.clone());
+                            self.interact.show_toast(msg);
+                        }
+                        Err(e) => {
+                            self.interact.playlist_modal_feedback = Some(e);
+                        }
+                    }
+                }
+                PlaylistAction::DeletePlaylist { idx } => {
+                    if let Some(removed) = self.playlists.delete_playlist(idx) {
+                        if let CollectionFilter::Playlist(ref cur) = self.interact.collection_filter
+                        {
+                            if cur.eq_ignore_ascii_case(&removed) {
+                                self.interact.collection_filter = CollectionFilter::All;
+                            }
+                        }
+                        dirty = true;
+                        let msg = format!("Deleted playlist `{removed}`");
+                        self.interact.playlist_modal_feedback = Some(msg.clone());
+                        self.interact.show_toast(msg);
+                        self.logger
+                            .log_info(&format!("[PLAYLISTS] Deleted `{removed}`"));
+                    }
+                }
+            }
+        }
+
+        if dirty {
+            self.playlists_revision = self.playlists_revision.wrapping_add(1);
+            if let Err(e) = self.playlists.save_atomic(&self.playlists_path) {
+                let err_msg = format!("Failed to save playlists.json: {e}");
+                self.logger.log_info(&format!("[ERROR] {err_msg}"));
+                self.interact.playlist_modal_feedback = Some(err_msg.clone());
+                self.interact.show_toast(err_msg);
+            }
+        }
+    }
+
+    /// Recomputes `filtered_indices` ONLY when search, Weight, Folder, Collection, playlists, or library change.
     fn refresh_filtered_presets_if_needed(&mut self) {
         let sig = (
             self.interact.search_query.clone(),
             self.interact.weight_filter,
             self.interact.folder_filter.clone(),
+            self.interact.collection_filter.clone(),
             self.library_revision,
+            self.playlists_revision,
         );
         if sig == self.last_filter_sig {
             return;
@@ -617,6 +779,8 @@ impl ConsoleState {
             &self.interact.search_query,
             self.interact.weight_filter,
             self.interact.folder_filter.as_deref(),
+            &self.interact.collection_filter,
+            &self.playlists,
         );
         if self.filtered_indices.is_empty() {
             self.interact.selected_preset_idx = 0;
@@ -874,6 +1038,15 @@ impl ConsoleState {
             return false;
         }
 
+        // 1b. Playlists Manager Modal active: pause all live performance keys; Esc closes modal.
+        if self.interact.playlists_modal_open {
+            if pressed && code == KeyCode::Escape {
+                self.interact.playlists_modal_open = false;
+                return true;
+            }
+            return false;
+        }
+
         // 2. Typing Mode (Search box has focus):
         //    - Esc exits Typing Mode immediately (keeping search text).
         //    - Enter exits Typing Mode first WITHOUT triggering a live load.
@@ -1074,8 +1247,9 @@ impl ConsoleState {
         }
         self.frame_count += 1;
 
-        // 0. Poll non-blocking background preset scanner and refresh filtered view if needed.
+        // 0. Poll non-blocking background preset scanner, apply playlist edits, and refresh filters.
         self.poll_preset_scanner();
+        self.process_playlist_actions();
         self.refresh_filtered_presets_if_needed();
 
         // 1. Execute any Control Bus triggers queued on the previous UI frame.
@@ -1229,6 +1403,12 @@ impl ConsoleState {
             deck_a_entry.complexity
         };
 
+        let deck_a_rel = if self.deck_a_override_name.is_some() {
+            None
+        } else {
+            Some(deck_a_entry.rel_path.as_str())
+        };
+
         let deck_res_label = format!("{}p", self.config.deck_height);
         let audio_source_label = match self.audio_mode {
             AudioMode::LiveWasapi => "Live WASAPI",
@@ -1255,6 +1435,7 @@ impl ConsoleState {
                 texture_id: self.deck_a_tex_id,
                 preset_name: deck_a_name,
                 preset_path: deck_a_path,
+                preset_rel_path: deck_a_rel,
                 complexity: deck_a_comp,
                 render_ms_avg: self.deck_a_ms_ema,
                 blank: self.deck_a.blank_status(),
@@ -1263,6 +1444,7 @@ impl ConsoleState {
                 texture_id: self.deck_b_tex_id,
                 preset_name: &deck_b_entry.display_name,
                 preset_path: &deck_b_entry.path,
+                preset_rel_path: Some(deck_b_entry.rel_path.as_str()),
                 complexity: deck_b_entry.complexity,
                 render_ms_avg: self.deck_b_ms_ema,
                 blank: self.deck_b.blank_status(),
@@ -1271,6 +1453,7 @@ impl ConsoleState {
             filtered_indices: &self.filtered_indices,
             folders: &self.folders,
             scan_status: &self.scan_status,
+            playlists: &self.playlists,
         };
 
         let bus_ref = &mut self.bus;
@@ -1425,7 +1608,7 @@ impl ConsoleState {
         };
         let end_mem = current_process_memory_mb();
 
-        self.logger.log_info("=== Stage 2A-4 Shutdown Summary (provisional, laptop-limited) ===");
+        self.logger.log_info("=== Stage 2A-4b Shutdown Summary (provisional, laptop-limited) ===");
         self.logger.log_info(&format!(
             "Elapsed: {:.2}s | Frames: {} | Avg FPS: {:.2} | Total GL errors: {}",
             elapsed,
@@ -1479,7 +1662,7 @@ impl ConsoleState {
         self.live_capture.take();
 
         println!(
-            "Stage 2A-4 closed cleanly. Frames={}, Avg FPS={:.2}, Presets={}, BlankPBO avg={:.1} us, GL errors={}, log={}",
+            "Stage 2A-4b closed cleanly. Frames={}, Avg FPS={:.2}, Presets={}, BlankPBO avg={:.1} us, GL errors={}, log={}",
             self.frame_count,
             avg_fps,
             self.presets.len(),
@@ -1709,7 +1892,7 @@ fn parse_cli_args() -> Result<CliConfig, String> {
         deck_height: 720,
         measure_gpu: false,
         auto_exit_secs: None,
-        log_path: PathBuf::from("logs").join("stage_2a4.log"),
+        log_path: PathBuf::from("logs").join("stage_2a4b.log"),
     };
 
     let mut args = std::env::args().skip(1);
