@@ -26,6 +26,7 @@ mod egui_renderer;
 mod gl_log;
 mod gl_state;
 mod metrics;
+mod mixer;
 mod render_deck;
 mod ui;
 
@@ -55,7 +56,7 @@ use winit::window::{Window, WindowId};
 use milkdrop_vj::audio::capture_thread::LiveAudioCapture;
 use milkdrop_vj::audio::wasapi_loopback::WasapiLoopbackSource;
 use milkdrop_vj::audio::AudioSource;
-use milkdrop_vj::control::{param, ControlBus, MappingsConfig};
+use milkdrop_vj::control::{param, ControlBus, MappingsConfig, BLEND_MODE_COUNT};
 use milkdrop_vj::deck::{
     init_gl_loader_for_projectm, max_pcm_samples_per_channel, projectm_version_string,
 };
@@ -65,10 +66,11 @@ use milkdrop_vj::test_audio::TestAudioGenerator;
 use crate::egui_renderer::EguiGlRenderer;
 use crate::gl_log::GlErrorLogger;
 use crate::metrics::{current_process_memory_mb, MemorySnapshotMb, TimingStats};
+use crate::mixer::{step_blackout_alpha, BlendMode, GpuMixer};
 use crate::render_deck::RenderDeck;
 use crate::ui::{
     apply_dark_venue_style, draw_console_ui, AudioBadgeState, ConsoleUiState, DeckUiSnapshot,
-    LastLoadSummary, StarterPresetRow,
+    LastLoadSummary, LoadGuardState, StarterPresetRow,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +116,8 @@ struct ConsoleState {
     egui_ctx: egui::Context,
     egui_winit: egui_winit::State,
     egui_renderer: EguiGlRenderer,
+    mixer: GpuMixer,
+    master_tex_id: egui::TextureId,
     deck_a_tex_id: egui::TextureId,
     deck_b_tex_id: egui::TextureId,
     deck_a: RenderDeck,
@@ -123,8 +127,10 @@ struct ConsoleState {
     main_context: PossiblyCurrentContext,
     main_gl: Arc<glow::Context>,
 
-    // Unified Control Bus + mappings.json
+    // Unified Control Bus + mappings.json + 2-click Load Safety guard + smooth blackout ramp
     bus: ControlBus,
+    load_guard: LoadGuardState,
+    blackout_alpha: f32,
     mappings_status: String,
 
     // GPU info
@@ -180,7 +186,7 @@ struct ConsoleState {
 impl ConsoleState {
     fn initialize(event_loop: &ActiveEventLoop, config: CliConfig) -> Result<Self, String> {
         let mut logger = GlErrorLogger::open(&config.log_path)?;
-        logger.log_info("Stage 2A-1: Dark-venue egui Console + Control Bus + GL 5.3 Sync + Async Blank Check");
+        logger.log_info("Stage 2A-2: GPU Mixer (5 Blend Modes incl. Luma Key) + Crossfader + Blackout + Load Safety");
         logger.log_info(&format!(
             "Deck render resolution: {}x{} (default 1280x720 per Light-Load Rules) | measure_gpu={}",
             config.deck_width, config.deck_height, config.measure_gpu
@@ -219,7 +225,7 @@ impl ConsoleState {
 
         // 3. Create the main winit window with minimum 1280x720 pt logical size (Section 13).
         let window_attrs = Window::default_attributes()
-            .with_title("MilkDrop VJ — Stage 2A-1 Console (1280x720 decks)")
+            .with_title("MilkDrop VJ — Stage 2A-2 GPU Mixer & Console (1280x720 decks)")
             .with_inner_size(LogicalSize::new(1440.0, 860.0))
             .with_min_inner_size(LogicalSize::new(1280.0, 720.0));
 
@@ -348,6 +354,7 @@ impl ConsoleState {
             .map_err(|e| format!("Failed to re-bind main context after deck init: {e}"))?;
 
         let mut egui_renderer = EguiGlRenderer::new(Arc::clone(&main_gl))?;
+        let mixer = GpuMixer::new(Arc::clone(&main_gl), config.deck_width, config.deck_height)?;
         let egui_ctx = egui::Context::default();
         apply_dark_venue_style(&egui_ctx);
         let egui_winit = egui_winit::State::new(
@@ -359,9 +366,10 @@ impl ConsoleState {
             Some(egui_renderer.max_texture_side()),
         );
 
+        let master_tex_id = egui_renderer.register_native_texture(mixer.master_texture());
         let deck_a_tex_id = egui_renderer.register_native_texture(deck_a.output_texture());
         let deck_b_tex_id = egui_renderer.register_native_texture(deck_b.output_texture());
-        logger.check_frame(&main_gl, 0, "egui-init");
+        logger.check_frame(&main_gl, 0, "egui-and-mixer-init");
 
         // 8. Start Live WASAPI Loopback capture (or Synthetic Test audio if requested).
         let (audio_mode, live_capture, audio_device_name, audio_sample_rate) =
@@ -421,6 +429,8 @@ impl ConsoleState {
             egui_ctx,
             egui_winit,
             egui_renderer,
+            mixer,
+            master_tex_id,
             deck_a_tex_id,
             deck_b_tex_id,
             deck_a,
@@ -430,6 +440,8 @@ impl ConsoleState {
             main_context,
             main_gl,
             bus,
+            load_guard: LoadGuardState::default(),
+            blackout_alpha: 0.0,
             mappings_status,
             gpu_label,
             gpu_is_intel,
@@ -706,6 +718,25 @@ impl ConsoleState {
             }
         }
 
+        // 4b. Step smooth Emergency Blackout fade (`0.4s`) and render Master Output FBO.
+        let dt_secs = (frame_dt_ms / 1000.0) as f32;
+        let blackout_on = self.bus.get_bool(param::MASTER_BLACKOUT);
+        self.blackout_alpha = step_blackout_alpha(self.blackout_alpha, blackout_on, dt_secs);
+        let xfade = self.bus.get(param::MIXER_CROSSFADER);
+        let blend_idx = self
+            .bus
+            .get_discrete_index(param::MIXER_BLEND_MODE, BLEND_MODE_COUNT);
+        let blend_mode = BlendMode::from_index(blend_idx);
+        self.mixer.render(
+            self.deck_a.output_texture(),
+            self.deck_b.output_texture(),
+            xfade,
+            blend_mode,
+            self.blackout_alpha,
+        );
+        self.logger
+            .check_frame(&self.main_gl, self.frame_count, "main-mixer");
+
         // 5. Update rolling 0.5-second global FPS readout.
         let fps_elapsed = self.last_fps_sample_time.elapsed().as_secs_f64();
         if fps_elapsed >= 0.5 {
@@ -762,6 +793,8 @@ impl ConsoleState {
             blank_check_avg_us: self.blank_check_stats.avg_ms() * 1000.0,
             mappings_status: &self.mappings_status,
             last_load: self.last_load.as_ref(),
+            master_texture_id: self.master_tex_id,
+            blackout_alpha: self.blackout_alpha,
             deck_a: DeckUiSnapshot {
                 texture_id: self.deck_a_tex_id,
                 preset_name: deck_a_name,
@@ -780,9 +813,10 @@ impl ConsoleState {
         };
 
         let bus_ref = &mut self.bus;
+        let guard_ref = &mut self.load_guard;
         let raw_input = self.egui_winit.take_egui_input(&self.window);
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
-            draw_console_ui(ui, &ui_state, bus_ref);
+            draw_console_ui(ui, &ui_state, bus_ref, guard_ref);
         });
         self.egui_winit
             .handle_platform_output(&self.window, full_output.platform_output);
@@ -929,7 +963,7 @@ impl ConsoleState {
         };
         let end_mem = current_process_memory_mb();
 
-        self.logger.log_info("=== Stage 2A-1 Shutdown Summary (provisional, laptop-limited) ===");
+        self.logger.log_info("=== Stage 2A-2 Shutdown Summary (provisional, laptop-limited) ===");
         self.logger.log_info(&format!(
             "Elapsed: {:.2}s | Frames: {} | Avg FPS: {:.2} | Total GL errors: {}",
             elapsed,
@@ -973,8 +1007,9 @@ impl ConsoleState {
             ));
         }
 
-        // Clean GPU teardown: destroy our egui renderer on main context, then destroy both decks.
+        // Clean GPU teardown: destroy mixer + egui renderer on main context, then destroy both decks.
         if self.main_context.make_current(&self.main_surface).is_ok() {
+            self.mixer.destroy();
             self.egui_renderer.destroy();
         }
         self.deck_a.destroy();
@@ -982,7 +1017,7 @@ impl ConsoleState {
         self.live_capture.take();
 
         println!(
-            "Stage 2A-1 closed cleanly. Frames={}, Avg FPS={:.2}, BlankPBO avg={:.1} us, GL errors={}, log={}",
+            "Stage 2A-2 closed cleanly. Frames={}, Avg FPS={:.2}, BlankPBO avg={:.1} us, GL errors={}, log={}",
             self.frame_count,
             avg_fps,
             self.blank_check_stats.avg_ms() * 1000.0,
@@ -1146,7 +1181,7 @@ fn parse_cli_args() -> Result<CliConfig, String> {
         deck_height: 720,
         measure_gpu: false,
         auto_exit_secs: None,
-        log_path: PathBuf::from("logs").join("stage_2a1.log"),
+        log_path: PathBuf::from("logs").join("stage_2a2.log"),
     };
 
     let mut args = std::env::args().skip(1);
