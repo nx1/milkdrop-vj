@@ -1,0 +1,9 @@
+//! Shared library modules for `milkdrop-vj`.
+//!
+//! Putting reusable modules (`audio`, `deck`, `test_audio`) in `src/lib.rs` keeps
+//! our C library links (`projectM-4`, `glew32`) in one place and lets both the main
+//! visualizer (`src/main.rs`) and console tools (`src/bin/audio_test.rs`) share code.
+
+pub mod audio;
+pub mod deck;
+pub mod test_audio;

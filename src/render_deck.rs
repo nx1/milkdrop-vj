@@ -31,7 +31,7 @@ use glutin::display::Display;
 use glutin::prelude::*;
 use glutin::surface::{PbufferSurface, Surface, SurfaceAttributesBuilder};
 
-use crate::deck::Deck;
+use milkdrop_vj::deck::Deck;
 use crate::gl_log::GlErrorLogger;
 use crate::gl_state::{reset_read_to_default_fbo, GlStateSnapshot};
 

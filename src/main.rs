@@ -19,12 +19,15 @@
 //! - `--log <path>`             Write log output to a specific file path
 
 mod compositor;
-mod deck;
 mod gl_log;
 mod gl_state;
 mod metrics;
 mod render_deck;
-mod test_audio;
+
+use milkdrop_vj::deck::{
+    init_gl_loader_for_projectm, max_pcm_samples_per_channel, projectm_version_string,
+};
+use milkdrop_vj::test_audio::TestAudioGenerator;
 
 use std::ffi::CStr;
 use std::fs;
@@ -50,16 +53,12 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::compositor::SideBySideCompositor;
-use crate::deck::{
-    init_gl_loader_for_projectm, max_pcm_samples_per_channel, projectm_version_string,
-};
 use crate::gl_log::GlErrorLogger;
 use crate::metrics::{
     current_process_memory_mb, FpsBucketTracker, GpuTelemetry, GpuTelemetryMonitor,
     MemorySnapshotMb, TimingStats,
 };
 use crate::render_deck::RenderDeck;
-use crate::test_audio::TestAudioGenerator;
 
 /// Threshold for counting slow frames: 1 / 55 FPS = 18.1818 ms.
 const FRAME_BELOW_55_FPS_MS: f64 = 1000.0 / 55.0;
