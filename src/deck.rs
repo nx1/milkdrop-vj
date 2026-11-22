@@ -205,21 +205,29 @@ impl Deck {
 
     /// Feeds interleaved stereo floating-point PCM audio (`[L0, R0, L1, R1, ...]`,
     /// values in `-1.0..=1.0`) into this deck's audio analyzer.
+    ///
+    /// Note: `projectm_pcm_get_max_samples()` returns `576` on `libprojectM 4.1.8`,
+    /// while 60 FPS at 48 kHz produces `800` frames per video frame. Sending data in
+    /// chronological chunks of `<= max_frames` keeps the ring buffer drained with zero
+    /// overruns while never exceeding libprojectM's per-call limit.
     pub fn add_pcm_stereo(&self, interleaved_lr: &[f32]) {
-        let frames = interleaved_lr.len() / 2;
-        if frames == 0 {
+        let total_frames = interleaved_lr.len() / 2;
+        if total_frames == 0 {
             return;
         }
-        let max_frames = max_pcm_samples_per_channel();
-        let clamped_frames = frames.min(max_frames);
+        let max_frames = max_pcm_samples_per_channel().max(1);
+        let chunk_floats = max_frames * 2;
 
-        unsafe {
-            ffi::projectm_pcm_add_float(
-                self.handle,
-                interleaved_lr.as_ptr(),
-                clamped_frames as u32,
-                ffi::projectm_channels_PROJECTM_STEREO,
-            );
+        for chunk in interleaved_lr[..total_frames * 2].chunks(chunk_floats) {
+            let chunk_frames = chunk.len() / 2;
+            unsafe {
+                ffi::projectm_pcm_add_float(
+                    self.handle,
+                    chunk.as_ptr(),
+                    chunk_frames as u32,
+                    ffi::projectm_channels_PROJECTM_STEREO,
+                );
+            }
         }
     }
 

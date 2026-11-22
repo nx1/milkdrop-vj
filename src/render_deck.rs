@@ -279,8 +279,9 @@ impl RenderDeck {
     }
 
     /// Samples a small 32x32 center patch of `output_texture` and returns average RGB
-    /// brightness (`0.0` = pure black/blank, `255.0` = pure white). Used only by the
-    /// diagnostic bad-preset test to report whether the deck went blank or stayed visible.
+    /// brightness (`0.0` = pure black/blank, `255.0` = pure white). Used by bad-preset
+    /// and Milestone 2 blank-deck detection.
+    #[allow(dead_code)]
     pub fn sample_center_brightness(&self, logger: &mut GlErrorLogger) -> Result<f64, String> {
         self.make_current()?;
         let patch = 32_i32;

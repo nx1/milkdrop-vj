@@ -531,7 +531,11 @@ impl StageBApp {
                         self.logger.log_info(&msg);
                     }
 
-                    let pop = cap.pop_stereo(&mut state.live_pcm_buf, state.max_pcm_samples);
+                    // Drain ALL newly arrived frames from the ring buffer on each video frame
+                    // (at 48 kHz / 60 FPS, ~800 frames arrive per tick, which is larger than
+                    // `projectm_pcm_get_max_samples()` = 576). `Deck::add_pcm_stereo` feeds
+                    // them in chronological chunks of `<= 576` so the ring never backs up.
+                    let pop = cap.pop_stereo(&mut state.live_pcm_buf, 4096);
                     let cur_pkts = cap.packets_received();
                     let got_live_packet = cur_pkts > state.last_wasapi_packets;
                     state.last_wasapi_packets = cur_pkts;
@@ -559,7 +563,7 @@ impl StageBApp {
                 // Keep draining the live ring buffer silently if running so it never overruns
                 // while temporarily switched to Synthetic Test mode.
                 if let Some(cap) = state.live_capture.as_mut() {
-                    let _ = cap.pop_stereo(&mut state.live_pcm_buf, state.max_pcm_samples);
+                    let _ = cap.pop_stereo(&mut state.live_pcm_buf, 4096);
                 }
                 state.audio_a_gen.fill_stereo(&mut state.synth_pcm_buf, true);
                 &state.synth_pcm_buf
