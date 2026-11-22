@@ -49,14 +49,17 @@ use glutin_winit::{DisplayBuilder, GlWindow};
 use raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use milkdrop_vj::audio::capture_thread::LiveAudioCapture;
 use milkdrop_vj::audio::wasapi_loopback::WasapiLoopbackSource;
 use milkdrop_vj::audio::AudioSource;
-use milkdrop_vj::control::{param, ControlBus, MappingsConfig, BLEND_MODE_COUNT};
+use milkdrop_vj::control::{
+    normalize_modifiers, param, ControlBus, MappingMode, MappingsConfig, BLEND_MODE_COUNT,
+};
 use milkdrop_vj::deck::{
     init_gl_loader_for_projectm, max_pcm_samples_per_channel, projectm_version_string,
 };
@@ -66,11 +69,11 @@ use milkdrop_vj::test_audio::TestAudioGenerator;
 use crate::egui_renderer::EguiGlRenderer;
 use crate::gl_log::GlErrorLogger;
 use crate::metrics::{current_process_memory_mb, MemorySnapshotMb, TimingStats};
-use crate::mixer::{step_blackout_alpha, BlendMode, GpuMixer};
+use crate::mixer::{step_blackout_alpha, BlendMode, DeckAirState, GpuMixer};
 use crate::render_deck::RenderDeck;
 use crate::ui::{
     apply_dark_venue_style, draw_console_ui, AudioBadgeState, ConsoleUiState, DeckUiSnapshot,
-    LastLoadSummary, LoadGuardState, StarterPresetRow,
+    LastLoadSummary, LoadGuardState, StarterPresetRow, UiInteractionState,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,9 +130,11 @@ struct ConsoleState {
     main_context: PossiblyCurrentContext,
     main_gl: Arc<glow::Context>,
 
-    // Unified Control Bus + mappings.json + 2-click Load Safety guard + smooth blackout ramp
+    // Unified Control Bus + mappings.json + 2-click Load Safety guard + keyboard/focus state
     bus: ControlBus,
     load_guard: LoadGuardState,
+    interact: UiInteractionState,
+    modifiers: ModifiersState,
     blackout_alpha: f32,
     mappings_status: String,
 
@@ -186,7 +191,7 @@ struct ConsoleState {
 impl ConsoleState {
     fn initialize(event_loop: &ActiveEventLoop, config: CliConfig) -> Result<Self, String> {
         let mut logger = GlErrorLogger::open(&config.log_path)?;
-        logger.log_info("Stage 2A-2: GPU Mixer (5 Blend Modes incl. Luma Key) + Crossfader + Blackout + Load Safety");
+        logger.log_info("Stage 2A-3: Remappable Keyboard Mapping via Control Bus + Focus Model + Keys Modal");
         logger.log_info(&format!(
             "Deck render resolution: {}x{} (default 1280x720 per Light-Load Rules) | measure_gpu={}",
             config.deck_width, config.deck_height, config.measure_gpu
@@ -225,7 +230,7 @@ impl ConsoleState {
 
         // 3. Create the main winit window with minimum 1280x720 pt logical size (Section 13).
         let window_attrs = Window::default_attributes()
-            .with_title("MilkDrop VJ — Stage 2A-2 GPU Mixer & Console (1280x720 decks)")
+            .with_title("MilkDrop VJ — Stage 2A-3 Remappable Keyboard & Console (1280x720 decks)")
             .with_inner_size(LogicalSize::new(1440.0, 860.0))
             .with_min_inner_size(LogicalSize::new(1280.0, 720.0));
 
@@ -441,6 +446,8 @@ impl ConsoleState {
             main_gl,
             bus,
             load_guard: LoadGuardState::default(),
+            interact: UiInteractionState::default(),
+            modifiers: ModifiersState::empty(),
             blackout_alpha: 0.0,
             mappings_status,
             gpu_label,
@@ -487,9 +494,37 @@ impl ConsoleState {
         })
     }
 
-    /// Executes any queued Control Bus triggers (preset switching, test-blank trigger).
+    /// Executes any queued Control Bus triggers (preset switching, keyboard loads, test-blank).
     fn process_bus_triggers(&mut self) {
+        if self.interact.request_reset_defaults {
+            self.interact.request_reset_defaults = false;
+            self.bus.mappings = MappingsConfig::default();
+            match self.bus.mappings.save(Path::new("mappings.json")) {
+                Ok(()) => {
+                    self.mappings_status = format!(
+                        "Bus: mappings.json reset ({} keys)",
+                        self.bus.mappings.keyboard.len()
+                    );
+                    self.interact.remap_feedback =
+                        Some("Restored default key bindings and saved mappings.json.".to_string());
+                    self.logger.log_info("Mappings reset to defaults and saved to mappings.json");
+                }
+                Err(e) => {
+                    self.interact.remap_feedback = Some(format!("Save failed: {e}"));
+                    self.logger.log_info(&format!("[ERROR] Failed to save mappings.json: {e}"));
+                }
+            }
+        }
+
         let triggers = self.bus.drain_triggers();
+        let xfade = self.bus.get(param::MIXER_CROSSFADER);
+        let air_a = DeckAirState::from_weight(1.0 - xfade);
+        let air_b = DeckAirState::from_weight(xfade);
+        let sel_idx = self
+            .interact
+            .selected_preset_idx
+            .min(self.presets.len().saturating_sub(1));
+
         for trig in triggers {
             match trig.target.as_str() {
                 param::DECK_A_PREV_PRESET => {
@@ -523,9 +558,220 @@ impl ConsoleState {
                 param::DECK_A_TEST_BLANK => {
                     self.load_bad_shader_on_deck_a();
                 }
+                param::BROWSER_LOAD_OFF_AIR => {
+                    // Section 13.3 Load Safety: `Enter` loads only into a `CUE` deck (<= 5% weight).
+                    if !air_b.is_protected() {
+                        let smooth =
+                            !trig.hard_cut && self.bus.get_bool(param::DECK_B_TRANSITION_SMOOTH);
+                        self.load_deck_preset(false, sel_idx, smooth);
+                    } else if !air_a.is_protected() {
+                        let smooth =
+                            !trig.hard_cut && self.bus.get_bool(param::DECK_A_TRANSITION_SMOOTH);
+                        self.load_deck_preset(true, sel_idx, smooth);
+                    } else {
+                        self.interact.show_toast(
+                            "Both decks are live (MIXED) — cue a deck (<=5%) or press Ctrl+A / Ctrl+B to force",
+                        );
+                    }
+                }
+                param::DECK_A_LOAD_SELECTED => {
+                    if air_a.is_protected() && !trig.force_on_air {
+                        self.interact.show_toast(
+                            "Deck A is ON-AIR/MIXED — press Ctrl+A to force load",
+                        );
+                    } else {
+                        let smooth =
+                            !trig.hard_cut && self.bus.get_bool(param::DECK_A_TRANSITION_SMOOTH);
+                        self.load_deck_preset(true, sel_idx, smooth);
+                    }
+                }
+                param::DECK_B_LOAD_SELECTED => {
+                    if air_b.is_protected() && !trig.force_on_air {
+                        self.interact.show_toast(
+                            "Deck B is ON-AIR/MIXED — press Ctrl+B to force load",
+                        );
+                    } else {
+                        let smooth =
+                            !trig.hard_cut && self.bus.get_bool(param::DECK_B_TRANSITION_SMOOTH);
+                        self.load_deck_preset(false, sel_idx, smooth);
+                    }
+                }
                 _ => {}
             }
         }
+    }
+
+    /// Handles `winit` keyboard events according to the Section 13 Focus Model & `mappings.json`.
+    /// Returns `true` if this event was consumed by our keyboard router (should NOT be sent to egui).
+    fn handle_keyboard_event(&mut self, event: &KeyEvent) -> bool {
+        let pressed = event.state == ElementState::Pressed;
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return false;
+        };
+
+        let shift = self.modifiers.shift_key();
+        let ctrl = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+
+        // 1. Keys Remapping Modal active: capture replacement key or close on Esc; pause all live keys.
+        if self.interact.keys_modal_open {
+            if !pressed {
+                return true;
+            }
+            if let Some(idx) = self.interact.remapping_idx {
+                if code == KeyCode::Escape {
+                    self.interact.remapping_idx = None;
+                    self.interact.remap_feedback = Some("Remap cancelled.".to_string());
+                    return true;
+                }
+                if let Some(key_name) = keycode_to_mapping_name(code) {
+                    let mods = normalize_modifiers(shift, ctrl, alt);
+                    let conflict = self.bus.mappings.remap_keyboard(idx, key_name, mods);
+                    let badge = self
+                        .bus
+                        .mappings
+                        .keyboard
+                        .get(idx)
+                        .map(|m| m.short_key_badge())
+                        .unwrap_or_default();
+                    let action = self
+                        .bus
+                        .mappings
+                        .keyboard
+                        .get(idx)
+                        .map(|m| m.action_description())
+                        .unwrap_or_default();
+                    match self.bus.mappings.save(Path::new("mappings.json")) {
+                        Ok(()) => {
+                            let conflict_note = conflict
+                                .and_then(|ci| self.bus.mappings.keyboard.get(ci))
+                                .map(|other| {
+                                    format!(" (WARNING: also bound to `{}`)", other.action_description())
+                                })
+                                .unwrap_or_default();
+                            let msg = format!("Saved `{action}` -> [{badge}]{conflict_note}");
+                            self.logger.log_info(&format!("[KEYS] {msg}"));
+                            self.interact.remap_feedback = Some(msg);
+                            self.mappings_status = format!(
+                                "Bus: mappings.json saved ({} keys)",
+                                self.bus.mappings.keyboard.len()
+                            );
+                        }
+                        Err(e) => {
+                            let msg = format!("Failed to save mappings.json: {e}");
+                            self.logger.log_info(&format!("[ERROR] {msg}"));
+                            self.interact.remap_feedback = Some(msg);
+                        }
+                    }
+                    self.interact.remapping_idx = None;
+                }
+                return true;
+            } else if code == KeyCode::Escape {
+                self.interact.keys_modal_open = false;
+                return true;
+            }
+            return false;
+        }
+
+        // 2. Typing Mode (Search box has focus):
+        //    - Esc exits Typing Mode immediately (keeping search text).
+        //    - Enter exits Typing Mode first WITHOUT triggering a live load.
+        //    - Up/Down still step through the Preset Browser list below.
+        //    - All other keys (including Left/Right cursor and Backspace) go to egui TextEdit!
+        if self.interact.search_focused {
+            if !pressed {
+                return false;
+            }
+            match code {
+                KeyCode::Escape | KeyCode::Enter | KeyCode::NumpadEnter => {
+                    self.interact.request_blur_search = true;
+                    return true;
+                }
+                KeyCode::ArrowUp => {
+                    self.step_browser_selection(-1);
+                    return true;
+                }
+                KeyCode::ArrowDown => {
+                    self.step_browser_selection(1);
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+
+        // 3. Performance / List Mode (default):
+        //    Fixed UI focus keys first, then remappable Control Bus mappings from `mappings.json`.
+        if pressed {
+            match code {
+                KeyCode::Slash if !shift && !ctrl && !alt => {
+                    self.interact.request_focus_search = true;
+                    return true;
+                }
+                KeyCode::Escape => {
+                    // Second Esc clears search text; Esc NEVER quits the app accidentally.
+                    if !self.interact.search_query.is_empty() {
+                        self.interact.search_query.clear();
+                    }
+                    return true;
+                }
+                KeyCode::ArrowUp => {
+                    self.step_browser_selection(-1);
+                    return true;
+                }
+                KeyCode::ArrowDown => {
+                    self.step_browser_selection(1);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        let Some(key_name) = keycode_to_mapping_name(code) else {
+            return false;
+        };
+
+        let mut matches = self
+            .bus
+            .mappings
+            .find_keyboard_matches(&key_name, shift, ctrl, alt);
+
+        // Convenience: allow Ctrl+Shift+<force-load key> to combine Force On-Air + Hard Cut.
+        if matches.is_empty() && ctrl && shift && !alt {
+            for mut m in self
+                .bus
+                .mappings
+                .find_keyboard_matches(&key_name, false, true, false)
+            {
+                if m.force_on_air {
+                    m.hard_cut = true;
+                    matches.push(m);
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            return false;
+        }
+
+        for mapping in matches {
+            // Allow key repeat ONLY for Nudge (smooth crossfader sliding); ignore repeat on Toggle/Trigger/Cycle/Set.
+            if event.repeat && mapping.mode != MappingMode::Nudge {
+                continue;
+            }
+            self.bus.apply_keyboard_mapping(&mapping, pressed);
+        }
+        true
+    }
+
+    fn step_browser_selection(&mut self, delta: isize) {
+        let len = self.presets.len();
+        if len == 0 {
+            return;
+        }
+        let next = (self.interact.selected_preset_idx as isize + delta).clamp(0, (len - 1) as isize)
+            as usize;
+        self.interact.selected_preset_idx = next;
+        self.interact.scroll_to_selected = true;
     }
 
     fn load_deck_preset(&mut self, is_deck_a: bool, idx: usize, smooth: bool) {
@@ -814,9 +1060,10 @@ impl ConsoleState {
 
         let bus_ref = &mut self.bus;
         let guard_ref = &mut self.load_guard;
+        let interact_ref = &mut self.interact;
         let raw_input = self.egui_winit.take_egui_input(&self.window);
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
-            draw_console_ui(ui, &ui_state, bus_ref, guard_ref);
+            draw_console_ui(ui, &ui_state, bus_ref, guard_ref, interact_ref);
         });
         self.egui_winit
             .handle_platform_output(&self.window, full_output.platform_output);
@@ -963,7 +1210,7 @@ impl ConsoleState {
         };
         let end_mem = current_process_memory_mb();
 
-        self.logger.log_info("=== Stage 2A-2 Shutdown Summary (provisional, laptop-limited) ===");
+        self.logger.log_info("=== Stage 2A-3 Shutdown Summary (provisional, laptop-limited) ===");
         self.logger.log_info(&format!(
             "Elapsed: {:.2}s | Frames: {} | Avg FPS: {:.2} | Total GL errors: {}",
             elapsed,
@@ -1017,7 +1264,7 @@ impl ConsoleState {
         self.live_capture.take();
 
         println!(
-            "Stage 2A-2 closed cleanly. Frames={}, Avg FPS={:.2}, BlankPBO avg={:.1} us, GL errors={}, log={}",
+            "Stage 2A-3 closed cleanly. Frames={}, Avg FPS={:.2}, BlankPBO avg={:.1} us, GL errors={}, log={}",
             self.frame_count,
             avg_fps,
             self.blank_check_stats.avg_ms() * 1000.0,
@@ -1053,7 +1300,22 @@ impl ApplicationHandler for App {
             return;
         };
 
-        let _ = state.egui_winit.on_window_event(&state.window, &event);
+        if let WindowEvent::ModifiersChanged(new_mods) = &event {
+            state.modifiers = new_mods.state();
+        }
+
+        // Route keyboard events through our Section 13 Focus Model & Control Bus first so
+        // `/` doesn't type a slash into Search and performance shortcuts never hijack Typing Mode.
+        let consumed_by_router = match &event {
+            WindowEvent::KeyboardInput {
+                event: key_event, ..
+            } => state.handle_keyboard_event(key_event),
+            _ => false,
+        };
+
+        if !consumed_by_router {
+            let _ = state.egui_winit.on_window_event(&state.window, &event);
+        }
 
         match event {
             WindowEvent::CloseRequested => {
@@ -1165,6 +1427,79 @@ fn resolve_device_filter(filter: Option<&str>) -> Result<Option<String>, String>
     Err(format!("No active Windows output device matched `--audio-device {f}`"))
 }
 
+fn keycode_to_mapping_name(code: KeyCode) -> Option<String> {
+    let s = match code {
+        KeyCode::KeyA => "A",
+        KeyCode::KeyB => "B",
+        KeyCode::KeyC => "C",
+        KeyCode::KeyD => "D",
+        KeyCode::KeyE => "E",
+        KeyCode::KeyF => "F",
+        KeyCode::KeyG => "G",
+        KeyCode::KeyH => "H",
+        KeyCode::KeyI => "I",
+        KeyCode::KeyJ => "J",
+        KeyCode::KeyK => "K",
+        KeyCode::KeyL => "L",
+        KeyCode::KeyM => "M",
+        KeyCode::KeyN => "N",
+        KeyCode::KeyO => "O",
+        KeyCode::KeyP => "P",
+        KeyCode::KeyQ => "Q",
+        KeyCode::KeyR => "R",
+        KeyCode::KeyS => "S",
+        KeyCode::KeyT => "T",
+        KeyCode::KeyU => "U",
+        KeyCode::KeyV => "V",
+        KeyCode::KeyW => "W",
+        KeyCode::KeyX => "X",
+        KeyCode::KeyY => "Y",
+        KeyCode::KeyZ => "Z",
+        KeyCode::Digit0 => "0",
+        KeyCode::Digit1 => "1",
+        KeyCode::Digit2 => "2",
+        KeyCode::Digit3 => "3",
+        KeyCode::Digit4 => "4",
+        KeyCode::Digit5 => "5",
+        KeyCode::Digit6 => "6",
+        KeyCode::Digit7 => "7",
+        KeyCode::Digit8 => "8",
+        KeyCode::Digit9 => "9",
+        KeyCode::F1 => "F1",
+        KeyCode::F2 => "F2",
+        KeyCode::F3 => "F3",
+        KeyCode::F4 => "F4",
+        KeyCode::F5 => "F5",
+        KeyCode::F6 => "F6",
+        KeyCode::F7 => "F7",
+        KeyCode::F8 => "F8",
+        KeyCode::F9 => "F9",
+        KeyCode::F10 => "F10",
+        KeyCode::F11 => "F11",
+        KeyCode::F12 => "F12",
+        KeyCode::BracketLeft => "BracketLeft",
+        KeyCode::BracketRight => "BracketRight",
+        KeyCode::Backslash => "Backslash",
+        KeyCode::ArrowLeft => "ArrowLeft",
+        KeyCode::ArrowRight => "ArrowRight",
+        KeyCode::ArrowUp => "ArrowUp",
+        KeyCode::ArrowDown => "ArrowDown",
+        KeyCode::Backspace => "Backspace",
+        KeyCode::Enter | KeyCode::NumpadEnter => "Enter",
+        KeyCode::Space => "Space",
+        KeyCode::Tab => "Tab",
+        KeyCode::Slash => "Slash",
+        KeyCode::Minus => "Minus",
+        KeyCode::Equal => "Equal",
+        KeyCode::Comma => "Comma",
+        KeyCode::Period => "Period",
+        KeyCode::Semicolon => "Semicolon",
+        KeyCode::Quote => "Quote",
+        _ => return None,
+    };
+    Some(s.to_string())
+}
+
 fn shorten_gpu_name(renderer: &str) -> String {
     let trimmed = renderer.split('/').next().unwrap_or(renderer).trim();
     trimmed
@@ -1181,7 +1516,7 @@ fn parse_cli_args() -> Result<CliConfig, String> {
         deck_height: 720,
         measure_gpu: false,
         auto_exit_secs: None,
-        log_path: PathBuf::from("logs").join("stage_2a2.log"),
+        log_path: PathBuf::from("logs").join("stage_2a3.log"),
     };
 
     let mut args = std::env::args().skip(1);

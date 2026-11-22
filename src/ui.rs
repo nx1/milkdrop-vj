@@ -1,4 +1,4 @@
-//! Dark-Venue Traktor-Style `egui 0.37` Console UI (Milestone 2 — Stage `2A-2`).
+//! Dark-Venue Traktor-Style `egui 0.37` Console UI (Milestone 2 — Stage `2A-3`).
 //!
 //! Layout specification: Section 13 of `docs/project_research_and_design.md`.
 //! - All sizes are in `egui` logical points (`pt`), automatically scaled by Windows DPI.
@@ -6,8 +6,9 @@
 //! - Preview sizes follow available stage height (`(window_h * 0.40).clamp(306, 432)`)
 //!   keeping exact `16:9` aspect ratio, and the Preset Browser fills all remaining height.
 //! - Every working control (crossfader, cuts, blend modes, blackout, deck load buttons,
-//!   transition mode) reads and writes through the unified `ControlBus` (`0.0..=1.0`).
-//! - Controls arriving in `2A-3`..`2B` remain greyed out until implemented.
+//!   transition mode, and remappable keyboard bindings) reads and writes through the
+//!   unified `ControlBus` (`0.0..=1.0`) and `mappings.json`.
+//! - Controls arriving in `2A-4`, `2A-5`, and `2B` remain greyed out until implemented.
 
 use std::time::{Duration, Instant};
 
@@ -18,21 +19,21 @@ use egui::{
 
 use crate::mixer::{BlendMode, DeckAirState};
 use crate::render_deck::BlankDeckStatus;
-use milkdrop_vj::control::{param, ControlBus, BLEND_MODE_COUNT};
+use milkdrop_vj::control::{param, ControlBus, MappingMode, BLEND_MODE_COUNT};
 use milkdrop_vj::preset_meta::{ComplexityTier, PresetComplexity};
 
 /// Thresholds for per-deck rolling GPU render time (`ms`) warnings (provisional, laptop-limited).
-/// Based on sharing one `16.67 ms` 60 Hz frame budget across Deck A + Deck B + Mixer/UI (~2 ms).
 pub const DECK_MS_WARN: f64 = 6.0;
 pub const DECK_MS_ALERT: f64 = 10.0;
 
 /// Thresholds for highlighting the Status Strip's `Last load` stall readout (Risk 8).
-/// `16.7 ms` = >1 dropped 60 FPS frame; `33.3 ms` = >=2 dropped frames.
 pub const LOAD_STALL_WARN_MS: f64 = 16.7;
 pub const LOAD_STALL_ALERT_MS: f64 = 33.3;
 
 /// Seconds a protected on-air/mixed load button stays armed (`[CONFIRM?]`) before disarming.
 const LOAD_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
+/// Duration for inline status notices (such as Load Safety guard messages).
+const TOAST_DURATION: Duration = Duration::from_millis(3500);
 
 // High-contrast dark-venue palette.
 const BG_WINDOW: Color32 = Color32::from_rgb(14, 16, 20); // #0E1014
@@ -56,7 +57,6 @@ pub struct LoadGuardState {
 }
 
 impl LoadGuardState {
-    /// Clears expired arming state (> 3 seconds old).
     pub fn expire_if_needed(&mut self) {
         if let Some(t) = self.armed_at {
             if t.elapsed() >= LOAD_CONFIRM_WINDOW {
@@ -74,12 +74,8 @@ impl LoadGuardState {
                 .unwrap_or(false)
     }
 
-    /// Handles clicking a load button on a deck with air state `air_state`.
-    /// Returns `true` if the load should execute immediately, or `false` if this first click
-    /// merely armed the 3-second confirmation guard.
     pub fn click_load(&mut self, target: &str, air_state: DeckAirState) -> bool {
         if !air_state.is_protected() {
-            // Deck is in CUE (<= 5% weight): safe to load in one click.
             self.disarm();
             return true;
         }
@@ -96,6 +92,54 @@ impl LoadGuardState {
     pub fn disarm(&mut self) {
         self.armed_target = None;
         self.armed_at = None;
+    }
+}
+
+/// Interactive focus, selection, and key-remapping modal state shared between `main.rs` and `ui.rs`.
+#[derive(Default)]
+pub struct UiInteractionState {
+    /// Highlighted row in the Preset Browser list (controlled by Up/Down arrows or click).
+    pub selected_preset_idx: usize,
+    /// True after Up/Down moved selection so the scroll area scrolls the row into view.
+    pub scroll_to_selected: bool,
+    /// Search box text (verifies Typing Mode in 2A-3; live list filtering arrives in 2A-4).
+    pub search_query: String,
+    /// True while the Search `TextEdit` has keyboard focus (pauses performance shortcuts).
+    pub search_focused: bool,
+    /// Set by `/` key to focus the Search box on the next UI frame.
+    pub request_focus_search: bool,
+    /// Set by `Esc` or `Enter` in Typing Mode to return focus cleanly to performance keys.
+    pub request_blur_search: bool,
+    /// True while the `Keyboard Mappings (mappings.json)` modal is open.
+    pub keys_modal_open: bool,
+    /// Index in `bus.mappings.keyboard` currently capturing a replacement key press.
+    pub remapping_idx: Option<usize>,
+    /// Status text shown inside the Keys modal (save confirmation or conflict warning).
+    pub remap_feedback: Option<String>,
+    /// Set when the user clicks `Reset Defaults` in the Keys modal.
+    pub request_reset_defaults: bool,
+    /// Temporary inline warning/notice shown in the Status Strip (e.g. Load Safety messages).
+    toast: Option<(String, Instant)>,
+}
+
+impl UiInteractionState {
+    /// Returns `true` whenever live performance keyboard shortcuts must be paused.
+    #[allow(dead_code)]
+    pub fn performance_keys_paused(&self) -> bool {
+        self.search_focused || self.keys_modal_open
+    }
+
+    pub fn show_toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    pub fn active_toast(&self) -> Option<&str> {
+        let (msg, at) = self.toast.as_ref()?;
+        if at.elapsed() < TOAST_DURATION {
+            Some(msg.as_str())
+        } else {
+            None
+        }
     }
 }
 
@@ -117,7 +161,7 @@ pub struct LastLoadSummary {
     pub error: Option<String>,
 }
 
-/// One row shown in the `2A-1`/`2A-2` read-only Preset Browser preview (activated in `2A-4`).
+/// One row shown in the Preset Browser list.
 #[derive(Debug, Clone)]
 pub struct StarterPresetRow {
     pub name: String,
@@ -134,7 +178,7 @@ pub struct DeckUiSnapshot<'a> {
     pub blank: BlankDeckStatus,
 }
 
-/// All live readouts needed to draw one frame of the `2A-2` Control Console.
+/// All live readouts needed to draw one frame of the `2A-3` Control Console.
 pub struct ConsoleUiState<'a> {
     pub audio_source_label: &'a str,
     pub audio_device_name: &'a str,
@@ -189,18 +233,17 @@ pub fn apply_dark_venue_style(ctx: &egui::Context) {
     ctx.set_global_style(style);
 }
 
-/// Draws the entire Milestone 2 (`2A-2`) console inside `ui` (`egui 0.37` root `Ui`).
+/// Draws the entire Milestone 2 (`2A-3`) console inside `ui` (`egui 0.37` root `Ui`).
 pub fn draw_console_ui(
     ui: &mut egui::Ui,
     state: &ConsoleUiState<'_>,
     bus: &mut ControlBus,
     load_guard: &mut LoadGuardState,
+    interact: &mut UiInteractionState,
 ) {
     load_guard.expire_if_needed();
 
     let window_h = ui.ctx().content_rect().height().max(720.0);
-    // Exact Section 13 vertical budget:
-    // At 720 pt -> stage = 306 pt (preview 320x180); at 1080 pt -> stage = 432 pt (preview 544x306).
     let stage_h = (window_h * 0.40).clamp(306.0, 432.0);
     let shift_held = ui.input(|i| i.modifiers.shift);
 
@@ -219,7 +262,7 @@ pub fn draw_console_ui(
                 .stroke(Stroke::new(1.0, BORDER_SUBTLE)),
         )
         .show(ui, |ui| {
-            draw_top_bar(ui, state);
+            draw_top_bar(ui, state, interact);
         });
 
     // 2. BOTTOM STATUS STRIP — fixed 28 pt height.
@@ -232,7 +275,7 @@ pub fn draw_console_ui(
                 .stroke(Stroke::new(1.0, BORDER_SUBTLE)),
         )
         .show(ui, |ui| {
-            draw_status_strip(ui, state);
+            draw_status_strip(ui, state, interact);
         });
 
     // 3. VISUAL STAGE — 3 columns (Deck A | Live Master Mixer | Deck B).
@@ -286,7 +329,30 @@ pub fn draw_console_ui(
             });
         });
 
-    // 4. PRESET BROWSER — CentralPanel fills 100% of remaining vertical space.
+    // 4. CONDITIONAL 30 pt AMBER TYPING BANNER — shown ONLY while Search box has focus.
+    if interact.search_focused {
+        egui::Panel::top("typing_mode_banner")
+            .exact_size(30.0)
+            .frame(
+                Frame::new()
+                    .fill(Color32::from_rgb(180, 110, 12))
+                    .inner_margin(Margin::symmetric(12, 4)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.label(
+                        RichText::new(
+                            "KEYS PAUSED — TYPING IN SEARCH   (Press Esc to resume live keys; Enter exits search first; Up/Down still select list rows)",
+                        )
+                        .font(FontId::proportional(14.5))
+                        .strong()
+                        .color(Color32::from_rgb(16, 16, 16)),
+                    );
+                });
+            });
+    }
+
+    // 5. PRESET BROWSER — CentralPanel fills 100% of remaining vertical space.
     egui::CentralPanel::default()
         .frame(
             Frame::new()
@@ -295,13 +361,21 @@ pub fn draw_console_ui(
                 .stroke(Stroke::new(1.0, BORDER_SUBTLE)),
         )
         .show(ui, |ui| {
-            draw_browser_placeholder(ui, state.starter_presets);
+            draw_browser_panel(ui, state.starter_presets, interact);
         });
+
+    // 6. IN-APP REMAPPABLE KEYS MODAL (`mappings.json`).
+    if interact.keys_modal_open {
+        draw_keys_modal(ui.ctx(), bus, interact);
+    }
 }
 
-fn draw_top_bar(ui: &mut egui::Ui, state: &ConsoleUiState<'_>) {
+fn draw_top_bar(
+    ui: &mut egui::Ui,
+    state: &ConsoleUiState<'_>,
+    interact: &mut UiInteractionState,
+) {
     ui.horizontal_centered(|ui| {
-        // Left cluster: greyed-out (2A-5) audio controls + LIVE meter + large audio status badge.
         ui.add_enabled(
             false,
             egui::Button::new(format!("{} v (2A-5)", state.audio_source_label)),
@@ -313,7 +387,6 @@ fn draw_top_bar(ui: &mut egui::Ui, state: &ConsoleUiState<'_>) {
         draw_peak_meter(ui, state.audio_peak_db);
         draw_audio_status_pill(ui, state.audio_state);
 
-        // Right cluster: stage placeholders + GPU + large global FPS badge.
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let (fps_bg, fps_fg) = if state.global_fps >= 55.0 {
                 (Color32::from_rgb(16, 62, 42), COLOR_OK)
@@ -355,7 +428,22 @@ fn draw_top_bar(ui: &mut egui::Ui, state: &ConsoleUiState<'_>) {
                     );
                 });
 
-            ui.add_enabled(false, egui::Button::new("Keys (2A-3)"));
+            // LIVE Stage 2A-3 Keys remapping modal toggle.
+            let keys_btn = if interact.keys_modal_open {
+                egui::Button::new(RichText::new("Keys").strong().color(Color32::BLACK))
+                    .fill(ACCENT_DECK_A)
+            } else {
+                egui::Button::new("Keys")
+            };
+            if ui
+                .add(keys_btn)
+                .on_hover_text("View and remap keyboard shortcuts (saved to mappings.json)")
+                .clicked()
+            {
+                interact.keys_modal_open = !interact.keys_modal_open;
+                interact.remapping_idx = None;
+            }
+
             ui.add_enabled(false, egui::Button::new("Proj: OFF (2B)"));
             ui.add_enabled(
                 false,
@@ -479,7 +567,6 @@ fn draw_deck_column(
         .inner_margin(Margin::same(8))
         .stroke(Stroke::new(1.5, border_color))
         .show(ui, |ui| {
-            // 1. Header row (~28 pt): Deck title + ON-AIR/MIXED/CUE badge + rolling GPU render time.
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(title)
@@ -510,20 +597,17 @@ fn draw_deck_column(
                 });
             });
 
-            // 2. Live 16:9 OpenGL preview sized strictly from available stage height & column width.
             let col_inner_w = ui.available_width().max(160.0);
             let preview_h = preview_h_from_stage.min(col_inner_w * 9.0 / 16.0);
             let preview_w = preview_h * 16.0 / 9.0;
             let preview_size = Vec2::new(preview_w, preview_h);
 
             ui.vertical_centered(|ui| {
-                // Flip V coordinate (`1.0 -> 0.0`) because OpenGL textures have origin at bottom-left.
                 let img = egui::Image::new((snap.texture_id, preview_size))
                     .uv(Rect::from_min_max(egui::pos2(0.0, 1.0), egui::pos2(1.0, 0.0)));
                 ui.add(img);
             });
 
-            // 3. Preset name + calibrated static complexity badge (~24 pt).
             ui.horizontal(|ui| {
                 let (badge_bg, badge_fg) = complexity_colors(snap.complexity.tier);
                 Frame::new()
@@ -557,7 +641,6 @@ fn draw_deck_column(
                 .on_hover_text(snap.preset_name);
             });
 
-            // 4. Blank-deck warning slot (~20 pt).
             if snap.blank.is_blank_warning {
                 Frame::new()
                     .fill(COLOR_ALERT)
@@ -587,8 +670,6 @@ fn draw_deck_column(
                 );
             }
 
-            // 5. Working deck controls — wired through the Control Bus with 2-click Load Safety
-            //    whenever this deck is protected (ON-AIR or MIXED, weight > 5%).
             ui.horizontal(|ui| {
                 if guarded_load_button(
                     ui,
@@ -641,10 +722,6 @@ fn draw_deck_column(
         });
 }
 
-/// Renders a load button with Section 13.3 Load Safety:
-/// - `CUE` deck (`w <= 5%`): fires on first click.
-/// - `ON-AIR` / `MIXED` deck (`w > 5%`): first click turns bright amber `[CONFIRM?]` for 3s;
-///   second click executes the load.
 fn guarded_load_button(
     ui: &mut egui::Ui,
     normal_label: &str,
@@ -671,7 +748,7 @@ fn guarded_load_button(
     }
 }
 
-/// Live Stage `2A-2` Center Column: Master Preview + 5 Blend Modes + Crossfader + Blackout.
+/// Live Center Column: Master Preview + 5 Blend Modes + Crossfader + Blackout with dynamic key hints.
 fn draw_master_mixer_column(
     ui: &mut egui::Ui,
     master_tex_id: TextureId,
@@ -687,13 +764,23 @@ fn draw_master_mixer_column(
         COLOR_OK.gamma_multiply(0.65)
     };
 
+    // Read dynamic key hints from `bus.mappings` so remaps reflect on-screen immediately.
+    let hint_blend = bus
+        .mappings
+        .hint_for_target(param::MIXER_BLEND_MODE, MappingMode::Cycle);
+    let hint_cut_a = bus.mappings.hint_for_set(param::MIXER_CROSSFADER, 0.0);
+    let hint_center = bus.mappings.hint_for_set(param::MIXER_CROSSFADER, 0.5);
+    let hint_cut_b = bus.mappings.hint_for_set(param::MIXER_CROSSFADER, 1.0);
+    let hint_blackout = bus
+        .mappings
+        .hint_for_target(param::MASTER_BLACKOUT, MappingMode::Toggle);
+
     Frame::new()
         .fill(BG_CARD)
         .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::same(8))
         .stroke(Stroke::new(1.5, border_color))
         .show(ui, |ui| {
-            // 1. Header (~28 pt): MASTER OUTPUT + LIVE / BLACKOUT pill.
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("MASTER OUTPUT")
@@ -725,7 +812,6 @@ fn draw_master_mixer_column(
                 });
             });
 
-            // 2. Live 16:9 Master Output texture preview (exact same height rule as Deck A & B).
             let col_inner_w = ui.available_width().max(160.0);
             let preview_h = preview_h_from_stage.min(col_inner_w * 9.0 / 16.0);
             let preview_w = preview_h * 16.0 / 9.0;
@@ -737,18 +823,17 @@ fn draw_master_mixer_column(
                 ui.add(img);
             });
 
-            // 3. Blend Mode dropdown (`2A-2`, wired to Control Bus `mixer.blend_mode`).
             let mode_idx = bus.get_discrete_index(param::MIXER_BLEND_MODE, BLEND_MODE_COUNT);
             let current_mode = BlendMode::from_index(mode_idx);
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("Blend [M]:")
+                    RichText::new(format!("Blend [{hint_blend}]:"))
                         .font(FontId::proportional(14.0))
                         .color(TEXT_MUTED),
                 );
                 egui::ComboBox::from_id_salt("master_blend_mode")
                     .selected_text(RichText::new(current_mode.label()).strong())
-                    .width(135.0)
+                    .width(130.0)
                     .show_ui(ui, |ui| {
                         for mode in BlendMode::ALL {
                             let selected = mode == current_mode;
@@ -775,7 +860,6 @@ fn draw_master_mixer_column(
                 });
             });
 
-            // 4. Wide Crossfader Slider (double-click snaps to 0.5 Center).
             let mut xfade = bus.get(param::MIXER_CROSSFADER);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("A").strong().color(ACCENT_DECK_A));
@@ -783,7 +867,7 @@ fn draw_master_mixer_column(
                 ui.spacing_mut().slider_width = slider_w;
                 let resp = ui
                     .add(egui::Slider::new(&mut xfade, 0.0..=1.0).show_value(false))
-                    .on_hover_text("Crossfader (double-click to center; keys [ \\ ] <- -> in 2A-3)");
+                    .on_hover_text("Crossfader (double-click to center; Left/Right arrows nudge 5%)");
                 if resp.double_clicked() {
                     bus.set(param::MIXER_CROSSFADER, 0.5);
                 } else if resp.changed() {
@@ -792,24 +876,23 @@ fn draw_master_mixer_column(
                 ui.label(RichText::new("B").strong().color(ACCENT_DECK_B));
             });
 
-            // 5. Cut buttons (`Cut A`, `Center`, `Cut B`) + Emergency Blackout toggle (`0.4s` fade).
             ui.horizontal(|ui| {
                 if ui
-                    .button("Cut A [[]")
+                    .button(format!("Cut A [{hint_cut_a}]"))
                     .on_hover_text("Jump crossfader to 100% Deck A")
                     .clicked()
                 {
                     bus.set(param::MIXER_CROSSFADER, 0.0);
                 }
                 if ui
-                    .button("Center [\\]")
+                    .button(format!("Center [{hint_center}]"))
                     .on_hover_text("Center crossfader (50% A / 50% B)")
                     .clicked()
                 {
                     bus.set(param::MIXER_CROSSFADER, 0.5);
                 }
                 if ui
-                    .button("Cut B []]")
+                    .button(format!("Cut B [{hint_cut_b}]"))
                     .on_hover_text("Jump crossfader to 100% Deck B")
                     .clicked()
                 {
@@ -817,16 +900,17 @@ fn draw_master_mixer_column(
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let blk_label = if blackout_target {
+                        format!("BLACKOUT ON [{hint_blackout}]")
+                    } else {
+                        format!("BLACKOUT [{hint_blackout}]")
+                    };
                     let blk_btn = if blackout_target {
-                        egui::Button::new(
-                            RichText::new("BLACKOUT ON")
-                                .strong()
-                                .color(Color32::WHITE),
-                        )
-                        .fill(COLOR_ALERT)
+                        egui::Button::new(RichText::new(blk_label).strong().color(Color32::WHITE))
+                            .fill(COLOR_ALERT)
                     } else {
                         egui::Button::new(
-                            RichText::new("BLACKOUT")
+                            RichText::new(blk_label)
                                 .strong()
                                 .color(Color32::from_rgb(252, 165, 165)),
                         )
@@ -834,7 +918,7 @@ fn draw_master_mixer_column(
                     };
                     if ui
                         .add(blk_btn)
-                        .on_hover_text("Emergency Blackout: smooth 0.4s fade-to-black on Master (Backspace in 2A-3)")
+                        .on_hover_text("Emergency Blackout: smooth 0.4s fade-to-black on Master")
                         .clicked()
                     {
                         bus.toggle(param::MASTER_BLACKOUT);
@@ -844,30 +928,60 @@ fn draw_master_mixer_column(
         });
 }
 
-fn draw_browser_placeholder(ui: &mut egui::Ui, presets: &[StarterPresetRow]) {
+fn draw_browser_panel(
+    ui: &mut egui::Ui,
+    presets: &[StarterPresetRow],
+    interact: &mut UiInteractionState,
+) {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("PRESET BROWSER")
                 .font(FontId::proportional(17.0))
                 .strong()
-                .color(TEXT_MUTED),
+                .color(TEXT_PRIMARY),
         );
         ui.label(
-            RichText::new("(Full search, background scan & cache arrive in Stage 2A-4)")
-                .font(FontId::proportional(13.5))
-                .color(TEXT_MUTED),
+            RichText::new(
+                "Up/Down select | Enter loads off-air deck | A/B target deck (Ctrl forces on-air; Shift hard-cuts) | Full scan & filter in 2A-4",
+            )
+            .font(FontId::proportional(13.0))
+            .color(TEXT_MUTED),
         );
     });
 
-    ui.add_enabled_ui(false, |ui| {
-        let mut search_dummy = String::new();
-        ui.horizontal(|ui| {
-            ui.label("Search [/]:");
-            ui.add(
-                egui::TextEdit::singleline(&mut search_dummy)
-                    .desired_width(220.0)
-                    .hint_text("Type to filter presets (2A-4)..."),
-            );
+    // Search box IS live in 2A-3 so Typing Mode (`/`, `Esc`, cursor `<-`/`->`, banner) can be verified!
+    ui.horizontal(|ui| {
+        ui.label("Search [/]:");
+
+        let border_stroke = if interact.search_focused {
+            Stroke::new(2.0, ACCENT_DECK_A)
+        } else {
+            Stroke::new(1.0, BORDER_SUBTLE)
+        };
+        Frame::new()
+            .stroke(border_stroke)
+            .corner_radius(CornerRadius::same(4))
+            .inner_margin(Margin::same(1))
+            .show(ui, |ui| {
+                let search_id = ui.make_persistent_id("preset_search_box");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut interact.search_query)
+                        .id(search_id)
+                        .desired_width(240.0)
+                        .hint_text("Press / to test Typing Mode (filtering in 2A-4)..."),
+                );
+                if interact.request_focus_search {
+                    resp.request_focus();
+                    interact.request_focus_search = false;
+                }
+                if interact.request_blur_search {
+                    resp.surrender_focus();
+                    interact.request_blur_search = false;
+                }
+                interact.search_focused = resp.has_focus();
+            });
+
+        ui.add_enabled_ui(false, |ui| {
             ui.separator();
             ui.label("Weight:");
             let _ = ui.button("All");
@@ -876,27 +990,49 @@ fn draw_browser_placeholder(ui: &mut egui::Ui, presets: &[StarterPresetRow]) {
             let _ = ui.button("Heavy");
             ui.separator();
             ui.label("Folder:");
-            let _ = ui.button("All v");
+            let _ = ui.button("All v (2A-4)");
         });
     });
 
     ui.separator();
 
+    let scroll_to = interact.scroll_to_selected;
+    interact.scroll_to_selected = false;
+
     ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for (idx, row) in presets.iter().enumerate() {
-                let row_bg = if idx % 2 == 0 {
+                let is_selected = idx == interact.selected_preset_idx;
+                let row_bg = if is_selected {
+                    Color32::from_rgb(24, 54, 68)
+                } else if idx % 2 == 0 {
                     BG_CARD
                 } else {
                     Color32::from_rgb(20, 24, 31)
                 };
-                Frame::new()
+                let row_stroke = if is_selected {
+                    Stroke::new(1.5, ACCENT_DECK_A)
+                } else {
+                    Stroke::NONE
+                };
+
+                let frame_resp = Frame::new()
                     .fill(row_bg)
+                    .stroke(row_stroke)
+                    .corner_radius(CornerRadius::same(3))
                     .inner_margin(Margin::symmetric(10, 6))
                     .show(ui, |ui| {
                         ui.set_min_height(24.0);
                         ui.horizontal(|ui| {
+                            let marker = if is_selected { ">" } else { " " };
+                            ui.label(
+                                RichText::new(marker)
+                                    .font(FontId::monospace(15.0))
+                                    .strong()
+                                    .color(ACCENT_DECK_A),
+                            );
+
                             let (badge_bg, badge_fg) = complexity_colors(row.complexity.tier);
                             Frame::new()
                                 .fill(badge_bg)
@@ -918,6 +1054,7 @@ fn draw_browser_placeholder(ui: &mut egui::Ui, presets: &[StarterPresetRow]) {
                             ui.label(
                                 RichText::new(&row.name)
                                     .font(FontId::proportional(15.0))
+                                    .strong()
                                     .color(TEXT_PRIMARY),
                             );
 
@@ -932,11 +1069,135 @@ fn draw_browser_placeholder(ui: &mut egui::Ui, presets: &[StarterPresetRow]) {
                             });
                         });
                     });
+
+                if frame_resp.response.interact(egui::Sense::click()).clicked() {
+                    interact.selected_preset_idx = idx;
+                }
+                if is_selected && scroll_to {
+                    frame_resp.response.scroll_to_me(Some(Align::Center));
+                }
             }
         });
 }
 
-fn draw_status_strip(ui: &mut egui::Ui, state: &ConsoleUiState<'_>) {
+fn draw_keys_modal(
+    ctx: &egui::Context,
+    bus: &ControlBus,
+    interact: &mut UiInteractionState,
+) {
+    let mut open = interact.keys_modal_open;
+    egui::Window::new("Keyboard Mappings (mappings.json)")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(680.0)
+        .default_height(460.0)
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(
+                    "Performance keys are paused while this window is open. Click Remap, then press your new key combo (Esc cancels).",
+                )
+                .font(FontId::proportional(13.5))
+                .color(TEXT_MUTED),
+            );
+            ui.label(
+                RichText::new(
+                    "Fixed UI navigation keys:  / = Focus Search  |  Esc = Exit Search / Close  |  Up/Down = Select Preset Row",
+                )
+                .font(FontId::monospace(12.5))
+                .color(ACCENT_DECK_A),
+            );
+            ui.separator();
+
+            ScrollArea::vertical()
+                .max_height(310.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (idx, binding) in bus.mappings.keyboard.iter().enumerate() {
+                        let is_capturing = interact.remapping_idx == Some(idx);
+                        let row_bg = if is_capturing {
+                            Color32::from_rgb(24, 64, 78)
+                        } else if idx % 2 == 0 {
+                            BG_CARD
+                        } else {
+                            Color32::from_rgb(20, 24, 31)
+                        };
+                        Frame::new()
+                            .fill(row_bg)
+                            .inner_margin(Margin::symmetric(8, 5))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(binding.action_description())
+                                            .font(FontId::proportional(14.5))
+                                            .color(TEXT_PRIMARY),
+                                    );
+
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if is_capturing {
+                                            let btn = egui::Button::new(
+                                                RichText::new("Press key... (Esc)")
+                                                    .strong()
+                                                    .color(Color32::BLACK),
+                                            )
+                                            .fill(ACCENT_DECK_A);
+                                            if ui.add(btn).clicked() {
+                                                interact.remapping_idx = None;
+                                            }
+                                        } else if ui.button("Remap").clicked() {
+                                            interact.remapping_idx = Some(idx);
+                                            interact.remap_feedback = Some(format!(
+                                                "Listening for new key for `{}`...",
+                                                binding.action_description()
+                                            ));
+                                        }
+
+                                        Frame::new()
+                                            .fill(Color32::from_rgb(16, 20, 28))
+                                            .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                                            .corner_radius(CornerRadius::same(4))
+                                            .inner_margin(Margin::symmetric(8, 2))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    RichText::new(binding.short_key_badge())
+                                                        .font(FontId::monospace(13.5))
+                                                        .strong()
+                                                        .color(COLOR_WARN),
+                                                );
+                                            });
+                                    });
+                                });
+                            });
+                    }
+                });
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Reset Defaults").clicked() {
+                    interact.request_reset_defaults = true;
+                    interact.remapping_idx = None;
+                }
+                if let Some(msg) = &interact.remap_feedback {
+                    ui.label(
+                        RichText::new(msg)
+                            .font(FontId::proportional(13.5))
+                            .color(COLOR_WARN),
+                    );
+                }
+            });
+        });
+
+    interact.keys_modal_open = open;
+    if !open {
+        interact.remapping_idx = None;
+    }
+}
+
+fn draw_status_strip(
+    ui: &mut egui::Ui,
+    state: &ConsoleUiState<'_>,
+    interact: &UiInteractionState,
+) {
     ui.horizontal_centered(|ui| {
         ui.label(
             RichText::new(format!("Audio: {} Hz", state.audio_sample_rate))
@@ -945,7 +1206,15 @@ fn draw_status_strip(ui: &mut egui::Ui, state: &ConsoleUiState<'_>) {
         );
         ui.separator();
 
-        if let Some(last) = state.last_load {
+        // Active Load Safety / remap toast takes priority so guard feedback is impossible to miss.
+        if let Some(toast_msg) = interact.active_toast() {
+            ui.label(
+                RichText::new(format!("! {toast_msg}"))
+                    .font(FontId::proportional(13.5))
+                    .strong()
+                    .color(COLOR_WARN),
+            );
+        } else if let Some(last) = state.last_load {
             if let Some(err) = &last.error {
                 ui.label(
                     RichText::new(format!(
@@ -986,10 +1255,18 @@ fn draw_status_strip(ui: &mut egui::Ui, state: &ConsoleUiState<'_>) {
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let (keys_text, keys_color) = if interact.search_focused {
+                ("KEYS PAUSED (Typing)", COLOR_WARN)
+            } else if interact.keys_modal_open {
+                ("KEYS PAUSED (Remap)", ACCENT_DECK_A)
+            } else {
+                ("Keys: ACTIVE (/ Search)", COLOR_OK)
+            };
             ui.label(
-                RichText::new(state.mappings_status)
+                RichText::new(keys_text)
                     .font(FontId::monospace(12.5))
-                    .color(TEXT_MUTED),
+                    .strong()
+                    .color(keys_color),
             );
             ui.separator();
             ui.label(
@@ -1008,6 +1285,12 @@ fn draw_status_strip(ui: &mut egui::Ui, state: &ConsoleUiState<'_>) {
                     .font(FontId::monospace(13.0))
                     .strong()
                     .color(gl_color),
+            );
+            ui.separator();
+            ui.label(
+                RichText::new(state.mappings_status)
+                    .font(FontId::monospace(12.0))
+                    .color(TEXT_MUTED),
             );
         });
     });

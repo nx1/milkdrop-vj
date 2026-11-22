@@ -318,7 +318,207 @@ impl Default for MappingsConfig {
     }
 }
 
+impl KeyboardMapping {
+    /// Returns a compact human-readable key badge (for example `"["`, `"Shift+Enter"`, `"Ctrl+A"`).
+    pub fn short_key_badge(&self) -> String {
+        let base = short_key_name(&self.key);
+        if self.modifiers.is_empty() {
+            base.to_string()
+        } else {
+            format!("{}+{base}", self.modifiers.join("+"))
+        }
+    }
+
+    /// Returns a clear plain-language description of what this binding does for the Keys modal.
+    pub fn action_description(&self) -> String {
+        match (self.target.as_str(), self.mode, self.value, self.step, self.hard_cut, self.force_on_air) {
+            (param::MIXER_CROSSFADER, MappingMode::Set, Some(v), _, _, _) if v <= 0.01 => {
+                "Crossfader: Cut Deck A (100% A)".to_string()
+            }
+            (param::MIXER_CROSSFADER, MappingMode::Set, Some(v), _, _, _) if v >= 0.99 => {
+                "Crossfader: Cut Deck B (100% B)".to_string()
+            }
+            (param::MIXER_CROSSFADER, MappingMode::Set, Some(_), _, _, _) => {
+                "Crossfader: Center (50% / 50%)".to_string()
+            }
+            (param::MIXER_CROSSFADER, MappingMode::Nudge, _, Some(s), _, _) if s < 0.0 => {
+                format!("Crossfader: Nudge Left ({s:+.2})")
+            }
+            (param::MIXER_CROSSFADER, MappingMode::Nudge, _, Some(s), _, _) => {
+                format!("Crossfader: Nudge Right ({s:+.2})")
+            }
+            (param::MIXER_BLEND_MODE, MappingMode::Cycle, _, _, _, _) => {
+                "Blend Mode: Cycle Next".to_string()
+            }
+            (param::MASTER_BLACKOUT, MappingMode::Toggle, _, _, _, _) => {
+                "Emergency Blackout: Toggle".to_string()
+            }
+            (param::BROWSER_LOAD_OFF_AIR, _, _, _, true, _) => {
+                "Browser: Load Off-Air Deck (Hard Cut)".to_string()
+            }
+            (param::BROWSER_LOAD_OFF_AIR, _, _, _, false, _) => {
+                "Browser: Load Off-Air Deck (Smooth)".to_string()
+            }
+            (param::DECK_A_LOAD_SELECTED, _, _, _, true, true) => {
+                "Deck A: Force Load + Hard Cut".to_string()
+            }
+            (param::DECK_A_LOAD_SELECTED, _, _, _, false, true) => {
+                "Deck A: Force Load (Override On-Air)".to_string()
+            }
+            (param::DECK_A_LOAD_SELECTED, _, _, _, true, false) => {
+                "Deck A: Load Selected (Hard Cut)".to_string()
+            }
+            (param::DECK_A_LOAD_SELECTED, _, _, _, false, false) => {
+                "Deck A: Load Selected".to_string()
+            }
+            (param::DECK_B_LOAD_SELECTED, _, _, _, true, true) => {
+                "Deck B: Force Load + Hard Cut".to_string()
+            }
+            (param::DECK_B_LOAD_SELECTED, _, _, _, false, true) => {
+                "Deck B: Force Load (Override On-Air)".to_string()
+            }
+            (param::DECK_B_LOAD_SELECTED, _, _, _, true, false) => {
+                "Deck B: Load Selected (Hard Cut)".to_string()
+            }
+            (param::DECK_B_LOAD_SELECTED, _, _, _, false, false) => {
+                "Deck B: Load Selected".to_string()
+            }
+            _ => format!("{} ({:?})", self.target, self.mode),
+        }
+    }
+}
+
+/// Converts a canonical key name (like `"BracketLeft"`, `"ArrowRight"`, `"Backspace"`) into
+/// a compact button hint string (`"["`, `"->"`, `"Bksp"`).
+pub fn short_key_name(key: &str) -> &str {
+    match key {
+        "BracketLeft" => "[",
+        "BracketRight" => "]",
+        "Backslash" => "\\",
+        "ArrowLeft" => "<-",
+        "ArrowRight" => "->",
+        "ArrowUp" => "Up",
+        "ArrowDown" => "Down",
+        "Backspace" => "Bksp",
+        "Enter" => "Enter",
+        "Space" => "Space",
+        "Slash" => "/",
+        "Minus" => "-",
+        "Equal" => "=",
+        "Comma" => ",",
+        "Period" => ".",
+        "Semicolon" => ";",
+        "Quote" => "'",
+        other => other,
+    }
+}
+
+/// Returns canonical sorted modifier names (`["Ctrl", "Shift", "Alt"]`) for exact matching.
+pub fn normalize_modifiers(shift: bool, ctrl: bool, alt: bool) -> Vec<String> {
+    let mut mods = Vec::new();
+    if ctrl {
+        mods.push("Ctrl".to_string());
+    }
+    if shift {
+        mods.push("Shift".to_string());
+    }
+    if alt {
+        mods.push("Alt".to_string());
+    }
+    mods
+}
+
+fn modifiers_equal(a: &[String], b: &[String]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let norm = |list: &[String]| {
+        let mut s = false;
+        let mut c = false;
+        let mut al = false;
+        for m in list {
+            if m.eq_ignore_ascii_case("shift") {
+                s = true;
+            } else if m.eq_ignore_ascii_case("ctrl") || m.eq_ignore_ascii_case("control") {
+                c = true;
+            } else if m.eq_ignore_ascii_case("alt") {
+                al = true;
+            }
+        }
+        (c, s, al)
+    };
+    norm(a) == norm(b)
+}
+
 impl MappingsConfig {
+    /// Finds all keyboard mappings matching `(key_name, shift, ctrl, alt)`.
+    pub fn find_keyboard_matches(
+        &self,
+        key_name: &str,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+    ) -> Vec<KeyboardMapping> {
+        let wanted_mods = normalize_modifiers(shift, ctrl, alt);
+        self.keyboard
+            .iter()
+            .filter(|m| {
+                m.key.eq_ignore_ascii_case(key_name)
+                    && modifiers_equal(&m.modifiers, &wanted_mods)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Updates the key + modifiers of binding `index` and returns any conflicting binding index.
+    pub fn remap_keyboard(
+        &mut self,
+        index: usize,
+        new_key: String,
+        new_modifiers: Vec<String>,
+    ) -> Option<usize> {
+        let conflict = self.keyboard.iter().enumerate().find_map(|(i, m)| {
+            if i != index
+                && m.key.eq_ignore_ascii_case(&new_key)
+                && modifiers_equal(&m.modifiers, &new_modifiers)
+            {
+                Some(i)
+            } else {
+                None
+            }
+        });
+        if let Some(slot) = self.keyboard.get_mut(index) {
+            slot.key = new_key;
+            slot.modifiers = new_modifiers;
+        }
+        conflict
+    }
+
+    /// Finds the current short key badge for a specific `(target, mode, value)` binding so
+    /// UI buttons update dynamically whenever the user remaps a key.
+    pub fn hint_for_set(&self, target: &str, expected_value: f32) -> String {
+        self.keyboard
+            .iter()
+            .find(|m| {
+                m.target == target
+                    && m.mode == MappingMode::Set
+                    && m.value
+                        .map(|v| (v - expected_value).abs() < 0.02)
+                        .unwrap_or(false)
+            })
+            .map(|m| m.short_key_badge())
+            .unwrap_or_else(|| "—".to_string())
+    }
+
+    /// Finds the current short key badge for a specific `(target, mode)` binding.
+    pub fn hint_for_target(&self, target: &str, mode: MappingMode) -> String {
+        self.keyboard
+            .iter()
+            .find(|m| m.target == target && m.mode == mode && !m.hard_cut && !m.force_on_air)
+            .map(|m| m.short_key_badge())
+            .unwrap_or_else(|| "—".to_string())
+    }
+
     /// Loads `mappings.json` from `path`, or creates a default file if it does not exist yet.
     pub fn load_or_create_default(path: &Path) -> Result<(Self, bool), String> {
         if path.exists() {
@@ -590,5 +790,42 @@ mod tests {
         assert_eq!(parsed.schema_version, 1);
         assert!(!parsed.keyboard.is_empty());
         assert!(!parsed.midi.is_empty());
+    }
+
+    #[test]
+    fn keyboard_matching_and_remapping_work_cleanly() {
+        let mut cfg = MappingsConfig::default();
+
+        // Default `M` cycles blend mode, and `Shift+M` does not match plain `M`.
+        let hits = cfg.find_keyboard_matches("M", false, false, false);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].target, param::MIXER_BLEND_MODE);
+        assert!(cfg.find_keyboard_matches("M", true, false, false).is_empty());
+
+        // Default `Ctrl+A` sets `force_on_air = true`, `Shift+A` sets `hard_cut = true`.
+        let ctrl_a = cfg.find_keyboard_matches("A", false, true, false);
+        assert_eq!(ctrl_a.len(), 1);
+        assert!(ctrl_a[0].force_on_air);
+        assert!(!ctrl_a[0].hard_cut);
+
+        let shift_a = cfg.find_keyboard_matches("A", true, false, false);
+        assert_eq!(shift_a.len(), 1);
+        assert!(shift_a[0].hard_cut);
+        assert!(!shift_a[0].force_on_air);
+
+        // Remap Blend Mode (`M`) -> `N` and verify dynamic UI hint updates.
+        let blend_idx = cfg
+            .keyboard
+            .iter()
+            .position(|m| m.target == param::MIXER_BLEND_MODE)
+            .expect("blend binding present");
+        let conflict = cfg.remap_keyboard(blend_idx, "N".to_string(), vec![]);
+        assert!(conflict.is_none());
+        assert_eq!(
+            cfg.hint_for_target(param::MIXER_BLEND_MODE, MappingMode::Cycle),
+            "N"
+        );
+        assert!(cfg.find_keyboard_matches("M", false, false, false).is_empty());
+        assert_eq!(cfg.find_keyboard_matches("N", false, false, false).len(), 1);
     }
 }
