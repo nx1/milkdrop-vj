@@ -394,7 +394,7 @@ fn draw_deck_column(
                             .color(ms_color),
                     )
                     .on_hover_text(
-                        "Deck CPU render submit time (rolling avg).\n\
+                        "Deck GPU render time (non-blocking GL_TIME_ELAPSED, rolling avg).\n\
                          Green/White < 6.0 ms | Yellow 6.0-9.9 ms (SLOW) | Red >= 10.0 ms (OVER BUDGET).",
                     );
                 });

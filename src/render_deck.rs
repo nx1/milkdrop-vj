@@ -21,6 +21,7 @@
 //!   If Rec. 709 average luma stays below `3.0 / 255.0` continuously for `>= 2.0 seconds`,
 //!   `is_blank_warning` becomes `true`.
 
+use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::fs::{self, File};
 use std::io::BufWriter;
@@ -59,10 +60,14 @@ pub const BLANK_HOLD_SECONDS: f32 = 2.0;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DeckRenderTiming {
     /// CPU time spent inside `add_pcm_stereo()`, `projectm_opengl_render_frame()`,
-    /// `glCopyTexSubImage2D`, and fence insertion (before any optional `glFinish`).
+    /// `glCopyTexSubImage2D`, and fence insertion (note: on Deck A with VSync enabled,
+    /// NVIDIA's driver may absorb idle VSync wait inside this wall-clock span).
     pub cpu_submit_ms: f64,
     /// Extra time waiting inside `glFinish()` (only non-zero when `--measure-gpu` is active).
     pub gpu_wait_ms: f64,
+    /// Non-blocking `GL_TIME_ELAPSED` GPU execution time from 2 frames ago (zero VSync wait,
+    /// zero CPU stall). `None` during the first 2 warm-up frames.
+    pub gpu_timer_ms: Option<f64>,
     /// CPU time spent in the `500 ms` async downscaled blank-deck check, when it ran this frame.
     pub blank_check_ms: Option<f64>,
 }
@@ -306,7 +311,8 @@ impl BlankDetector {
 }
 
 /// One isolated MilkDrop deck owning its own shared OpenGL context, off-screen
-/// pbuffer surface, shared output texture, fence sync, blank detector, and `libprojectM` instance.
+/// pbuffer surface, shared output texture, fence sync, GPU timer ring, blank detector,
+/// and `libprojectM` instance.
 pub struct RenderDeck {
     name: String,
     width: u32,
@@ -319,6 +325,14 @@ pub struct RenderDeck {
     /// Pending GPU fence inserted after `glCopyTexSubImage2D` + `glFlush()` so the main/projector
     /// context can call `glWaitSync` before sampling `output_texture`.
     pending_sync: Option<glow::NativeFence>,
+    /// Previous fences waiting to finish on the GPU before `glDeleteSync` (so we never delete
+    /// a fence while `glWaitSync` on the main context still references it).
+    retired_syncs: VecDeque<glow::NativeFence>,
+    /// 3-slot `GL_TIME_ELAPSED` timer query ring (measures true per-deck GPU time without
+    /// VSync wait or CPU stalls by reading the query issued 2 frames earlier).
+    gpu_timer_queries: [glow::NativeQuery; 3],
+    gpu_timer_in_flight: [bool; 3],
+    gpu_timer_cursor: usize,
     /// Asynchronous `32x18` PBO blank-deck detector (`2x/sec`, zero CPU/GPU stall).
     blank_detector: BlankDetector,
     pbuffer: Surface<PbufferSurface>,
@@ -415,8 +429,20 @@ impl RenderDeck {
             tex
         };
 
-        // 5. Create reusable async 32x18 PBO blank-deck detector on this context.
+        // 5. Create reusable async 32x18 PBO blank-deck detector and 3-slot GL_TIME_ELAPSED ring.
         let blank_detector = BlankDetector::new(&gl, output_texture, name)?;
+        let gpu_timer_queries = unsafe {
+            let q0 = gl
+                .create_query()
+                .map_err(|e| format!("[{name}] Failed to create GL timer query 0: {e}"))?;
+            let q1 = gl
+                .create_query()
+                .map_err(|e| format!("[{name}] Failed to create GL timer query 1: {e}"))?;
+            let q2 = gl
+                .create_query()
+                .map_err(|e| format!("[{name}] Failed to create GL timer query 2: {e}"))?;
+            [q0, q1, q2]
+        };
 
         // 6. Create this deck's own independent `libprojectM` instance on this context.
         let deck = Deck::new(width as usize, height as usize)?;
@@ -431,6 +457,10 @@ impl RenderDeck {
             deck: Some(deck),
             output_texture,
             pending_sync: None,
+            retired_syncs: VecDeque::with_capacity(8),
+            gpu_timer_queries,
+            gpu_timer_in_flight: [false; 3],
+            gpu_timer_cursor: 0,
             blank_detector,
             pbuffer,
             context,
@@ -443,10 +473,11 @@ impl RenderDeck {
         self.output_texture
     }
 
-    /// Takes the pending cross-context GPU fence (inserted after `glCopyTexSubImage2D` + `glFlush`),
-    /// transferring ownership so the main context can call `glWaitSync` + `glDeleteSync`.
-    pub fn take_pending_sync(&mut self) -> Option<glow::NativeFence> {
-        self.pending_sync.take()
+    /// Returns this deck's latest cross-context GPU fence (inserted after `glCopyTexSubImage2D`
+    /// + `glFlush`), so the main/projector context can call GPU-only `glWaitSync` before sampling
+    /// `output_texture`. `RenderDeck` retains ownership and retires signaled fences on its own context.
+    pub fn pending_sync(&self) -> Option<glow::NativeFence> {
+        self.pending_sync
     }
 
     /// Returns the latest asynchronous blank-deck detector status for UI display.
@@ -493,10 +524,20 @@ impl RenderDeck {
         let t_start = Instant::now();
         self.make_current()?;
 
-        // If a previous frame's sync was never consumed (for example minimized window), free it.
-        if let Some(old_sync) = self.pending_sync.take() {
-            unsafe {
-                self.gl.delete_sync(old_sync);
+        // Move previous frame's fence into `retired_syncs`, and delete any retired fences
+        // that the GPU has already signaled (non-blocking `timeout = 0` check).
+        if let Some(prev_sync) = self.pending_sync.take() {
+            self.retired_syncs.push_back(prev_sync);
+        }
+        while let Some(&oldest) = self.retired_syncs.front() {
+            let status = unsafe { self.gl.client_wait_sync(oldest, 0, 0) };
+            if status == glow::ALREADY_SIGNALED || status == glow::CONDITION_SATISFIED {
+                self.retired_syncs.pop_front();
+                unsafe {
+                    self.gl.delete_sync(oldest);
+                }
+            } else {
+                break;
             }
         }
 
@@ -507,6 +548,39 @@ impl RenderDeck {
 
         // Save GL state before handing control to libprojectM.
         let saved = GlStateSnapshot::save(&self.gl);
+
+        // Read back the GL_TIME_ELAPSED query from 2 frames ago if ready (non-blocking, zero stall).
+        let read_idx = (self.gpu_timer_cursor + 1) % 3;
+        let gpu_timer_ms = if self.gpu_timer_in_flight[read_idx] {
+            let q = self.gpu_timer_queries[read_idx];
+            unsafe {
+                if self
+                    .gl
+                    .get_query_parameter_u32(q, glow::QUERY_RESULT_AVAILABLE)
+                    != 0
+                {
+                    let ns = self.gl.get_query_parameter_u64(q, glow::QUERY_RESULT);
+                    self.gpu_timer_in_flight[read_idx] = false;
+                    Some(ns as f64 / 1_000_000.0)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Start a fresh GL_TIME_ELAPSED query around pure deck GPU rendering + texture copy.
+        let write_idx = self.gpu_timer_cursor;
+        let write_q = self.gpu_timer_queries[write_idx];
+        let started_timer = if !self.gpu_timer_in_flight[write_idx] {
+            unsafe {
+                self.gl.begin_query(glow::TIME_ELAPSED, write_q);
+            }
+            true
+        } else {
+            false
+        };
 
         // Feed this deck's private audio buffer and render one MilkDrop frame to FBO 0 (pbuffer).
         deck.add_pcm_stereo(interleaved_lr_pcm);
@@ -529,7 +603,12 @@ impl RenderDeck {
                 self.height as i32,
             );
             self.gl.bind_texture(glow::TEXTURE_2D, None);
+            if started_timer {
+                self.gl.end_query(glow::TIME_ELAPSED);
+                self.gpu_timer_in_flight[write_idx] = true;
+            }
         }
+        self.gpu_timer_cursor = (self.gpu_timer_cursor + 1) % 3;
 
         // Periodic (500 ms) asynchronous 32x18 PBO blank-deck check (zero pipeline stall).
         let blank_check_ms = self
@@ -567,6 +646,7 @@ impl RenderDeck {
         Ok(DeckRenderTiming {
             cpu_submit_ms,
             gpu_wait_ms,
+            gpu_timer_ms,
             blank_check_ms,
         })
     }
@@ -650,6 +730,16 @@ impl RenderDeck {
             if let Some(fence) = self.pending_sync.take() {
                 unsafe {
                     self.gl.delete_sync(fence);
+                }
+            }
+            while let Some(fence) = self.retired_syncs.pop_front() {
+                unsafe {
+                    self.gl.delete_sync(fence);
+                }
+            }
+            for q in self.gpu_timer_queries {
+                unsafe {
+                    self.gl.delete_query(q);
                 }
             }
             self.blank_detector.destroy(&self.gl);

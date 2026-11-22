@@ -22,6 +22,7 @@
 //! - `--measure-gpu`              Diagnostic `glFinish()` split timing (OFF in normal runs)
 //! - `--log <path>`               Custom log file path (default `logs/stage_2a1.log`)
 
+mod egui_renderer;
 mod gl_log;
 mod gl_state;
 mod metrics;
@@ -61,6 +62,7 @@ use milkdrop_vj::deck::{
 use milkdrop_vj::preset_meta::{estimate_complexity_from_file, PresetComplexity};
 use milkdrop_vj::test_audio::TestAudioGenerator;
 
+use crate::egui_renderer::EguiGlRenderer;
 use crate::gl_log::GlErrorLogger;
 use crate::metrics::{current_process_memory_mb, MemorySnapshotMb, TimingStats};
 use crate::render_deck::RenderDeck;
@@ -82,6 +84,7 @@ struct CliConfig {
     deck_width: u32,
     deck_height: u32,
     measure_gpu: bool,
+    auto_exit_secs: Option<f64>,
     log_path: PathBuf,
 }
 
@@ -106,9 +109,11 @@ struct PendingStallTrace {
 
 struct ConsoleState {
     config: CliConfig,
-    // Drop order matters: destroy `egui_glow`, `deck_a`, `deck_b` explicitly in `shutdown()`
+    // Drop order matters: destroy `egui_renderer`, `deck_a`, `deck_b` explicitly in `shutdown()`
     // while their respective OpenGL contexts are current.
-    egui_glow: egui_glow::EguiGlow,
+    egui_ctx: egui::Context,
+    egui_winit: egui_winit::State,
+    egui_renderer: EguiGlRenderer,
     deck_a_tex_id: egui::TextureId,
     deck_b_tex_id: egui::TextureId,
     deck_a: RenderDeck,
@@ -162,6 +167,8 @@ struct ConsoleState {
     frame_count: u64,
     timing_a_cpu: TimingStats,
     timing_b_cpu: TimingStats,
+    timing_a_gpu_q: TimingStats,
+    timing_b_gpu_q: TimingStats,
     timing_frame_dt: TimingStats,
     blank_check_stats: TimingStats,
     start_memory: Option<MemorySnapshotMb>,
@@ -335,26 +342,25 @@ impl ConsoleState {
         deck_a.load_preset(&presets[deck_a_idx].path, false)?;
         deck_b.load_preset(&presets[deck_b_idx].path, false)?;
 
-        // 7. Re-bind main window context and initialize `egui_glow 0.37` + native textures.
+        // 7. Re-bind main window context and initialize `egui 0.37` + zero-reallocation GL renderer.
         main_context
             .make_current(&main_surface)
             .map_err(|e| format!("Failed to re-bind main context after deck init: {e}"))?;
 
-        let mut egui_glow = egui_glow::EguiGlow::new(
+        let mut egui_renderer = EguiGlRenderer::new(Arc::clone(&main_gl))?;
+        let egui_ctx = egui::Context::default();
+        apply_dark_venue_style(&egui_ctx);
+        let egui_winit = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
             event_loop,
-            Arc::clone(&main_gl),
-            None,
             Some(window.scale_factor() as f32),
-            true,
+            event_loop.system_theme(),
+            Some(egui_renderer.max_texture_side()),
         );
-        apply_dark_venue_style(&egui_glow.egui_ctx);
 
-        let deck_a_tex_id = egui_glow
-            .painter
-            .register_native_texture(deck_a.output_texture());
-        let deck_b_tex_id = egui_glow
-            .painter
-            .register_native_texture(deck_b.output_texture());
+        let deck_a_tex_id = egui_renderer.register_native_texture(deck_a.output_texture());
+        let deck_b_tex_id = egui_renderer.register_native_texture(deck_b.output_texture());
         logger.check_frame(&main_gl, 0, "egui-init");
 
         // 8. Start Live WASAPI Loopback capture (or Synthetic Test audio if requested).
@@ -412,7 +418,9 @@ impl ConsoleState {
         let now = Instant::now();
         Ok(Self {
             config,
-            egui_glow,
+            egui_ctx,
+            egui_winit,
+            egui_renderer,
             deck_a_tex_id,
             deck_b_tex_id,
             deck_a,
@@ -456,6 +464,8 @@ impl ConsoleState {
             frame_count: 0,
             timing_a_cpu: TimingStats::default(),
             timing_b_cpu: TimingStats::default(),
+            timing_a_gpu_q: TimingStats::default(),
+            timing_b_gpu_q: TimingStats::default(),
             timing_frame_dt: TimingStats::default(),
             blank_check_stats: TimingStats::default(),
             start_memory,
@@ -664,8 +674,14 @@ impl ConsoleState {
 
         self.timing_a_cpu.record_ms(timing_a.cpu_submit_ms);
         self.timing_b_cpu.record_ms(timing_b.cpu_submit_ms);
-        self.deck_a_ms_ema = self.deck_a_ms_ema * 0.88 + timing_a.cpu_submit_ms * 0.12;
-        self.deck_b_ms_ema = self.deck_b_ms_ema * 0.88 + timing_b.cpu_submit_ms * 0.12;
+        if let Some(gpu_ms) = timing_a.gpu_timer_ms {
+            self.timing_a_gpu_q.record_ms(gpu_ms);
+            self.deck_a_ms_ema = self.deck_a_ms_ema * 0.88 + gpu_ms * 0.12;
+        }
+        if let Some(gpu_ms) = timing_b.gpu_timer_ms {
+            self.timing_b_gpu_q.record_ms(gpu_ms);
+            self.deck_b_ms_ema = self.deck_b_ms_ema * 0.88 + gpu_ms * 0.12;
+        }
 
         if let Some(ms) = timing_a.blank_check_ms {
             self.blank_check_stats.record_ms(ms);
@@ -674,24 +690,19 @@ impl ConsoleState {
             self.blank_check_stats.record_ms(ms);
         }
 
-        // 4. Switch back to main window context and apply OpenGL 5.3 GPU-only `glWaitSync`.
+        // 4. Switch back to main window context and issue OpenGL 3.3 Core Section 5.3
+        // GPU-only `glWaitSync` on both decks' fences before sampling their shared textures.
         if let Err(e) = self.main_context.make_current(&self.main_surface) {
             self.logger
                 .log_info(&format!("[ERROR] Main context make_current failed: {e}"));
             return;
         }
-        for fence in [
-            self.deck_a.take_pending_sync(),
-            self.deck_b.take_pending_sync(),
-        ]
-        .into_iter()
-        .flatten()
+        for fence in [self.deck_a.pending_sync(), self.deck_b.pending_sync()]
+            .into_iter()
+            .flatten()
         {
             unsafe {
-                // GPU-side synchronization only — guarantees Deck texture copy finished before
-                // egui samples it, with ZERO CPU stall.
                 self.main_gl.wait_sync(fence, 0, glow::TIMEOUT_IGNORED);
-                self.main_gl.delete_sync(fence);
             }
         }
 
@@ -769,10 +780,22 @@ impl ConsoleState {
         };
 
         let bus_ref = &mut self.bus;
-        self.egui_glow.run(&self.window, |ui| {
+        let raw_input = self.egui_winit.take_egui_input(&self.window);
+        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             draw_console_ui(ui, &ui_state, bus_ref);
         });
-        self.egui_glow.paint(&self.window);
+        self.egui_winit
+            .handle_platform_output(&self.window, full_output.platform_output);
+        let clipped_primitives = self
+            .egui_ctx
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
+        let dimensions: [u32; 2] = [win_size.width, win_size.height];
+        self.egui_renderer.paint(
+            dimensions,
+            full_output.pixels_per_point,
+            &clipped_primitives,
+            &full_output.textures_delta,
+        );
 
         self.logger
             .check_frame(&self.main_gl, self.frame_count, "main-egui");
@@ -915,7 +938,14 @@ impl ConsoleState {
             self.logger.total_errors()
         ));
         self.logger.log_info(&format!(
-            "Deck A CPU submit: avg {:.2} ms (max {:.2} ms) | Deck B CPU submit: avg {:.2} ms (max {:.2} ms)",
+            "Deck A GL_TIME_ELAPSED: avg {:.2} ms (max {:.2} ms) | Deck B GL_TIME_ELAPSED: avg {:.2} ms (max {:.2} ms)",
+            self.timing_a_gpu_q.avg_ms(),
+            self.timing_a_gpu_q.max_ms(),
+            self.timing_b_gpu_q.avg_ms(),
+            self.timing_b_gpu_q.max_ms()
+        ));
+        self.logger.log_info(&format!(
+            "Deck A CPU submit (incl. VSync wait): avg {:.2} ms (max {:.2} ms) | Deck B CPU submit: avg {:.2} ms (max {:.2} ms)",
             self.timing_a_cpu.avg_ms(),
             self.timing_a_cpu.max_ms(),
             self.timing_b_cpu.avg_ms(),
@@ -943,11 +973,9 @@ impl ConsoleState {
             ));
         }
 
-        // Clean GPU teardown: destroy egui_glow on main context, then destroy both decks.
+        // Clean GPU teardown: destroy our egui renderer on main context, then destroy both decks.
         if self.main_context.make_current(&self.main_surface).is_ok() {
-            self.egui_glow.painter.free_texture(self.deck_a_tex_id);
-            self.egui_glow.painter.free_texture(self.deck_b_tex_id);
-            self.egui_glow.destroy();
+            self.egui_renderer.destroy();
         }
         self.deck_a.destroy();
         self.deck_b.destroy();
@@ -990,7 +1018,7 @@ impl ApplicationHandler for App {
             return;
         };
 
-        let _ = state.egui_glow.on_window_event(&state.window, &event);
+        let _ = state.egui_winit.on_window_event(&state.window, &event);
 
         match event {
             WindowEvent::CloseRequested => {
@@ -1013,6 +1041,12 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 state.render_frame();
+                if let Some(limit_s) = state.config.auto_exit_secs {
+                    if state.start_time.elapsed().as_secs_f64() >= limit_s {
+                        state.shutdown();
+                        event_loop.exit();
+                    }
+                }
             }
             _ => {}
         }
@@ -1111,6 +1145,7 @@ fn parse_cli_args() -> Result<CliConfig, String> {
         deck_width: 1280,
         deck_height: 720,
         measure_gpu: false,
+        auto_exit_secs: None,
         log_path: PathBuf::from("logs").join("stage_2a1.log"),
     };
 
@@ -1153,6 +1188,15 @@ fn parse_cli_args() -> Result<CliConfig, String> {
                     .map_err(|_| format!("Invalid height `{h_str}`"))?;
             }
             "--measure-gpu" => cfg.measure_gpu = true,
+            "--auto-exit-secs" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--auto-exit-secs requires a number of seconds".to_string())?;
+                cfg.auto_exit_secs = Some(
+                    val.parse::<f64>()
+                        .map_err(|_| format!("Invalid --auto-exit-secs `{val}`"))?,
+                );
+            }
             "--log" => {
                 let val = args
                     .next()
