@@ -20,6 +20,7 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::time::Instant;
 
 use glow::HasContext;
 use glutin::config::Config;
@@ -33,6 +34,25 @@ use glutin::surface::{PbufferSurface, Surface, SurfaceAttributesBuilder};
 use crate::deck::Deck;
 use crate::gl_log::GlErrorLogger;
 use crate::gl_state::{reset_read_to_default_fbo, GlStateSnapshot};
+
+/// Split timing returned by `RenderDeck::render_to_texture()` for one frame.
+///
+/// - `cpu_submit_ms`: Time spent on the CPU inside `add_pcm_stereo()`,
+///   `projectm_opengl_render_frame()`, and `glCopyTexSubImage2D` **before** `glFinish()`.
+/// - `gpu_wait_ms`: Extra time spent waiting inside `glFinish()` (only non-zero when
+///   `measure_gpu == true`). Comparing these two numbers separates CPU-side cost from
+///   GPU-side cost.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeckRenderTiming {
+    pub cpu_submit_ms: f64,
+    pub gpu_wait_ms: f64,
+}
+
+impl DeckRenderTiming {
+    pub fn total_ms(self) -> f64 {
+        self.cpu_submit_ms + self.gpu_wait_ms
+    }
+}
 
 /// One isolated MilkDrop deck owning its own shared OpenGL context, off-screen
 /// pbuffer surface, shared output texture, and `libprojectM` instance.
@@ -190,17 +210,17 @@ impl RenderDeck {
     /// OpenGL state save/restore, copies the pbuffer GPU-to-GPU into `output_texture`,
     /// and logs any OpenGL errors.
     ///
-    /// When `measure_gpu` is `true` (diagnostic `--measure-gpu` mode ONLY), calls
-    /// `glFinish()` before returning so the caller's timer measures this deck's true
-    /// GPU render cost. In normal live rendering (`measure_gpu == false`), we only call
-    /// `glFlush()` and never stall the CPU.
+    /// Returns split timing (`cpu_submit_ms` before `glFinish` and `gpu_wait_ms` inside
+    /// `glFinish` when `measure_gpu == true`). In normal live rendering (`measure_gpu == false`),
+    /// we only call `glFlush()` and never stall the CPU.
     pub fn render_to_texture(
         &self,
         interleaved_lr_pcm: &[f32],
         frame_index: u64,
         measure_gpu: bool,
         logger: &mut GlErrorLogger,
-    ) -> Result<(), String> {
+    ) -> Result<DeckRenderTiming, String> {
+        let t_start = Instant::now();
         self.make_current()?;
         let deck = self
             .deck
@@ -233,19 +253,29 @@ impl RenderDeck {
             self.gl.bind_texture(glow::TEXTURE_2D, None);
         }
 
-        // Restore GL state cleanly. In diagnostic `--measure-gpu` mode we wait for GPU
-        // completion (`glFinish`); in normal mode we only `glFlush` so the CPU never stalls.
         saved.restore(&self.gl);
-        unsafe {
-            if measure_gpu {
+        let cpu_submit_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+
+        // In diagnostic `--measure-gpu` mode we time the extra wait inside `glFinish()`;
+        // in normal mode we only `glFlush` so the CPU never stalls.
+        let gpu_wait_ms = if measure_gpu {
+            let t_gpu = Instant::now();
+            unsafe {
                 self.gl.finish();
-            } else {
+            }
+            t_gpu.elapsed().as_secs_f64() * 1000.0
+        } else {
+            unsafe {
                 self.gl.flush();
             }
-        }
+            0.0
+        };
 
         logger.check_frame(&self.gl, frame_index, &self.name);
-        Ok(())
+        Ok(DeckRenderTiming {
+            cpu_submit_ms,
+            gpu_wait_ms,
+        })
     }
 
     /// Samples a small 32x32 center patch of `output_texture` and returns average RGB

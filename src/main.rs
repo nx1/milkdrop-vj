@@ -79,6 +79,8 @@ struct CliConfig {
     deck_width: u32,
     deck_height: u32,
     measure_gpu: bool,
+    deck_a_preset_override: Option<PathBuf>,
+    deck_b_preset_override: Option<PathBuf>,
     log_path: PathBuf,
 }
 
@@ -98,8 +100,12 @@ struct HeavyTestRunner {
     steady_start: Option<Instant>,
     steady_frames: u64,
     steady_below_55: u64,
-    steady_timing_a: TimingStats,
-    steady_timing_b: TimingStats,
+    steady_a_cpu: TimingStats,
+    steady_a_gpu: TimingStats,
+    steady_a_total: TimingStats,
+    steady_b_cpu: TimingStats,
+    steady_b_gpu: TimingStats,
+    steady_b_total: TimingStats,
     steady_timing_total: TimingStats,
     steady_fps_buckets: FpsBucketTracker,
     last_bucket_time: Instant,
@@ -153,7 +159,11 @@ struct Stage3State {
     last_report_time: Instant,
     last_report_frames: u64,
     frame_count: u64,
+    timing_a_cpu: TimingStats,
+    timing_a_gpu: TimingStats,
     timing_a: TimingStats,
+    timing_b_cpu: TimingStats,
+    timing_b_gpu: TimingStats,
     timing_b: TimingStats,
     timing_total: TimingStats,
     frames_below_55: u64,
@@ -329,10 +339,9 @@ impl Stage3App {
         )
         .expect("Failed to create Deck B");
 
-        // Pick initial presets based on run mode.
+        // Pick initial presets based on run mode (with optional CLI overrides for Runs 3D/3E).
         let (deck_a_idx, deck_b_idx) = match self.config.mode {
             RunMode::HeavyTest { .. } => {
-                // Find 08_Reaction and 09_Drawing explicitly.
                 let idx_08 = find_preset_by_prefix(&self.presets, "08_").unwrap_or(0);
                 let idx_09 = find_preset_by_prefix(&self.presets, "09_").unwrap_or(1);
                 (idx_08, idx_09)
@@ -340,13 +349,24 @@ impl Stage3App {
             _ => (0, 1.min(self.presets.len().saturating_sub(1))),
         };
 
-        let label_a = preset_label(&self.presets[deck_a_idx]);
-        let label_b = preset_label(&self.presets[deck_b_idx]);
+        let init_path_a = self
+            .config
+            .deck_a_preset_override
+            .clone()
+            .unwrap_or_else(|| self.presets[deck_a_idx].clone());
+        let init_path_b = self
+            .config
+            .deck_b_preset_override
+            .clone()
+            .unwrap_or_else(|| self.presets[deck_b_idx].clone());
+
+        let label_a = preset_label(&init_path_a);
+        let label_b = preset_label(&init_path_b);
         deck_a
-            .load_preset(&self.presets[deck_a_idx], false)
+            .load_preset(&init_path_a, false)
             .unwrap_or_else(|e| self.logger.log_info(&format!("Deck A init err: {e}")));
         deck_b
-            .load_preset(&self.presets[deck_b_idx], false)
+            .load_preset(&init_path_b, false)
             .unwrap_or_else(|e| self.logger.log_info(&format!("Deck B init err: {e}")));
 
         println!("Deck A initial preset: {label_a}");
@@ -385,8 +405,9 @@ impl Stage3App {
 
         let heavy_runner = matches!(self.config.mode, RunMode::HeavyTest { .. }).then(|| {
             println!("[Heavy Test] First 5s = warmup/shader compile (tracked separately from steady state)...");
-            self.logger
-                .log_info("[Heavy Test] Warmup 5s started (08_Reaction on A + 09_Drawing on B)");
+            self.logger.log_info(&format!(
+                "[Heavy Test] Warmup 5s started (Deck A=`{label_a}`, Deck B=`{label_b}`)"
+            ));
             HeavyTestRunner {
                 warmup_done: false,
                 warmup_frames: 0,
@@ -395,8 +416,12 @@ impl Stage3App {
                 steady_start: None,
                 steady_frames: 0,
                 steady_below_55: 0,
-                steady_timing_a: TimingStats::default(),
-                steady_timing_b: TimingStats::default(),
+                steady_a_cpu: TimingStats::default(),
+                steady_a_gpu: TimingStats::default(),
+                steady_a_total: TimingStats::default(),
+                steady_b_cpu: TimingStats::default(),
+                steady_b_gpu: TimingStats::default(),
+                steady_b_total: TimingStats::default(),
                 steady_timing_total: TimingStats::default(),
                 steady_fps_buckets: FpsBucketTracker::default(),
                 last_bucket_time: now,
@@ -470,7 +495,11 @@ impl Stage3App {
             last_report_time: now,
             last_report_frames: 0,
             frame_count: 0,
+            timing_a_cpu: TimingStats::default(),
+            timing_a_gpu: TimingStats::default(),
             timing_a: TimingStats::default(),
+            timing_b_cpu: TimingStats::default(),
+            timing_b_gpu: TimingStats::default(),
             timing_b: TimingStats::default(),
             timing_total: TimingStats::default(),
             frames_below_55: 0,
@@ -672,28 +701,28 @@ impl Stage3App {
         state
             .audio_a
             .fill_stereo(&mut state.pcm_a, state.deck_a_audio);
-        let t_a = Instant::now();
-        state
+        let timing_a_frame = state
             .deck_a
             .render_to_texture(&state.pcm_a, frame_idx, measure_gpu, &mut self.logger)
             .expect("Deck A render failed");
-        let a_ms = t_a.elapsed().as_secs_f64() * 1000.0;
         if frame_idx > 5 {
-            state.timing_a.record_ms(a_ms);
+            state.timing_a_cpu.record_ms(timing_a_frame.cpu_submit_ms);
+            state.timing_a_gpu.record_ms(timing_a_frame.gpu_wait_ms);
+            state.timing_a.record_ms(timing_a_frame.total_ms());
         }
 
         // 2. Render Deck B inside Deck B's shared OpenGL context.
         state
             .audio_b
             .fill_stereo(&mut state.pcm_b, state.deck_b_audio);
-        let t_b = Instant::now();
-        state
+        let timing_b_frame = state
             .deck_b
             .render_to_texture(&state.pcm_b, frame_idx, measure_gpu, &mut self.logger)
             .expect("Deck B render failed");
-        let b_ms = t_b.elapsed().as_secs_f64() * 1000.0;
         if frame_idx > 5 {
-            state.timing_b.record_ms(b_ms);
+            state.timing_b_cpu.record_ms(timing_b_frame.cpu_submit_ms);
+            state.timing_b_gpu.record_ms(timing_b_frame.gpu_wait_ms);
+            state.timing_b.record_ms(timing_b_frame.total_ms());
         }
 
         // 3. Composite side-by-side on the main window context.
@@ -772,8 +801,12 @@ impl Stage3App {
                 if frame_delta_ms > FRAME_BELOW_55_FPS_MS {
                     heavy.steady_below_55 += 1;
                 }
-                heavy.steady_timing_a.record_ms(a_ms);
-                heavy.steady_timing_b.record_ms(b_ms);
+                heavy.steady_a_cpu.record_ms(timing_a_frame.cpu_submit_ms);
+                heavy.steady_a_gpu.record_ms(timing_a_frame.gpu_wait_ms);
+                heavy.steady_a_total.record_ms(timing_a_frame.total_ms());
+                heavy.steady_b_cpu.record_ms(timing_b_frame.cpu_submit_ms);
+                heavy.steady_b_gpu.record_ms(timing_b_frame.gpu_wait_ms);
+                heavy.steady_b_total.record_ms(timing_b_frame.total_ms());
                 heavy.steady_timing_total.record_ms(total_recorded_ms);
 
                 let b_secs = heavy.last_bucket_time.elapsed().as_secs_f64();
@@ -937,8 +970,8 @@ impl Stage3App {
                 "=== Stage 3 Summary ({:?}) ===\n\
                  Duration:         {:.2}s ({} frames, overall avg {:.2} FPS)\n\
                  Deck resolution:  {}x{} per deck (x2) | measure_gpu={}\n\
-                 Deck A render:    avg {:.2} ms | worst {:.2} ms ({} frames)\n\
-                 Deck B render:    avg {:.2} ms | worst {:.2} ms ({} frames)\n\
+                 Deck A render:    avg {:.2} ms (cpu_submit {:.2} ms + gpu_wait {:.2} ms) | worst {:.2} ms ({} frames)\n\
+                 Deck B render:    avg {:.2} ms (cpu_submit {:.2} ms + gpu_wait {:.2} ms) | worst {:.2} ms ({} frames)\n\
                  Total work/frame: avg {:.2} ms | worst {:.2} ms\n\
                  Frames < 55 FPS:  {}\n\
                  Start memory:     {}\n\
@@ -952,9 +985,13 @@ impl Stage3App {
                 state.config.deck_height,
                 state.config.measure_gpu,
                 state.timing_a.avg_ms(),
+                state.timing_a_cpu.avg_ms(),
+                state.timing_a_gpu.avg_ms(),
                 state.timing_a.max_ms(),
                 state.timing_a.samples(),
                 state.timing_b.avg_ms(),
+                state.timing_b_cpu.avg_ms(),
+                state.timing_b_gpu.avg_ms(),
                 state.timing_b.max_ms(),
                 state.timing_b.samples(),
                 state.timing_total.avg_ms(),
@@ -980,20 +1017,28 @@ impl Stage3App {
                     None => "n/a".to_string(),
                 };
                 summary.push_str(&format!(
-                    "\n--- Heavy-Preset Steady State (08_Reaction + 09_Drawing, AFTER 5s warmup) ---\n\
+                    "\n--- Heavy-Preset Steady State (AFTER 5s warmup) ---\n\
                      Steady duration:  {:.2}s ({} frames, avg {:.2} FPS | 1s buckets: {})\n\
-                     Steady Deck A:    avg {:.2} ms | worst {:.2} ms\n\
-                     Steady Deck B:    avg {:.2} ms | worst {:.2} ms\n\
+                     Steady Deck A:    total avg {:.2} ms (max {:.2}) | cpu_submit avg {:.2} ms (max {:.2}) | gpu_wait avg {:.2} ms (max {:.2})\n\
+                     Steady Deck B:    total avg {:.2} ms (max {:.2}) | cpu_submit avg {:.2} ms (max {:.2}) | gpu_wait avg {:.2} ms (max {:.2})\n\
                      Steady Total:     avg {:.2} ms | worst {:.2} ms\n\
                      Steady < 55 FPS:  {} frames",
                     steady_secs,
                     heavy.steady_frames,
                     steady_avg_fps,
                     bucket_line,
-                    heavy.steady_timing_a.avg_ms(),
-                    heavy.steady_timing_a.max_ms(),
-                    heavy.steady_timing_b.avg_ms(),
-                    heavy.steady_timing_b.max_ms(),
+                    heavy.steady_a_total.avg_ms(),
+                    heavy.steady_a_total.max_ms(),
+                    heavy.steady_a_cpu.avg_ms(),
+                    heavy.steady_a_cpu.max_ms(),
+                    heavy.steady_a_gpu.avg_ms(),
+                    heavy.steady_a_gpu.max_ms(),
+                    heavy.steady_b_total.avg_ms(),
+                    heavy.steady_b_total.max_ms(),
+                    heavy.steady_b_cpu.avg_ms(),
+                    heavy.steady_b_cpu.max_ms(),
+                    heavy.steady_b_gpu.avg_ms(),
+                    heavy.steady_b_gpu.max_ms(),
                     heavy.steady_timing_total.avg_ms(),
                     heavy.steady_timing_total.max_ms(),
                     heavy.steady_below_55
@@ -1223,7 +1268,7 @@ fn discover_valid_presets(dir: &Path) -> Result<Vec<PathBuf>, String> {
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.eq_ignore_ascii_case("milk"))
             .unwrap_or(false);
-        if is_milk && !name.starts_with("_bad_") {
+        if is_milk && !name.starts_with('_') {
             presets.push(path);
         }
     }
@@ -1268,6 +1313,8 @@ fn parse_cli() -> CliConfig {
     let mut deck_width = 1920_u32;
     let mut deck_height = 1080_u32;
     let mut measure_gpu = false;
+    let mut deck_a_preset_override: Option<PathBuf> = None;
+    let mut deck_b_preset_override: Option<PathBuf> = None;
     let mut custom_log: Option<PathBuf> = None;
 
     let mut i = 1;
@@ -1276,6 +1323,16 @@ fn parse_cli() -> CliConfig {
             "--measure-gpu" => measure_gpu = true,
             "--bad-preset-test" => mode = RunMode::BadPresetTest,
             "--preset-load-bench" => mode = RunMode::PresetLoadBench,
+            "--deck-a-preset" => {
+                i += 1;
+                let val = args.get(i).expect("--deck-a-preset requires a file path");
+                deck_a_preset_override = Some(PathBuf::from(val));
+            }
+            "--deck-b-preset" => {
+                i += 1;
+                let val = args.get(i).expect("--deck-b-preset requires a file path");
+                deck_b_preset_override = Some(PathBuf::from(val));
+            }
             "--deck-size" => {
                 i += 1;
                 let val = args.get(i).expect("--deck-size requires WxH (e.g. 1280x720)");
@@ -1330,6 +1387,8 @@ fn parse_cli() -> CliConfig {
         deck_width,
         deck_height,
         measure_gpu,
+        deck_a_preset_override,
+        deck_b_preset_override,
         log_path: custom_log.unwrap_or(default_log),
     }
 }
