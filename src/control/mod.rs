@@ -46,13 +46,20 @@ pub mod param {
     pub const MASTER_BEAT_AUTO: &str = "master.beat_auto";
     pub const MASTER_BEAT_STRENGTH: &str = "master.beat_strength";
 
-    // Milestone 3 (3C): Two Live GPU Effect Racks (FX1 Color/Geo + FX2 Performance/Punch).
+    // Milestone 3 (3C): Two Live GPU Effect Racks (FX1 Color/Geo + FX2 Performance/Punch)
+    // plus Traktor-style per-unit routing (Deck A, Deck B, or Master).
     pub const MASTER_FX_HUE: &str = "master.fx.hue";
     pub const MASTER_FX_KALEIDOSCOPE: &str = "master.fx.kaleidoscope";
     pub const MASTER_FX_INVERT: &str = "master.fx.invert";
     pub const MASTER_FX_STROBE: &str = "master.fx.strobe";
     pub const MASTER_FX_FREEZE: &str = "master.fx.freeze";
     pub const MASTER_FX_ZOOM_PUNCH: &str = "master.fx.zoom_punch";
+    pub const MASTER_FX1_ROUTE_A: &str = "master.fx1.route_a";
+    pub const MASTER_FX1_ROUTE_B: &str = "master.fx1.route_b";
+    pub const MASTER_FX1_ROUTE_MASTER: &str = "master.fx1.route_master";
+    pub const MASTER_FX2_ROUTE_A: &str = "master.fx2.route_a";
+    pub const MASTER_FX2_ROUTE_B: &str = "master.fx2.route_b";
+    pub const MASTER_FX2_ROUTE_MASTER: &str = "master.fx2.route_master";
 
     // One-shot trigger targets (queued as actions rather than stored as continuous values).
     pub const DECK_A_PREV_PRESET: &str = "deck_a.prev_preset";
@@ -834,13 +841,20 @@ impl ControlBus {
         // Milestone 3 (3B): Beat Pulse strength (0.75 = punchy default) & Auto-Pulse OFF.
         params.insert(param::MASTER_BEAT_AUTO.to_string(), 0.0);
         params.insert(param::MASTER_BEAT_STRENGTH.to_string(), 0.75);
-        // Milestone 3 (3C): Two GPU Effect Racks (all FX off at startup; Beat Zoom-Punch ON).
+        // Milestone 3 (3C): Two GPU Effect Racks (all FX off at startup; Beat Zoom-Punch ON;
+        // both FX1 and FX2 routed to Master by default, switchable to Deck A / Deck B / Master).
         params.insert(param::MASTER_FX_HUE.to_string(), 0.0);
         params.insert(param::MASTER_FX_KALEIDOSCOPE.to_string(), 0.0);
         params.insert(param::MASTER_FX_INVERT.to_string(), 0.0);
         params.insert(param::MASTER_FX_STROBE.to_string(), 0.0);
         params.insert(param::MASTER_FX_FREEZE.to_string(), 0.0);
         params.insert(param::MASTER_FX_ZOOM_PUNCH.to_string(), 1.0);
+        params.insert(param::MASTER_FX1_ROUTE_A.to_string(), 0.0);
+        params.insert(param::MASTER_FX1_ROUTE_B.to_string(), 0.0);
+        params.insert(param::MASTER_FX1_ROUTE_MASTER.to_string(), 1.0);
+        params.insert(param::MASTER_FX2_ROUTE_A.to_string(), 0.0);
+        params.insert(param::MASTER_FX2_ROUTE_B.to_string(), 0.0);
+        params.insert(param::MASTER_FX2_ROUTE_MASTER.to_string(), 1.0);
 
         Self {
             params,
@@ -874,6 +888,55 @@ impl ControlBus {
         let next = if self.get_bool(target) { 0.0 } else { 1.0 };
         self.set(target, next);
         next >= 0.5
+    }
+
+    /// Traktor-style smart FX Unit routing toggle (`unit` = `1` or `2`, `slot` = `'A'`, `'B'`, or `'M'`).
+    ///
+    /// - Turning **`M`** (Master) ON clears `A` and `B` so effects are never applied twice.
+    /// - Turning **`A`** or **`B`** ON clears `M` in a single click while allowing `A + B` together.
+    /// - Turning the last active target OFF cleanly bypasses that FX unit (dry).
+    pub fn toggle_fx_route(&mut self, unit: u8, slot: char) {
+        let (p_a, p_b, p_m) = if unit == 1 {
+            (
+                param::MASTER_FX1_ROUTE_A,
+                param::MASTER_FX1_ROUTE_B,
+                param::MASTER_FX1_ROUTE_MASTER,
+            )
+        } else {
+            (
+                param::MASTER_FX2_ROUTE_A,
+                param::MASTER_FX2_ROUTE_B,
+                param::MASTER_FX2_ROUTE_MASTER,
+            )
+        };
+        match slot {
+            'A' => {
+                if self.get_bool(p_a) {
+                    self.set(p_a, 0.0);
+                } else {
+                    self.set(p_a, 1.0);
+                    self.set(p_m, 0.0);
+                }
+            }
+            'B' => {
+                if self.get_bool(p_b) {
+                    self.set(p_b, 0.0);
+                } else {
+                    self.set(p_b, 1.0);
+                    self.set(p_m, 0.0);
+                }
+            }
+            'M' => {
+                if self.get_bool(p_m) {
+                    self.set(p_m, 0.0);
+                } else {
+                    self.set(p_m, 1.0);
+                    self.set(p_a, 0.0);
+                    self.set(p_b, 0.0);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Adds a signed delta to a parameter, clamped to `0.0..=1.0`.
@@ -1118,5 +1181,38 @@ mod tests {
             old_cfg.hint_for_target(param::DECK_B_EQ_TREBLE_KILL, MappingMode::Toggle),
             "P"
         );
+    }
+
+    #[test]
+    fn traktor_fx_routing_switches_cleanly_between_master_and_decks() {
+        let mut bus = ControlBus::new(MappingsConfig::default());
+        // Default: both FX units routed to Master only.
+        assert!(bus.get_bool(param::MASTER_FX1_ROUTE_MASTER));
+        assert!(!bus.get_bool(param::MASTER_FX1_ROUTE_A));
+        assert!(!bus.get_bool(param::MASTER_FX1_ROUTE_B));
+
+        // Clicking A switches off Master in 1 click.
+        bus.toggle_fx_route(1, 'A');
+        assert!(bus.get_bool(param::MASTER_FX1_ROUTE_A));
+        assert!(!bus.get_bool(param::MASTER_FX1_ROUTE_B));
+        assert!(!bus.get_bool(param::MASTER_FX1_ROUTE_MASTER));
+
+        // Clicking B allows A + B pre-fader routing simultaneously.
+        bus.toggle_fx_route(1, 'B');
+        assert!(bus.get_bool(param::MASTER_FX1_ROUTE_A));
+        assert!(bus.get_bool(param::MASTER_FX1_ROUTE_B));
+        assert!(!bus.get_bool(param::MASTER_FX1_ROUTE_MASTER));
+
+        // Clicking M switches back to Master and clears A & B so effects never double-apply.
+        bus.toggle_fx_route(1, 'M');
+        assert!(!bus.get_bool(param::MASTER_FX1_ROUTE_A));
+        assert!(!bus.get_bool(param::MASTER_FX1_ROUTE_B));
+        assert!(bus.get_bool(param::MASTER_FX1_ROUTE_MASTER));
+
+        // Clicking M again cleanly bypasses FX1 (all OFF / dry).
+        bus.toggle_fx_route(1, 'M');
+        assert!(!bus.get_bool(param::MASTER_FX1_ROUTE_A));
+        assert!(!bus.get_bool(param::MASTER_FX1_ROUTE_B));
+        assert!(!bus.get_bool(param::MASTER_FX1_ROUTE_MASTER));
     }
 }

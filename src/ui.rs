@@ -515,6 +515,122 @@ pub fn draw_console_ui(
     }
 }
 
+/// Draws compact Traktor-style `[A] [B] [M]` routing pills for FX Unit 1 or FX Unit 2.
+fn draw_fx_route_pills(ui: &mut egui::Ui, bus: &mut ControlBus, unit: u8) {
+    let (p_a, p_b, p_m, unit_desc) = if unit == 1 {
+        (
+            param::MASTER_FX1_ROUTE_A,
+            param::MASTER_FX1_ROUTE_B,
+            param::MASTER_FX1_ROUTE_MASTER,
+            "FX1 (Color/Geo)",
+        )
+    } else {
+        (
+            param::MASTER_FX2_ROUTE_A,
+            param::MASTER_FX2_ROUTE_B,
+            param::MASTER_FX2_ROUTE_MASTER,
+            "FX2 (Performance)",
+        )
+    };
+    let on_a = bus.get_bool(p_a);
+    let on_b = bus.get_bool(p_b);
+    let on_m = bus.get_bool(p_m);
+
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for (slot, active, fill, tip) in [
+            (
+                'A',
+                on_a,
+                ACCENT_DECK_A,
+                format!("Assign {unit_desc} to Deck A (pre-fader; visible in Deck A preview even in CUE)"),
+            ),
+            (
+                'B',
+                on_b,
+                ACCENT_DECK_B,
+                format!("Assign {unit_desc} to Deck B (pre-fader; visible in Deck B preview even in CUE)"),
+            ),
+            (
+                'M',
+                on_m,
+                COLOR_OK,
+                format!("Assign {unit_desc} to Master Output (post-crossfader)"),
+            ),
+        ] {
+            let btn = if active {
+                egui::Button::new(
+                    RichText::new(slot.to_string())
+                        .font(FontId::monospace(11.5))
+                        .strong()
+                        .color(Color32::BLACK),
+                )
+                .fill(fill)
+                .min_size(Vec2::new(20.0, 20.0))
+            } else {
+                egui::Button::new(
+                    RichText::new(slot.to_string())
+                        .font(FontId::monospace(11.5))
+                        .color(TEXT_MUTED),
+                )
+                .min_size(Vec2::new(20.0, 20.0))
+            };
+            if ui.add(btn).on_hover_text(tip).clicked() {
+                bus.toggle_fx_route(unit, slot);
+            }
+        }
+    });
+}
+
+/// Draws compact Traktor-style `1` `2` FX Unit assign toggles inside a Deck or Master header.
+fn draw_header_fx_assign_buttons(
+    ui: &mut egui::Ui,
+    bus: &mut ControlBus,
+    slot: char,
+    active_fill: Color32,
+    slot_label: &str,
+) {
+    let (p1, p2) = match slot {
+        'A' => (param::MASTER_FX1_ROUTE_A, param::MASTER_FX2_ROUTE_A),
+        'B' => (param::MASTER_FX1_ROUTE_B, param::MASTER_FX2_ROUTE_B),
+        _ => (
+            param::MASTER_FX1_ROUTE_MASTER,
+            param::MASTER_FX2_ROUTE_MASTER,
+        ),
+    };
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for (unit, param_name, unit_name) in [
+            (2_u8, p2, "FX2 (Strobe/Freeze/Zoom)"),
+            (1_u8, p1, "FX1 (Hue/Kaleid/Invert)"),
+        ] {
+            let active = bus.get_bool(param_name);
+            let btn = if active {
+                egui::Button::new(
+                    RichText::new(format!("FX{unit}"))
+                        .font(FontId::monospace(11.0))
+                        .strong()
+                        .color(Color32::BLACK),
+                )
+                .fill(active_fill)
+            } else {
+                egui::Button::new(
+                    RichText::new(format!("FX{unit}"))
+                        .font(FontId::monospace(11.0))
+                        .color(TEXT_MUTED),
+                )
+            };
+            if ui
+                .add(btn)
+                .on_hover_text(format!("Toggle {unit_name} on {slot_label}"))
+                .clicked()
+            {
+                bus.toggle_fx_route(unit, slot);
+            }
+        }
+    });
+}
+
 /// Compact 34 pt horizontal bar for Milestone 3 Stage `3C` GPU Effect Racks (`FX1` + `FX2`).
 fn draw_fx_racks_bar(ui: &mut egui::Ui, bus: &mut ControlBus, beat_bpm: Option<f64>) {
     let hint_kaleid = bus
@@ -530,16 +646,25 @@ fn draw_fx_racks_bar(ui: &mut egui::Ui, bus: &mut ControlBus, beat_bpm: Option<f
         .mappings
         .hint_for_target(param::MASTER_FX_FREEZE, MappingMode::Momentary);
 
+    let fx1_routed = bus.get_bool(param::MASTER_FX1_ROUTE_A)
+        || bus.get_bool(param::MASTER_FX1_ROUTE_B)
+        || bus.get_bool(param::MASTER_FX1_ROUTE_MASTER);
+    let fx2_routed = bus.get_bool(param::MASTER_FX2_ROUTE_A)
+        || bus.get_bool(param::MASTER_FX2_ROUTE_B)
+        || bus.get_bool(param::MASTER_FX2_ROUTE_MASTER);
+
     ui.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
 
         // --- FX1: Color & Geometry ---
         ui.label(
-            RichText::new("FX1 COLOR/GEO")
-                .font(FontId::monospace(12.0))
+            RichText::new("FX1")
+                .font(FontId::monospace(12.5))
                 .strong()
-                .color(ACCENT_DECK_A),
-        );
+                .color(if fx1_routed { ACCENT_DECK_A } else { TEXT_MUTED }),
+        )
+        .on_hover_text("FX Unit 1 (Color & Geometry): assign to Deck A, Deck B, or Master");
+        draw_fx_route_pills(ui, bus, 1);
 
         let mut hue = bus.get(param::MASTER_FX_HUE);
         let hue_deg = (hue * 360.0).round() as u32;
@@ -548,7 +673,7 @@ fn draw_fx_racks_bar(ui: &mut egui::Ui, bus: &mut ControlBus, beat_bpm: Option<f
                 .font(FontId::monospace(12.0))
                 .color(if hue > 0.01 { ACCENT_DECK_A } else { TEXT_MUTED }),
         );
-        ui.spacing_mut().slider_width = 74.0;
+        ui.spacing_mut().slider_width = 70.0;
         let hue_resp = ui
             .add(egui::Slider::new(&mut hue, 0.0..=1.0).show_value(false))
             .on_hover_text(
@@ -601,7 +726,7 @@ fn draw_fx_racks_bar(ui: &mut egui::Ui, bus: &mut ControlBus, beat_bpm: Option<f
             );
             kaleid = bus.get(param::MASTER_FX_KALEIDOSCOPE);
         }
-        ui.spacing_mut().slider_width = 62.0;
+        ui.spacing_mut().slider_width = 58.0;
         let kaleid_resp = ui
             .add(egui::Slider::new(&mut kaleid, 0.0..=1.0).show_value(false))
             .on_hover_text(format!(
@@ -643,11 +768,13 @@ fn draw_fx_racks_bar(ui: &mut egui::Ui, bus: &mut ControlBus, beat_bpm: Option<f
 
         // --- FX2: Performance & Punch ---
         ui.label(
-            RichText::new("FX2 PERFORMANCE")
-                .font(FontId::monospace(12.0))
+            RichText::new("FX2")
+                .font(FontId::monospace(12.5))
                 .strong()
-                .color(ACCENT_DECK_B),
-        );
+                .color(if fx2_routed { ACCENT_DECK_B } else { TEXT_MUTED }),
+        )
+        .on_hover_text("FX Unit 2 (Performance & Punch): assign to Deck A, Deck B, or Master");
+        draw_fx_route_pills(ui, bus, 2);
 
         let strobe_on = bus.get_bool(param::MASTER_FX_STROBE);
         let strobe_rate_desc = match beat_bpm {
@@ -1276,6 +1403,8 @@ fn draw_deck_column(
                         "Deck GPU render time (non-blocking GL_TIME_ELAPSED, rolling avg).\n\
                          Green/White < 6.0 ms | Yellow 6.0-9.9 ms (SLOW) | Red >= 10.0 ms (OVER BUDGET).",
                     );
+                    let slot = if title.ends_with('A') { 'A' } else { 'B' };
+                    draw_header_fx_assign_buttons(ui, bus, slot, accent, title);
                 });
             });
 
@@ -1627,6 +1756,7 @@ fn draw_master_mixer_column(
                                     .color(pill_fg),
                             );
                         });
+                    draw_header_fx_assign_buttons(ui, bus, 'M', COLOR_OK, "Master Output");
                 });
             });
 

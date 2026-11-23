@@ -80,7 +80,8 @@ use crate::egui_renderer::EguiGlRenderer;
 use crate::gl_log::GlErrorLogger;
 use crate::metrics::{current_process_memory_mb, MemorySnapshotMb, TimingStats};
 use crate::mixer::{
-    compute_strobe_flash, step_blackout_alpha, BlendMode, DeckAirState, GpuMixer, MasterFxParams,
+    compute_strobe_flash, step_blackout_alpha, BlendMode, DeckAirState, FxRoutingState,
+    FxUnitRoute, GpuMixer, MasterFxParams,
 };
 use crate::projector::{
     enumerate_monitors, DisplayMonitorInfo, ProjectorTarget, ProjectorWindow,
@@ -469,8 +470,9 @@ impl ConsoleState {
         );
 
         let master_tex_id = egui_renderer.register_native_texture(mixer.master_texture());
-        let deck_a_tex_id = egui_renderer.register_native_texture(deck_a.output_texture());
-        let deck_b_tex_id = egui_renderer.register_native_texture(deck_b.output_texture());
+        // Register post-FX deck textures so Deck A and Deck B previews show cue FX live!
+        let deck_a_tex_id = egui_renderer.register_native_texture(mixer.deck_a_texture());
+        let deck_b_tex_id = egui_renderer.register_native_texture(mixer.deck_b_texture());
         logger.check_frame(&main_gl, 0, "egui-and-mixer-init");
 
         // 8. Start Live WASAPI Loopback capture (or Synthetic Test audio if requested),
@@ -1929,6 +1931,18 @@ impl ConsoleState {
             freeze: self.bus.get_bool(param::MASTER_FX_FREEZE),
             zoom_punch,
         };
+        let routing = FxRoutingState {
+            fx1: FxUnitRoute {
+                deck_a: self.bus.get_bool(param::MASTER_FX1_ROUTE_A),
+                deck_b: self.bus.get_bool(param::MASTER_FX1_ROUTE_B),
+                master: self.bus.get_bool(param::MASTER_FX1_ROUTE_MASTER),
+            },
+            fx2: FxUnitRoute {
+                deck_a: self.bus.get_bool(param::MASTER_FX2_ROUTE_A),
+                deck_b: self.bus.get_bool(param::MASTER_FX2_ROUTE_B),
+                master: self.bus.get_bool(param::MASTER_FX2_ROUTE_MASTER),
+            },
+        };
         self.mixer.render(
             self.deck_a.output_texture(),
             self.deck_b.output_texture(),
@@ -1936,6 +1950,7 @@ impl ConsoleState {
             blend_mode,
             self.blackout_alpha,
             fx,
+            routing,
         );
         // OpenGL 3.3 Core Spec (Section 5.3): if the Projector window is open, insert a fence
         // + glFlush() after writing `master_texture` so the Projector context can call GPU-only

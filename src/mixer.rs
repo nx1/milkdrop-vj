@@ -122,10 +122,49 @@ pub struct MasterFxParams {
     pub invert: f32,
     /// Instant strobe flash state (`0.0` = off, `0.0..=1.0` flash intensity, or negative for black gate).
     pub strobe_flash: f32,
-    /// True while Frame Freeze is active (freezes live Deck A/B blend while FX remain live).
+    /// True while Frame Freeze is active (freezes target frame while FX1/Strobe/Blackout stay live).
     pub freeze: bool,
     /// Instant center zoom-punch amount (`0.0..=1.0`, driven by Beat Pulse flash).
     pub zoom_punch: f32,
+}
+
+impl MasterFxParams {
+    /// Extracts only the effects assigned to a single target (`Deck A`, `Deck B`, or `Master`).
+    pub fn filter_for_target(self, fx1_active: bool, fx2_active: bool) -> Self {
+        Self {
+            hue_shift: if fx1_active { self.hue_shift } else { 0.0 },
+            kaleidoscope: if fx1_active { self.kaleidoscope } else { 0.0 },
+            invert: if fx1_active { self.invert } else { 0.0 },
+            strobe_flash: if fx2_active { self.strobe_flash } else { 0.0 },
+            freeze: if fx2_active { self.freeze } else { false },
+            zoom_punch: if fx2_active { self.zoom_punch } else { 0.0 },
+        }
+    }
+}
+
+/// Traktor-style routing targets for a single GPU Effect Unit (`A`, `B`, or `Master`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FxUnitRoute {
+    pub deck_a: bool,
+    pub deck_b: bool,
+    pub master: bool,
+}
+
+impl Default for FxUnitRoute {
+    fn default() -> Self {
+        Self {
+            deck_a: false,
+            deck_b: false,
+            master: true,
+        }
+    }
+}
+
+/// Complete live routing state for FX Unit 1 (Color/Geo) and FX Unit 2 (Performance/Punch).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FxRoutingState {
+    pub fx1: FxUnitRoute,
+    pub fx2: FxUnitRoute,
 }
 
 /// Computes the instantaneous strobe flash value (`+1.0` bright flash / `-0.75` dark gate)
@@ -287,18 +326,105 @@ void main() {
 }
 "#;
 
-/// Off-screen OpenGL 3.3 Core GPU mixer producing `master_texture` with FX1/FX2 + Freeze FBO.
+/// Reusable off-screen RGBA8 texture + FBO pair owned by `GpuMixer` (zero per-frame allocs).
+#[derive(Clone, Copy)]
+struct FboTarget {
+    fbo: glow::NativeFramebuffer,
+    tex: glow::NativeTexture,
+}
+
+impl FboTarget {
+    unsafe fn new(gl: &glow::Context, width: u32, height: u32, label: &str) -> Result<Self, String> {
+        let fbo = gl
+            .create_framebuffer()
+            .map_err(|e| format!("Failed to create {label} FBO: {e}"))?;
+        let tex = match create_rgba8_texture(gl, width, height) {
+            Ok(t) => t,
+            Err(e) => {
+                gl.delete_framebuffer(fbo);
+                return Err(e);
+            }
+        };
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(tex),
+            0,
+        );
+        let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        if status != glow::FRAMEBUFFER_COMPLETE {
+            gl.delete_texture(tex);
+            gl.delete_framebuffer(fbo);
+            return Err(format!("{label} FBO incomplete (status=0x{status:04X})"));
+        }
+        Ok(Self { fbo, tex })
+    }
+
+    unsafe fn resize(
+        &self,
+        gl: &glow::Context,
+        width: u32,
+        height: u32,
+        label: &str,
+    ) -> Result<(), String> {
+        gl.bind_texture(glow::TEXTURE_2D, Some(self.tex));
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA8 as i32,
+            width as i32,
+            height as i32,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(None),
+        );
+        gl.bind_texture(glow::TEXTURE_2D, None);
+
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::TEXTURE_2D,
+            Some(self.tex),
+            0,
+        );
+        let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        if status != glow::FRAMEBUFFER_COMPLETE {
+            return Err(format!(
+                "{label} FBO incomplete after resize to {width}x{height} (status=0x{status:04X})"
+            ));
+        }
+        Ok(())
+    }
+
+    unsafe fn destroy(&self, gl: &glow::Context) {
+        gl.delete_texture(self.tex);
+        gl.delete_framebuffer(self.fbo);
+    }
+}
+
+/// Off-screen OpenGL 3.3 Core GPU mixer producing per-deck post-FX textures (`deck_a_texture`,
+/// `deck_b_texture`) and `master_texture` with Traktor-style FX1/FX2 routing + per-target Freeze FBOs.
 pub struct GpuMixer {
     gl: Arc<glow::Context>,
     width: u32,
     height: u32,
     program: glow::NativeProgram,
     vao: glow::NativeVertexArray,
-    fbo: glow::NativeFramebuffer,
-    master_texture: glow::NativeTexture,
-    freeze_fbo: glow::NativeFramebuffer,
-    freeze_texture: glow::NativeTexture,
-    was_frozen: bool,
+    deck_a_target: FboTarget,
+    deck_b_target: FboTarget,
+    master_target: FboTarget,
+    freeze_a_target: FboTarget,
+    freeze_b_target: FboTarget,
+    freeze_master_target: FboTarget,
+    was_frozen_a: bool,
+    was_frozen_b: bool,
+    was_frozen_master: bool,
     u_tex_a: Option<glow::NativeUniformLocation>,
     u_tex_b: Option<glow::NativeUniformLocation>,
     u_tex_freeze: Option<glow::NativeUniformLocation>,
@@ -314,7 +440,7 @@ pub struct GpuMixer {
 }
 
 impl GpuMixer {
-    /// Compiles the mixer + FX shader and allocates `master_texture` and `freeze_texture` FBOs
+    /// Compiles the mixer + FX shader and allocates per-deck, Master, and Freeze FBOs
     /// on the currently active main OpenGL context.
     pub fn new(gl: Arc<glow::Context>, width: u32, height: u32) -> Result<Self, String> {
         unsafe {
@@ -340,52 +466,31 @@ impl GpuMixer {
             let vao = gl
                 .create_vertex_array()
                 .map_err(|e| format!("Failed to create GPU mixer VAO: {e}"))?;
-            let fbo = gl
-                .create_framebuffer()
-                .map_err(|e| format!("Failed to create GPU mixer FBO: {e}"))?;
-            let master_texture = create_rgba8_texture(&gl, width, height)?;
 
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-            gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D,
-                Some(master_texture),
-                0,
-            );
-            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            if status != glow::FRAMEBUFFER_COMPLETE {
-                gl.delete_texture(master_texture);
-                gl.delete_framebuffer(fbo);
-                gl.delete_vertex_array(vao);
-                gl.delete_program(program);
-                return Err(format!("GPU mixer FBO incomplete (status=0x{status:04X})"));
-            }
+            let mut created: Vec<FboTarget> = Vec::with_capacity(6);
+            let make = |created: &mut Vec<FboTarget>, label: &str| -> Result<FboTarget, String> {
+                match FboTarget::new(&gl, width, height, label) {
+                    Ok(t) => {
+                        created.push(t);
+                        Ok(t)
+                    }
+                    Err(e) => {
+                        for prev in created.drain(..) {
+                            prev.destroy(&gl);
+                        }
+                        gl.delete_vertex_array(vao);
+                        gl.delete_program(program);
+                        Err(e)
+                    }
+                }
+            };
 
-            let freeze_fbo = gl
-                .create_framebuffer()
-                .map_err(|e| format!("Failed to create Freeze FBO: {e}"))?;
-            let freeze_texture = create_rgba8_texture(&gl, width, height)?;
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(freeze_fbo));
-            gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D,
-                Some(freeze_texture),
-                0,
-            );
-            let f_status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            if f_status != glow::FRAMEBUFFER_COMPLETE {
-                gl.delete_texture(freeze_texture);
-                gl.delete_framebuffer(freeze_fbo);
-                gl.delete_texture(master_texture);
-                gl.delete_framebuffer(fbo);
-                gl.delete_vertex_array(vao);
-                gl.delete_program(program);
-                return Err(format!("GPU Freeze FBO incomplete (status=0x{f_status:04X})"));
-            }
+            let deck_a_target = make(&mut created, "Deck A FX")?;
+            let deck_b_target = make(&mut created, "Deck B FX")?;
+            let master_target = make(&mut created, "Master Mixer")?;
+            let freeze_a_target = make(&mut created, "Deck A Freeze")?;
+            let freeze_b_target = make(&mut created, "Deck B Freeze")?;
+            let freeze_master_target = make(&mut created, "Master Freeze")?;
 
             let u_tex_a = gl.get_uniform_location(program, "u_tex_a");
             let u_tex_b = gl.get_uniform_location(program, "u_tex_b");
@@ -406,11 +511,15 @@ impl GpuMixer {
                 height,
                 program,
                 vao,
-                fbo,
-                master_texture,
-                freeze_fbo,
-                freeze_texture,
-                was_frozen: false,
+                deck_a_target,
+                deck_b_target,
+                master_target,
+                freeze_a_target,
+                freeze_b_target,
+                freeze_master_target,
+                was_frozen_a: false,
+                was_frozen_b: false,
+                was_frozen_master: false,
                 u_tex_a,
                 u_tex_b,
                 u_tex_freeze,
@@ -427,69 +536,59 @@ impl GpuMixer {
         }
     }
 
-    /// Returns the OpenGL texture handle containing the latest mixed Master Output frame.
-    pub fn master_texture(&self) -> glow::NativeTexture {
-        self.master_texture
+    /// Returns the post-FX Deck A texture (so the Deck A preview shows cue FX live before blending).
+    pub fn deck_a_texture(&self) -> glow::NativeTexture {
+        self.deck_a_target.tex
     }
 
-    /// Resizes `master_texture` and `freeze_texture` in-place when toggling deck resolution (`2A-5`),
-    /// preserving the GL texture handle so `egui` texture IDs stay valid without reallocation.
+    /// Returns the post-FX Deck B texture (so the Deck B preview shows cue FX live before blending).
+    pub fn deck_b_texture(&self) -> glow::NativeTexture {
+        self.deck_b_target.tex
+    }
+
+    /// Returns the OpenGL texture handle containing the latest mixed Master Output frame.
+    pub fn master_texture(&self) -> glow::NativeTexture {
+        self.master_target.tex
+    }
+
+    /// Resizes all mixer, deck-FX, and freeze textures in-place when toggling deck resolution (`2A-5`),
+    /// preserving all GL texture handles so `egui` texture IDs stay valid without reallocation.
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
         if self.width == width && self.height == height {
             return Ok(());
         }
         self.width = width;
         self.height = height;
-        self.was_frozen = false;
+        self.was_frozen_a = false;
+        self.was_frozen_b = false;
+        self.was_frozen_master = false;
         unsafe {
-            for (tex, fbo, label) in [
-                (self.master_texture, self.fbo, "GPU mixer"),
-                (self.freeze_texture, self.freeze_fbo, "GPU freeze"),
+            for (target, label) in [
+                (self.deck_a_target, "Deck A FX"),
+                (self.deck_b_target, "Deck B FX"),
+                (self.master_target, "Master Mixer"),
+                (self.freeze_a_target, "Deck A Freeze"),
+                (self.freeze_b_target, "Deck B Freeze"),
+                (self.freeze_master_target, "Master Freeze"),
             ] {
-                self.gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-                self.gl.tex_image_2d(
-                    glow::TEXTURE_2D,
-                    0,
-                    glow::RGBA8 as i32,
-                    width as i32,
-                    height as i32,
-                    0,
-                    glow::RGBA,
-                    glow::UNSIGNED_BYTE,
-                    glow::PixelUnpackData::Slice(None),
-                );
-                self.gl.bind_texture(glow::TEXTURE_2D, None);
-
-                self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-                self.gl.framebuffer_texture_2d(
-                    glow::FRAMEBUFFER,
-                    glow::COLOR_ATTACHMENT0,
-                    glow::TEXTURE_2D,
-                    Some(tex),
-                    0,
-                );
-                let status = self.gl.check_framebuffer_status(glow::FRAMEBUFFER);
-                self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                if status != glow::FRAMEBUFFER_COMPLETE {
-                    return Err(format!(
-                        "{label} FBO incomplete after resize to {width}x{height} (status=0x{status:04X})"
-                    ));
-                }
+                target.resize(&self.gl, width, height, label)?;
             }
         }
         Ok(())
     }
 
-    /// Blends `tex_a` and `tex_b` into `master_texture` using the chosen blend mode,
-    /// crossfader position (`0.0..=1.0`), FX1/FX2 GPU racks, and smooth blackout fade (`0.0..=1.0`).
+    /// Applies Traktor-style per-deck FX1/FX2 (`deck_a_target`, `deck_b_target`), then blends them
+    /// into `master_texture` with Master FX1/FX2 and smooth Emergency Blackout (`0.0..=1.0`).
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
-        tex_a: glow::NativeTexture,
-        tex_b: glow::NativeTexture,
+        raw_tex_a: glow::NativeTexture,
+        raw_tex_b: glow::NativeTexture,
         crossfader: f32,
         blend_mode: BlendMode,
         blackout_alpha: f32,
         fx: MasterFxParams,
+        routing: FxRoutingState,
     ) {
         unsafe {
             self.gl.disable(glow::SCISSOR_TEST);
@@ -499,13 +598,70 @@ impl GpuMixer {
             self.gl
                 .viewport(0, 0, self.width as i32, self.height as i32);
 
-            // On rising edge of FX2 Freeze, capture a clean snapshot of the live Deck A/B mix
-            // into `freeze_fbo` (without FX1/Strobe baked in) so FX1 & Strobe remain live on top!
-            if fx.freeze && !self.was_frozen {
+            // --- Pass 1a: Deck A pre-fader FX (visible in Deck A preview even while in CUE!) ---
+            let fx_a = fx.filter_for_target(routing.fx1.deck_a, routing.fx2.deck_a);
+            if fx_a.freeze && !self.was_frozen_a {
                 self.draw_pass(
-                    self.freeze_fbo,
-                    tex_a,
-                    tex_b,
+                    self.freeze_a_target.fbo,
+                    raw_tex_a,
+                    raw_tex_a,
+                    self.freeze_a_target.tex,
+                    0.0,
+                    BlendMode::Crossfade,
+                    0.0,
+                    MasterFxParams::default(),
+                    false,
+                );
+            }
+            self.was_frozen_a = fx_a.freeze;
+            self.draw_pass(
+                self.deck_a_target.fbo,
+                raw_tex_a,
+                raw_tex_a,
+                self.freeze_a_target.tex,
+                0.0,
+                BlendMode::Crossfade,
+                0.0,
+                fx_a,
+                fx_a.freeze,
+            );
+
+            // --- Pass 1b: Deck B pre-fader FX (visible in Deck B preview even while in CUE!) ---
+            let fx_b = fx.filter_for_target(routing.fx1.deck_b, routing.fx2.deck_b);
+            if fx_b.freeze && !self.was_frozen_b {
+                self.draw_pass(
+                    self.freeze_b_target.fbo,
+                    raw_tex_b,
+                    raw_tex_b,
+                    self.freeze_b_target.tex,
+                    0.0,
+                    BlendMode::Crossfade,
+                    0.0,
+                    MasterFxParams::default(),
+                    false,
+                );
+            }
+            self.was_frozen_b = fx_b.freeze;
+            self.draw_pass(
+                self.deck_b_target.fbo,
+                raw_tex_b,
+                raw_tex_b,
+                self.freeze_b_target.tex,
+                0.0,
+                BlendMode::Crossfade,
+                0.0,
+                fx_b,
+                fx_b.freeze,
+            );
+
+            // --- Pass 2: Master Blend + Master FX1/FX2 + Emergency Blackout ---
+            let fx_m = fx.filter_for_target(routing.fx1.master, routing.fx2.master);
+            if fx_m.freeze && !self.was_frozen_master {
+                self.draw_pass(
+                    self.freeze_master_target.fbo,
+                    self.deck_a_target.tex,
+                    self.deck_b_target.tex,
+                    self.freeze_master_target.tex,
                     crossfader,
                     blend_mode,
                     0.0,
@@ -513,17 +669,17 @@ impl GpuMixer {
                     false,
                 );
             }
-            self.was_frozen = fx.freeze;
-
+            self.was_frozen_master = fx_m.freeze;
             self.draw_pass(
-                self.fbo,
-                tex_a,
-                tex_b,
+                self.master_target.fbo,
+                self.deck_a_target.tex,
+                self.deck_b_target.tex,
+                self.freeze_master_target.tex,
                 crossfader,
                 blend_mode,
                 blackout_alpha,
-                fx,
-                fx.freeze,
+                fx_m,
+                fx_m.freeze,
             );
         }
     }
@@ -534,6 +690,7 @@ impl GpuMixer {
         target_fbo: glow::NativeFramebuffer,
         tex_a: glow::NativeTexture,
         tex_b: glow::NativeTexture,
+        freeze_tex: glow::NativeTexture,
         crossfader: f32,
         blend_mode: BlendMode,
         blackout_alpha: f32,
@@ -552,8 +709,7 @@ impl GpuMixer {
         self.gl.uniform_1_i32(self.u_tex_b.as_ref(), 1);
 
         self.gl.active_texture(glow::TEXTURE2);
-        self.gl
-            .bind_texture(glow::TEXTURE_2D, Some(self.freeze_texture));
+        self.gl.bind_texture(glow::TEXTURE_2D, Some(freeze_tex));
         self.gl.uniform_1_i32(self.u_tex_freeze.as_ref(), 2);
 
         self.gl
@@ -602,10 +758,12 @@ impl GpuMixer {
     /// Destroys all OpenGL objects owned by this mixer while the main context is current.
     pub fn destroy(&mut self) {
         unsafe {
-            self.gl.delete_texture(self.freeze_texture);
-            self.gl.delete_framebuffer(self.freeze_fbo);
-            self.gl.delete_texture(self.master_texture);
-            self.gl.delete_framebuffer(self.fbo);
+            self.freeze_master_target.destroy(&self.gl);
+            self.freeze_b_target.destroy(&self.gl);
+            self.freeze_a_target.destroy(&self.gl);
+            self.master_target.destroy(&self.gl);
+            self.deck_b_target.destroy(&self.gl);
+            self.deck_a_target.destroy(&self.gl);
             self.gl.delete_vertex_array(self.vao);
             self.gl.delete_program(self.program);
         }
@@ -706,5 +864,37 @@ mod tests {
         // At 120 BPM (8 Hz = 125 ms cycle): t = 0.01s is bright flash (+1.0), t = 0.08s is dark gate (-0.85).
         assert!(compute_strobe_flash(1.0, 0.01, Some(120.0)) > 0.9);
         assert!(compute_strobe_flash(1.0, 0.08, Some(120.0)) < -0.5);
+    }
+
+    #[test]
+    fn fx_routing_filter_isolates_units_per_target() {
+        let fx = MasterFxParams {
+            hue_shift: 0.4,
+            kaleidoscope: 0.67,
+            invert: 1.0,
+            strobe_flash: 0.85,
+            freeze: true,
+            zoom_punch: 0.9,
+        };
+        // FX1 on Deck A only, FX2 on Deck B only, Master dry.
+        let deck_a = fx.filter_for_target(true, false);
+        assert_eq!(deck_a.hue_shift, 0.4);
+        assert_eq!(deck_a.kaleidoscope, 0.67);
+        assert_eq!(deck_a.invert, 1.0);
+        assert_eq!(deck_a.strobe_flash, 0.0);
+        assert!(!deck_a.freeze);
+        assert_eq!(deck_a.zoom_punch, 0.0);
+
+        let deck_b = fx.filter_for_target(false, true);
+        assert_eq!(deck_b.hue_shift, 0.0);
+        assert_eq!(deck_b.kaleidoscope, 0.0);
+        assert_eq!(deck_b.invert, 0.0);
+        assert_eq!(deck_b.strobe_flash, 0.85);
+        assert!(deck_b.freeze);
+        assert_eq!(deck_b.zoom_punch, 0.9);
+
+        let master = fx.filter_for_target(false, false);
+        assert_eq!(master.hue_shift, 0.0);
+        assert!(!master.freeze);
     }
 }
