@@ -26,6 +26,20 @@ pub mod param {
     pub const DECK_A_TRANSITION_SMOOTH: &str = "deck_a.transition_smooth";
     pub const DECK_B_TRANSITION_SMOOTH: &str = "deck_b.transition_smooth";
 
+    // Milestone 3 (3A): Per-deck 3-band Visual EQ (`0.5` = unity 1.0x) and Kill toggles.
+    pub const DECK_A_EQ_BASS: &str = "deck_a.eq.bass";
+    pub const DECK_A_EQ_MID: &str = "deck_a.eq.mid";
+    pub const DECK_A_EQ_TREBLE: &str = "deck_a.eq.treble";
+    pub const DECK_A_EQ_BASS_KILL: &str = "deck_a.eq.bass_kill";
+    pub const DECK_A_EQ_MID_KILL: &str = "deck_a.eq.mid_kill";
+    pub const DECK_A_EQ_TREBLE_KILL: &str = "deck_a.eq.treble_kill";
+    pub const DECK_B_EQ_BASS: &str = "deck_b.eq.bass";
+    pub const DECK_B_EQ_MID: &str = "deck_b.eq.mid";
+    pub const DECK_B_EQ_TREBLE: &str = "deck_b.eq.treble";
+    pub const DECK_B_EQ_BASS_KILL: &str = "deck_b.eq.bass_kill";
+    pub const DECK_B_EQ_MID_KILL: &str = "deck_b.eq.mid_kill";
+    pub const DECK_B_EQ_TREBLE_KILL: &str = "deck_b.eq.treble_kill";
+
     // One-shot trigger targets (queued as actions rather than stored as continuous values).
     pub const DECK_A_PREV_PRESET: &str = "deck_a.prev_preset";
     pub const DECK_A_NEXT_PRESET: &str = "deck_a.next_preset";
@@ -289,6 +303,73 @@ impl Default for MappingsConfig {
                     hard_cut: false,
                     force_on_air: true,
                 },
+                // Milestone 3 (3A): Per-deck Visual EQ Kill switches (Q/W/E = Deck A, I/O/P = Deck B).
+                KeyboardMapping {
+                    key: "Q".to_string(),
+                    modifiers: vec![],
+                    target: param::DECK_A_EQ_BASS_KILL.to_string(),
+                    mode: MappingMode::Toggle,
+                    value: None,
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "W".to_string(),
+                    modifiers: vec![],
+                    target: param::DECK_A_EQ_MID_KILL.to_string(),
+                    mode: MappingMode::Toggle,
+                    value: None,
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "E".to_string(),
+                    modifiers: vec![],
+                    target: param::DECK_A_EQ_TREBLE_KILL.to_string(),
+                    mode: MappingMode::Toggle,
+                    value: None,
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "I".to_string(),
+                    modifiers: vec![],
+                    target: param::DECK_B_EQ_BASS_KILL.to_string(),
+                    mode: MappingMode::Toggle,
+                    value: None,
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "O".to_string(),
+                    modifiers: vec![],
+                    target: param::DECK_B_EQ_MID_KILL.to_string(),
+                    mode: MappingMode::Toggle,
+                    value: None,
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "P".to_string(),
+                    modifiers: vec![],
+                    target: param::DECK_B_EQ_TREBLE_KILL.to_string(),
+                    mode: MappingMode::Toggle,
+                    value: None,
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
             ],
             midi: vec![
                 MidiMapping {
@@ -382,6 +463,24 @@ impl KeyboardMapping {
             }
             (param::DECK_B_LOAD_SELECTED, _, _, _, false, false) => {
                 "Deck B: Load Selected".to_string()
+            }
+            (param::DECK_A_EQ_BASS_KILL, MappingMode::Toggle, _, _, _, _) => {
+                "Deck A EQ: Bass Kill Toggle".to_string()
+            }
+            (param::DECK_A_EQ_MID_KILL, MappingMode::Toggle, _, _, _, _) => {
+                "Deck A EQ: Mid Kill Toggle".to_string()
+            }
+            (param::DECK_A_EQ_TREBLE_KILL, MappingMode::Toggle, _, _, _, _) => {
+                "Deck A EQ: Treble Kill Toggle".to_string()
+            }
+            (param::DECK_B_EQ_BASS_KILL, MappingMode::Toggle, _, _, _, _) => {
+                "Deck B EQ: Bass Kill Toggle".to_string()
+            }
+            (param::DECK_B_EQ_MID_KILL, MappingMode::Toggle, _, _, _, _) => {
+                "Deck B EQ: Mid Kill Toggle".to_string()
+            }
+            (param::DECK_B_EQ_TREBLE_KILL, MappingMode::Toggle, _, _, _, _) => {
+                "Deck B EQ: Treble Kill Toggle".to_string()
             }
             _ => format!("{} ({:?})", self.target, self.mode),
         }
@@ -525,12 +624,35 @@ impl MappingsConfig {
             .unwrap_or_else(|| "—".to_string())
     }
 
+    /// Appends any newly introduced default keyboard targets that do not yet exist in an older
+    /// `mappings.json` file, preserving all of the user's personal remaps.
+    pub fn merge_missing_default_targets(&mut self) -> usize {
+        let defaults = Self::default();
+        let mut added = 0usize;
+        for def in defaults.keyboard {
+            let exists = self.keyboard.iter().any(|existing| {
+                existing.target == def.target
+                    && existing.mode == def.mode
+                    && existing.hard_cut == def.hard_cut
+                    && existing.force_on_air == def.force_on_air
+                    && existing.value == def.value
+                    && existing.step == def.step
+            });
+            if !exists {
+                self.keyboard.push(def);
+                added += 1;
+            }
+        }
+        added
+    }
+
     /// Loads `mappings.json` from `path`, or creates a default file if it does not exist yet.
+    /// Automatically merges newly added milestone default targets while preserving user remaps.
     pub fn load_or_create_default(path: &Path) -> Result<(Self, bool), String> {
         if path.exists() {
             let text = fs::read_to_string(path)
                 .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-            let cfg: Self = serde_json::from_str(&text)
+            let mut cfg: Self = serde_json::from_str(&text)
                 .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
             if cfg.schema_version != 1 {
                 return Err(format!(
@@ -538,6 +660,9 @@ impl MappingsConfig {
                     cfg.schema_version,
                     path.display()
                 ));
+            }
+            if cfg.merge_missing_default_targets() > 0 {
+                cfg.save(path)?;
             }
             Ok((cfg, false))
         } else {
@@ -593,6 +718,19 @@ impl ControlBus {
         // Default preset transition: Smooth (1.5s) = 1.0 (0.0 = Hard Cut).
         params.insert(param::DECK_A_TRANSITION_SMOOTH.to_string(), 1.0);
         params.insert(param::DECK_B_TRANSITION_SMOOTH.to_string(), 1.0);
+        // Milestone 3 (3A): Per-deck 3-band Visual EQ defaults (`0.5` = 1.0x unity, kills OFF).
+        params.insert(param::DECK_A_EQ_BASS.to_string(), 0.5);
+        params.insert(param::DECK_A_EQ_MID.to_string(), 0.5);
+        params.insert(param::DECK_A_EQ_TREBLE.to_string(), 0.5);
+        params.insert(param::DECK_A_EQ_BASS_KILL.to_string(), 0.0);
+        params.insert(param::DECK_A_EQ_MID_KILL.to_string(), 0.0);
+        params.insert(param::DECK_A_EQ_TREBLE_KILL.to_string(), 0.0);
+        params.insert(param::DECK_B_EQ_BASS.to_string(), 0.5);
+        params.insert(param::DECK_B_EQ_MID.to_string(), 0.5);
+        params.insert(param::DECK_B_EQ_TREBLE.to_string(), 0.5);
+        params.insert(param::DECK_B_EQ_BASS_KILL.to_string(), 0.0);
+        params.insert(param::DECK_B_EQ_MID_KILL.to_string(), 0.0);
+        params.insert(param::DECK_B_EQ_TREBLE_KILL.to_string(), 0.0);
 
         Self {
             params,
@@ -833,5 +971,42 @@ mod tests {
         );
         assert!(cfg.find_keyboard_matches("M", false, false, false).is_empty());
         assert_eq!(cfg.find_keyboard_matches("N", false, false, false).len(), 1);
+    }
+
+    #[test]
+    fn merge_missing_defaults_adds_milestone_3_eq_keys_without_clobbering_remaps() {
+        // Simulate an older Milestone 2 mappings.json containing only Blend Mode remapped to `N`.
+        let mut old_cfg = MappingsConfig {
+            schema_version: 1,
+            keyboard: vec![KeyboardMapping {
+                key: "N".to_string(),
+                modifiers: vec![],
+                target: param::MIXER_BLEND_MODE.to_string(),
+                mode: MappingMode::Cycle,
+                value: None,
+                step: None,
+                steps: Some(BLEND_MODE_COUNT),
+                hard_cut: false,
+                force_on_air: false,
+            }],
+            midi: vec![],
+        };
+
+        let added = old_cfg.merge_missing_default_targets();
+        assert!(added >= 6, "Expected new default targets including Q/W/E/I/O/P");
+        // User's custom `N` remap for Blend Mode must remain untouched!
+        assert_eq!(
+            old_cfg.hint_for_target(param::MIXER_BLEND_MODE, MappingMode::Cycle),
+            "N"
+        );
+        // New Milestone 3A Visual EQ kills must be present!
+        assert_eq!(
+            old_cfg.hint_for_target(param::DECK_A_EQ_BASS_KILL, MappingMode::Toggle),
+            "Q"
+        );
+        assert_eq!(
+            old_cfg.hint_for_target(param::DECK_B_EQ_TREBLE_KILL, MappingMode::Toggle),
+            "P"
+        );
     }
 }

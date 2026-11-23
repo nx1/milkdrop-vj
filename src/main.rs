@@ -58,6 +58,7 @@ use winit::window::{Window, WindowId};
 use milkdrop_vj::audio::capture_thread::{
     AsyncAudioSwitch, AsyncDeviceListRefresh, AudioSwitchOutcome, LiveAudioCapture,
 };
+use milkdrop_vj::audio::visual_eq::{VisualEqParams, VisualEqProcessor};
 use milkdrop_vj::audio::wasapi_loopback::WasapiLoopbackSource;
 use milkdrop_vj::audio::{AudioDeviceInfo, AudioSource};
 use milkdrop_vj::control::{
@@ -182,6 +183,10 @@ struct ConsoleState {
     live_pcm_buf: Vec<f32>,
     synth_pcm_buf: Vec<f32>,
     silence_pcm_buf: Vec<f32>,
+    eq_deck_a: VisualEqProcessor,
+    eq_deck_b: VisualEqProcessor,
+    eq_buf_a: Vec<f32>,
+    eq_buf_b: Vec<f32>,
     device_lost_logged: bool,
 
     // Preset Library (background scanner + disk cache + favorites/playlists + live filtered view)
@@ -229,7 +234,7 @@ impl ConsoleState {
     fn initialize(event_loop: &ActiveEventLoop, config: CliConfig) -> Result<Self, String> {
         let mut logger = GlErrorLogger::open(&config.log_path)?;
         logger.log_info(
-            "Stage 2B: Borderless Fullscreen Projector Output Window (Shared GL Context, GL 5.3 Sync, Single-VSync Rule)",
+            "Milestone 3 Stage 3A: Per-Deck 3-Band Visual EQ & Kill Switches (Q/W/E, I/O/P) via Control Bus",
         );
         logger.log_info(&format!(
             "Deck render resolution: {}x{} (default 1280x720 per Light-Load Rules) | measure_gpu={}",
@@ -571,6 +576,10 @@ impl ConsoleState {
             live_pcm_buf: Vec::with_capacity(4096 * 2),
             synth_pcm_buf: vec![0.0_f32; 800 * 2],
             silence_pcm_buf: vec![0.0_f32; 800 * 2],
+            eq_deck_a: VisualEqProcessor::new(audio_sample_rate),
+            eq_deck_b: VisualEqProcessor::new(audio_sample_rate),
+            eq_buf_a: Vec::with_capacity(4096 * 2),
+            eq_buf_b: Vec::with_capacity(4096 * 2),
             device_lost_logged: false,
             presets_root,
             preset_cache_path,
@@ -1730,9 +1739,40 @@ impl ConsoleState {
             self.audio_peak_db = (self.audio_peak_db - 0.7).max(instant_db);
         }
 
+        // 2b. Shape independent read-only copies of stereo PCM for Deck A & Deck B Visual EQ
+        //     (speakers are never touched; zero per-frame allocations via reusable scratch buffers).
+        let eq_params_a = VisualEqParams {
+            bass: self.bus.get(param::DECK_A_EQ_BASS),
+            mid: self.bus.get(param::DECK_A_EQ_MID),
+            treble: self.bus.get(param::DECK_A_EQ_TREBLE),
+            bass_kill: self.bus.get_bool(param::DECK_A_EQ_BASS_KILL),
+            mid_kill: self.bus.get_bool(param::DECK_A_EQ_MID_KILL),
+            treble_kill: self.bus.get_bool(param::DECK_A_EQ_TREBLE_KILL),
+        };
+        let eq_params_b = VisualEqParams {
+            bass: self.bus.get(param::DECK_B_EQ_BASS),
+            mid: self.bus.get(param::DECK_B_EQ_MID),
+            treble: self.bus.get(param::DECK_B_EQ_TREBLE),
+            bass_kill: self.bus.get_bool(param::DECK_B_EQ_BASS_KILL),
+            mid_kill: self.bus.get_bool(param::DECK_B_EQ_MID_KILL),
+            treble_kill: self.bus.get_bool(param::DECK_B_EQ_TREBLE_KILL),
+        };
+        self.eq_deck_a.process_stereo(
+            pcm_slice,
+            &mut self.eq_buf_a,
+            self.audio_sample_rate,
+            eq_params_a,
+        );
+        self.eq_deck_b.process_stereo(
+            pcm_slice,
+            &mut self.eq_buf_b,
+            self.audio_sample_rate,
+            eq_params_b,
+        );
+
         // 3. Render Deck A and Deck B in their isolated shared OpenGL contexts.
         let timing_a = match self.deck_a.render_to_texture(
-            pcm_slice,
+            &self.eq_buf_a,
             self.frame_count,
             self.config.measure_gpu,
             &mut self.logger,
@@ -1745,7 +1785,7 @@ impl ConsoleState {
             }
         };
         let timing_b = match self.deck_b.render_to_texture(
-            pcm_slice,
+            &self.eq_buf_b,
             self.frame_count,
             self.config.measure_gpu,
             &mut self.logger,
@@ -2128,7 +2168,7 @@ impl ConsoleState {
         };
         let end_mem = current_process_memory_mb();
 
-        self.logger.log_info("=== Stage 2B Shutdown Summary (provisional, laptop-limited) ===");
+        self.logger.log_info("=== Stage 3A Shutdown Summary (provisional, laptop-limited) ===");
         self.logger.log_info(&format!(
             "Elapsed: {:.2}s | Frames: {} | Avg FPS: {:.2} | Total GL errors: {}",
             elapsed,
@@ -2195,7 +2235,7 @@ impl ConsoleState {
         self.live_capture.take();
 
         println!(
-            "Stage 2B closed cleanly. Frames={}, Avg FPS={:.2}, Presets={}, BlankPBO avg={:.1} us, GL errors={}, log={}",
+            "Stage 3A closed cleanly. Frames={}, Avg FPS={:.2}, Presets={}, BlankPBO avg={:.1} us, GL errors={}, log={}",
             self.frame_count,
             avg_fps,
             self.presets.len(),
@@ -2462,7 +2502,7 @@ fn parse_cli_args() -> Result<CliConfig, String> {
         auto_exit_secs: None,
         test_res_toggles: 0,
         test_projector_windowed: false,
-        log_path: PathBuf::from("logs").join("stage_2b.log"),
+        log_path: PathBuf::from("logs").join("stage_3a.log"),
     };
 
     let mut args = std::env::args().skip(1);

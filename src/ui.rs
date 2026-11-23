@@ -335,7 +335,7 @@ pub fn draw_console_ui(
     load_guard.expire_if_needed();
 
     let window_h = ui.ctx().content_rect().height().max(720.0);
-    let stage_h = (window_h * 0.40).clamp(306.0, 432.0);
+    let stage_h = (window_h * 0.42).clamp(328.0, 454.0);
     let shift_held = ui.input(|i| i.modifiers.shift);
 
     // Derive ON-AIR / MIXED / CUE live states strictly from Control Bus crossfader position.
@@ -378,7 +378,7 @@ pub fn draw_console_ui(
                 .inner_margin(Margin::symmetric(10, 6)),
         )
         .show(ui, |ui| {
-            let preview_h_from_stage = (stage_h - 126.0).max(140.0);
+            let preview_h_from_stage = (stage_h - 154.0).max(145.0);
             ui.columns(3, |cols| {
                 draw_deck_column(
                     &mut cols[0],
@@ -395,6 +395,14 @@ pub fn draw_console_ui(
                     param::DECK_A_NEXT_PRESET,
                     param::DECK_A_TRANSITION_SMOOTH,
                     Some(param::DECK_A_TEST_BLANK),
+                    DeckEqParamNames {
+                        bass: param::DECK_A_EQ_BASS,
+                        mid: param::DECK_A_EQ_MID,
+                        treble: param::DECK_A_EQ_TREBLE,
+                        bass_kill: param::DECK_A_EQ_BASS_KILL,
+                        mid_kill: param::DECK_A_EQ_MID_KILL,
+                        treble_kill: param::DECK_A_EQ_TREBLE_KILL,
+                    },
                     shift_held,
                 );
                 draw_master_mixer_column(
@@ -419,6 +427,14 @@ pub fn draw_console_ui(
                     param::DECK_B_NEXT_PRESET,
                     param::DECK_B_TRANSITION_SMOOTH,
                     None,
+                    DeckEqParamNames {
+                        bass: param::DECK_B_EQ_BASS,
+                        mid: param::DECK_B_EQ_MID,
+                        treble: param::DECK_B_EQ_TREBLE,
+                        bass_kill: param::DECK_B_EQ_BASS_KILL,
+                        mid_kill: param::DECK_B_EQ_MID_KILL,
+                        treble_kill: param::DECK_B_EQ_TREBLE_KILL,
+                    },
                     shift_held,
                 );
             });
@@ -881,6 +897,16 @@ fn draw_air_badge(ui: &mut egui::Ui, air_state: DeckAirState, deck_accent: Color
         });
 }
 
+#[derive(Clone, Copy)]
+struct DeckEqParamNames {
+    bass: &'static str,
+    mid: &'static str,
+    treble: &'static str,
+    bass_kill: &'static str,
+    mid_kill: &'static str,
+    treble_kill: &'static str,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_deck_column(
     ui: &mut egui::Ui,
@@ -897,6 +923,7 @@ fn draw_deck_column(
     next_target: &str,
     smooth_param: &str,
     test_blank_target: Option<&str>,
+    eq_params: DeckEqParamNames,
     shift_held: bool,
 ) {
     let border_color = match air_state {
@@ -1101,7 +1128,122 @@ fn draw_deck_column(
                     }
                 }
             });
+
+            // Milestone 3 (3A): Per-Deck 3-Band Visual EQ & Kill Switches (read-only PCM copy;
+            // speakers are never modified). Double-click any slider to reset to 1.0x unity.
+            draw_deck_visual_eq_strip(ui, eq_params, bus);
         });
+}
+
+fn draw_deck_visual_eq_strip(
+    ui: &mut egui::Ui,
+    eq: DeckEqParamNames,
+    bus: &mut ControlBus,
+) {
+    let hint_b = bus
+        .mappings
+        .hint_for_target(eq.bass_kill, MappingMode::Toggle);
+    let hint_m = bus
+        .mappings
+        .hint_for_target(eq.mid_kill, MappingMode::Toggle);
+    let hint_t = bus
+        .mappings
+        .hint_for_target(eq.treble_kill, MappingMode::Toggle);
+
+    let slider_w = ((ui.available_width() - 216.0) / 3.0).clamp(40.0, 96.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(
+            RichText::new("EQ:")
+                .font(FontId::monospace(12.0))
+                .strong()
+                .color(TEXT_MUTED),
+        )
+        .on_hover_text(
+            "Per-deck Visual Audio EQ (Bass <250 Hz, Mid 250-2500 Hz, Treble >2500 Hz).\n\
+             Shapes visuals only — your speakers are never changed.\n\
+             Double-click any slider to reset to 1.0x unity.",
+        );
+
+        for (short_lbl, hint, val_param, kill_param, band_desc) in [
+            ("B", &hint_b, eq.bass, eq.bass_kill, "Bass (<250 Hz)"),
+            ("M", &hint_m, eq.mid, eq.mid_kill, "Mid (250-2500 Hz)"),
+            ("T", &hint_t, eq.treble, eq.treble_kill, "Treble (>2500 Hz)"),
+        ] {
+            let killed = bus.get_bool(kill_param);
+            let kill_label = format!("{short_lbl}[{hint}]");
+            let kill_btn = if killed {
+                egui::Button::new(
+                    RichText::new(kill_label)
+                        .font(FontId::monospace(11.5))
+                        .strong()
+                        .color(Color32::WHITE),
+                )
+                .fill(COLOR_ALERT)
+            } else {
+                egui::Button::new(
+                    RichText::new(kill_label)
+                        .font(FontId::monospace(11.5))
+                        .color(TEXT_PRIMARY),
+                )
+            };
+            if ui
+                .add(kill_btn)
+                .on_hover_text(format!("Toggle {band_desc} Kill [{hint}]"))
+                .clicked()
+            {
+                bus.toggle(kill_param);
+            }
+
+            let mut v = bus.get(val_param);
+            ui.spacing_mut().slider_width = slider_w;
+            let resp = ui
+                .add_enabled(!killed, egui::Slider::new(&mut v, 0.0..=1.0).show_value(false))
+                .on_hover_text(format!(
+                    "{band_desc}: {:.2}x (double-click to reset to 1.00x)",
+                    v * 2.0
+                ));
+            if resp.double_clicked() {
+                bus.set(val_param, 0.5);
+            } else if resp.changed() {
+                bus.set(val_param, v);
+            }
+        }
+
+        let is_modified = bus.get_bool(eq.bass_kill)
+            || bus.get_bool(eq.mid_kill)
+            || bus.get_bool(eq.treble_kill)
+            || (bus.get(eq.bass) - 0.5).abs() > 0.01
+            || (bus.get(eq.mid) - 0.5).abs() > 0.01
+            || (bus.get(eq.treble) - 0.5).abs() > 0.01;
+        let reset_btn = if is_modified {
+            egui::Button::new(
+                RichText::new("0dB")
+                    .font(FontId::monospace(11.5))
+                    .strong()
+                    .color(Color32::BLACK),
+            )
+            .fill(COLOR_WARN)
+        } else {
+            egui::Button::new(
+                RichText::new("0dB")
+                    .font(FontId::monospace(11.5))
+                    .color(TEXT_MUTED),
+            )
+        };
+        if ui
+            .add(reset_btn)
+            .on_hover_text("Reset all 3 Visual EQ bands to 1.0x unity and clear Kills")
+            .clicked()
+        {
+            bus.set(eq.bass, 0.5);
+            bus.set(eq.mid, 0.5);
+            bus.set(eq.treble, 0.5);
+            bus.set(eq.bass_kill, 0.0);
+            bus.set(eq.mid_kill, 0.0);
+            bus.set(eq.treble_kill, 0.0);
+        }
+    });
 }
 
 fn guarded_load_button(

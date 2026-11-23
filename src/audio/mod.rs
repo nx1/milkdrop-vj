@@ -10,6 +10,7 @@
 pub mod capture_thread;
 pub mod ring_buffer;
 pub mod test_source;
+pub mod visual_eq;
 pub mod wasapi_loopback;
 
 /// Describes one selectable audio endpoint (for example, laptop speakers or a USB DJ output).
