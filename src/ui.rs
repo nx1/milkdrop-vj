@@ -201,6 +201,8 @@ pub struct UiInteractionState {
     pub playlist_actions: Vec<PlaylistAction>,
     /// Queued Top Bar hardware/audio/resolution actions handled cleanly by `main.rs`.
     pub top_bar_actions: Vec<TopBarAction>,
+    /// Set when the user clicks `x` next to the Tap Tempo BPM pill to clear BPM/Auto-Pulse.
+    pub request_clear_tempo: bool,
     /// Temporary inline warning/notice shown in the Status Strip (e.g. Load Safety messages).
     toast: Option<(String, Instant)>,
 }
@@ -282,6 +284,8 @@ pub struct ConsoleUiState<'a> {
     pub last_load: Option<&'a LastLoadSummary>,
     pub master_texture_id: TextureId,
     pub blackout_alpha: f32,
+    pub beat_bpm: Option<f64>,
+    pub beat_flash: f32,
     pub deck_a: DeckUiSnapshot<'a>,
     pub deck_b: DeckUiSnapshot<'a>,
     pub all_presets: &'a [PresetEntry],
@@ -409,8 +413,11 @@ pub fn draw_console_ui(
                     &mut cols[1],
                     state.master_texture_id,
                     state.blackout_alpha,
+                    state.beat_bpm,
+                    state.beat_flash,
                     preview_h_from_stage,
                     bus,
+                    interact,
                 );
                 draw_deck_column(
                     &mut cols[2],
@@ -1203,7 +1210,7 @@ fn draw_deck_visual_eq_strip(
                     "{band_desc}: {:.2}x (double-click to reset to 1.00x)",
                     v * 2.0
                 ));
-            if resp.double_clicked() {
+            if slider_double_clicked(ui, &resp) {
                 bus.set(val_param, 0.5);
             } else if resp.changed() {
                 bus.set(val_param, v);
@@ -1272,13 +1279,34 @@ fn guarded_load_button(
     }
 }
 
-/// Live Center Column: Master Preview + 5 Blend Modes + Crossfader + Blackout with dynamic key hints.
+/// Detects primary-button double-clicks inside a slider's rect.
+/// Needed in `egui 0.37` because `egui::Slider` allocates `Sense::drag()` without `Sense::CLICK`,
+/// so `Response::double_clicked()` alone always returns `false`.
+fn slider_double_clicked(ui: &egui::Ui, resp: &egui::Response) -> bool {
+    if resp.double_clicked() {
+        return true;
+    }
+    ui.input(|i| {
+        i.pointer
+            .button_double_clicked(egui::PointerButton::Primary)
+            && i.pointer
+                .interact_pos()
+                .map(|pos| resp.rect.contains(pos))
+                .unwrap_or(false)
+    })
+}
+
+/// Live Center Column: Master Preview + 5 Blend Modes + Crossfader + Blackout + Beat Pulse/Tap Tempo.
+#[allow(clippy::too_many_arguments)]
 fn draw_master_mixer_column(
     ui: &mut egui::Ui,
     master_tex_id: TextureId,
     blackout_alpha: f32,
+    beat_bpm: Option<f64>,
+    beat_flash: f32,
     preview_h_from_stage: f32,
     bus: &mut ControlBus,
+    interact: &mut UiInteractionState,
 ) {
     let blackout_target = bus.get_bool(param::MASTER_BLACKOUT);
     let is_darkening = blackout_target || blackout_alpha > 0.01;
@@ -1392,7 +1420,7 @@ fn draw_master_mixer_column(
                 let resp = ui
                     .add(egui::Slider::new(&mut xfade, 0.0..=1.0).show_value(false))
                     .on_hover_text("Crossfader (double-click to center; Left/Right arrows nudge 5%)");
-                if resp.double_clicked() {
+                if slider_double_clicked(ui, &resp) {
                     bus.set(param::MIXER_CROSSFADER, 0.5);
                 } else if resp.changed() {
                     bus.set(param::MIXER_CROSSFADER, xfade);
@@ -1448,6 +1476,109 @@ fn draw_master_mixer_column(
                         bus.toggle(param::MASTER_BLACKOUT);
                     }
                 });
+            });
+
+            // Milestone 3 (3B): Manual Beat Pulse (`Space`) & Tap Tempo (`T`) row.
+            let hint_beat = bus
+                .mappings
+                .hint_for_target(param::MASTER_BEAT_PULSE, MappingMode::Trigger);
+            let hint_tap = bus
+                .mappings
+                .hint_for_target(param::MASTER_TAP_TEMPO, MappingMode::Trigger);
+            let auto_on = bus.get_bool(param::MASTER_BEAT_AUTO);
+
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let beat_label = format!("BEAT [{hint_beat}]");
+                let beat_btn = if beat_flash > 0.15 {
+                    egui::Button::new(RichText::new(beat_label).strong().color(Color32::BLACK))
+                        .fill(ACCENT_DECK_A)
+                } else {
+                    egui::Button::new(RichText::new(beat_label).strong().color(ACCENT_DECK_A))
+                        .fill(Color32::from_rgb(18, 46, 56))
+                };
+                if ui
+                    .add(beat_btn)
+                    .on_hover_text(
+                        "Inject a damped 70 Hz visual bass pulse into both decks (speakers unchanged).",
+                    )
+                    .clicked()
+                {
+                    bus.trigger(param::MASTER_BEAT_PULSE, false, false);
+                }
+
+                if ui
+                    .button(format!("TAP [{hint_tap}]"))
+                    .on_hover_text("Tap 2+ times in rhythm to set BPM and align Auto-Pulse phase")
+                    .clicked()
+                {
+                    bus.trigger(param::MASTER_TAP_TEMPO, false, false);
+                }
+
+                let bpm_text = match beat_bpm {
+                    Some(bpm) => format!("{bpm:5.1} BPM"),
+                    None => "  --- BPM".to_string(),
+                };
+                Frame::new()
+                    .fill(Color32::from_rgb(16, 20, 28))
+                    .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                    .corner_radius(CornerRadius::same(4))
+                    .inner_margin(Margin::symmetric(6, 2))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(bpm_text)
+                                .font(FontId::monospace(12.0))
+                                .strong()
+                                .color(if beat_bpm.is_some() {
+                                    COLOR_WARN
+                                } else {
+                                    TEXT_MUTED
+                                }),
+                        );
+                    });
+
+                if beat_bpm.is_some()
+                    && ui
+                        .button("x")
+                        .on_hover_text("Clear tapped BPM and stop Auto-Pulse")
+                        .clicked()
+                {
+                    interact.request_clear_tempo = true;
+                }
+
+                let auto_btn = if auto_on && beat_bpm.is_some() {
+                    egui::Button::new(RichText::new("AUTO").strong().color(Color32::BLACK))
+                        .fill(COLOR_OK)
+                } else if auto_on {
+                    egui::Button::new(RichText::new("AUTO").strong().color(Color32::BLACK))
+                        .fill(COLOR_WARN)
+                } else {
+                    egui::Button::new("AUTO")
+                };
+                if ui
+                    .add(auto_btn)
+                    .on_hover_text(
+                        "Automatically fire visual beat pulses on your tapped BPM beat grid",
+                    )
+                    .clicked()
+                {
+                    bus.toggle(param::MASTER_BEAT_AUTO);
+                }
+
+                let mut strength = bus.get(param::MASTER_BEAT_STRENGTH);
+                let strength_w = (ui.available_width() - 6.0).clamp(36.0, 88.0);
+                ui.spacing_mut().slider_width = strength_w;
+                let s_resp = ui
+                    .add(egui::Slider::new(&mut strength, 0.1..=1.0).show_value(false))
+                    .on_hover_text(format!(
+                        "Beat pulse strength: {:.0}% (double-click to reset to 75%)",
+                        strength * 100.0
+                    ));
+                if slider_double_clicked(ui, &s_resp) {
+                    bus.set(param::MASTER_BEAT_STRENGTH, 0.75);
+                } else if s_resp.changed() {
+                    bus.set(param::MASTER_BEAT_STRENGTH, strength);
+                }
             });
         });
 }

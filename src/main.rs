@@ -55,6 +55,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use milkdrop_vj::audio::beat_pulse::BeatPulseEngine;
 use milkdrop_vj::audio::capture_thread::{
     AsyncAudioSwitch, AsyncDeviceListRefresh, AudioSwitchOutcome, LiveAudioCapture,
 };
@@ -187,6 +188,7 @@ struct ConsoleState {
     eq_deck_b: VisualEqProcessor,
     eq_buf_a: Vec<f32>,
     eq_buf_b: Vec<f32>,
+    beat_pulse: BeatPulseEngine,
     device_lost_logged: bool,
 
     // Preset Library (background scanner + disk cache + favorites/playlists + live filtered view)
@@ -234,7 +236,7 @@ impl ConsoleState {
     fn initialize(event_loop: &ActiveEventLoop, config: CliConfig) -> Result<Self, String> {
         let mut logger = GlErrorLogger::open(&config.log_path)?;
         logger.log_info(
-            "Milestone 3 Stage 3A: Per-Deck 3-Band Visual EQ & Kill Switches (Q/W/E, I/O/P) via Control Bus",
+            "Milestone 3 Stage 3B: Manual Beat Pulse (Space), Tap Tempo (T), Auto-Pulse, & Slider Double-Click Reset Fix",
         );
         logger.log_info(&format!(
             "Deck render resolution: {}x{} (default 1280x720 per Light-Load Rules) | measure_gpu={}",
@@ -580,6 +582,7 @@ impl ConsoleState {
             eq_deck_b: VisualEqProcessor::new(audio_sample_rate),
             eq_buf_a: Vec::with_capacity(4096 * 2),
             eq_buf_b: Vec::with_capacity(4096 * 2),
+            beat_pulse: BeatPulseEngine::new(audio_sample_rate),
             device_lost_logged: false,
             presets_root,
             preset_cache_path,
@@ -1299,6 +1302,13 @@ impl ConsoleState {
             }
         }
 
+        if self.interact.request_clear_tempo {
+            self.interact.request_clear_tempo = false;
+            self.beat_pulse.clear_tempo();
+            self.bus.set(param::MASTER_BEAT_AUTO, 0.0);
+            self.interact.show_toast("Cleared Tap Tempo & Auto-Pulse");
+        }
+
         let triggers = self.bus.drain_triggers();
         let xfade = self.bus.get(param::MIXER_CROSSFADER);
         let air_a = DeckAirState::from_weight(1.0 - xfade);
@@ -1400,6 +1410,16 @@ impl ConsoleState {
                         let smooth =
                             !trig.hard_cut && self.bus.get_bool(param::DECK_B_TRANSITION_SMOOTH);
                         self.load_deck_preset(false, sel_idx, smooth);
+                    }
+                }
+                param::MASTER_BEAT_PULSE => {
+                    let strength = self.bus.get(param::MASTER_BEAT_STRENGTH);
+                    self.beat_pulse.trigger_pulse(strength);
+                }
+                param::MASTER_TAP_TEMPO => {
+                    if let Some(bpm) = self.beat_pulse.record_tap() {
+                        self.interact
+                            .show_toast(format!("Tap Tempo: {bpm:.1} BPM"));
                     }
                 }
                 _ => {}
@@ -1770,6 +1790,18 @@ impl ConsoleState {
             eq_params_b,
         );
 
+        // 2c. Advance Tap Tempo Auto-Pulse clock and mix any active 70 Hz visual beat pulse
+        //     after Visual EQ so manual `Space` hits work even during silence or Bass Kill.
+        let beat_dt_secs = (frame_dt_ms / 1000.0) as f32;
+        self.beat_pulse.update_clock(
+            frame_start,
+            beat_dt_secs,
+            self.bus.get_bool(param::MASTER_BEAT_AUTO),
+            self.bus.get(param::MASTER_BEAT_STRENGTH),
+        );
+        self.beat_pulse
+            .mix_into_decks(&mut self.eq_buf_a, &mut self.eq_buf_b, self.audio_sample_rate);
+
         // 3. Render Deck A and Deck B in their isolated shared OpenGL contexts.
         let timing_a = match self.deck_a.render_to_texture(
             &self.eq_buf_a,
@@ -1964,6 +1996,8 @@ impl ConsoleState {
             last_load: self.last_load.as_ref(),
             master_texture_id: self.master_tex_id,
             blackout_alpha: self.blackout_alpha,
+            beat_bpm: self.beat_pulse.bpm(),
+            beat_flash: self.beat_pulse.ui_flash(),
             deck_a: DeckUiSnapshot {
                 texture_id: self.deck_a_tex_id,
                 preset_name: deck_a_name,
@@ -2168,7 +2202,7 @@ impl ConsoleState {
         };
         let end_mem = current_process_memory_mb();
 
-        self.logger.log_info("=== Stage 3A Shutdown Summary (provisional, laptop-limited) ===");
+        self.logger.log_info("=== Stage 3B Shutdown Summary (provisional, laptop-limited) ===");
         self.logger.log_info(&format!(
             "Elapsed: {:.2}s | Frames: {} | Avg FPS: {:.2} | Total GL errors: {}",
             elapsed,
@@ -2235,7 +2269,7 @@ impl ConsoleState {
         self.live_capture.take();
 
         println!(
-            "Stage 3A closed cleanly. Frames={}, Avg FPS={:.2}, Presets={}, BlankPBO avg={:.1} us, GL errors={}, log={}",
+            "Stage 3B closed cleanly. Frames={}, Avg FPS={:.2}, Presets={}, BlankPBO avg={:.1} us, GL errors={}, log={}",
             self.frame_count,
             avg_fps,
             self.presets.len(),
@@ -2502,7 +2536,7 @@ fn parse_cli_args() -> Result<CliConfig, String> {
         auto_exit_secs: None,
         test_res_toggles: 0,
         test_projector_windowed: false,
-        log_path: PathBuf::from("logs").join("stage_3a.log"),
+        log_path: PathBuf::from("logs").join("stage_3b.log"),
     };
 
     let mut args = std::env::args().skip(1);

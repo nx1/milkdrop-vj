@@ -40,6 +40,12 @@ pub mod param {
     pub const DECK_B_EQ_MID_KILL: &str = "deck_b.eq.mid_kill";
     pub const DECK_B_EQ_TREBLE_KILL: &str = "deck_b.eq.treble_kill";
 
+    // Milestone 3 (3B): Manual Beat Pulse (`Space`), Tap Tempo (`T`), Auto-Pulse toggle & strength.
+    pub const MASTER_BEAT_PULSE: &str = "master.beat_pulse";
+    pub const MASTER_TAP_TEMPO: &str = "master.tap_tempo";
+    pub const MASTER_BEAT_AUTO: &str = "master.beat_auto";
+    pub const MASTER_BEAT_STRENGTH: &str = "master.beat_strength";
+
     // One-shot trigger targets (queued as actions rather than stored as continuous values).
     pub const DECK_A_PREV_PRESET: &str = "deck_a.prev_preset";
     pub const DECK_A_NEXT_PRESET: &str = "deck_a.next_preset";
@@ -370,6 +376,29 @@ impl Default for MappingsConfig {
                     hard_cut: false,
                     force_on_air: false,
                 },
+                // Milestone 3 (3B): Manual Beat Pulse (`Space`) & Tap Tempo (`T`).
+                KeyboardMapping {
+                    key: "Space".to_string(),
+                    modifiers: vec![],
+                    target: param::MASTER_BEAT_PULSE.to_string(),
+                    mode: MappingMode::Trigger,
+                    value: Some(1.0),
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "T".to_string(),
+                    modifiers: vec![],
+                    target: param::MASTER_TAP_TEMPO.to_string(),
+                    mode: MappingMode::Trigger,
+                    value: Some(1.0),
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
             ],
             midi: vec![
                 MidiMapping {
@@ -481,6 +510,12 @@ impl KeyboardMapping {
             }
             (param::DECK_B_EQ_TREBLE_KILL, MappingMode::Toggle, _, _, _, _) => {
                 "Deck B EQ: Treble Kill Toggle".to_string()
+            }
+            (param::MASTER_BEAT_PULSE, MappingMode::Trigger, _, _, _, _) => {
+                "Master: Manual Beat Pulse".to_string()
+            }
+            (param::MASTER_TAP_TEMPO, MappingMode::Trigger, _, _, _, _) => {
+                "Master: Tap Tempo".to_string()
             }
             _ => format!("{} ({:?})", self.target, self.mode),
         }
@@ -731,6 +766,9 @@ impl ControlBus {
         params.insert(param::DECK_B_EQ_BASS_KILL.to_string(), 0.0);
         params.insert(param::DECK_B_EQ_MID_KILL.to_string(), 0.0);
         params.insert(param::DECK_B_EQ_TREBLE_KILL.to_string(), 0.0);
+        // Milestone 3 (3B): Beat Pulse strength (0.75 = punchy default) & Auto-Pulse OFF.
+        params.insert(param::MASTER_BEAT_AUTO.to_string(), 0.0);
+        params.insert(param::MASTER_BEAT_STRENGTH.to_string(), 0.75);
 
         Self {
             params,
