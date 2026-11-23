@@ -37,11 +37,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glow::HasContext;
-use glutin::config::{ConfigSurfaceTypes, ConfigTemplateBuilder};
+use glutin::config::{Config, ConfigSurfaceTypes, ConfigTemplateBuilder};
 use glutin::context::{
     ContextApi, ContextAttributesBuilder, PossiblyCurrentContext, Version,
 };
-use glutin::display::GetGlDisplay;
+use glutin::display::{Display, GetGlDisplay};
 use glutin::prelude::*;
 use glutin::surface::{Surface, SwapInterval, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow};
@@ -53,9 +53,11 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use milkdrop_vj::audio::capture_thread::LiveAudioCapture;
+use milkdrop_vj::audio::capture_thread::{
+    AsyncAudioSwitch, AsyncDeviceListRefresh, AudioSwitchOutcome, LiveAudioCapture,
+};
 use milkdrop_vj::audio::wasapi_loopback::WasapiLoopbackSource;
-use milkdrop_vj::audio::AudioSource;
+use milkdrop_vj::audio::{AudioDeviceInfo, AudioSource};
 use milkdrop_vj::control::{
     normalize_modifiers, param, ControlBus, MappingMode, MappingsConfig, BLEND_MODE_COUNT,
 };
@@ -77,7 +79,7 @@ use crate::mixer::{step_blackout_alpha, BlendMode, DeckAirState, GpuMixer};
 use crate::render_deck::RenderDeck;
 use crate::ui::{
     apply_dark_venue_style, draw_console_ui, AudioBadgeState, ConsoleUiState, DeckUiSnapshot,
-    LastLoadSummary, LoadGuardState, PlaylistAction, UiInteractionState,
+    LastLoadSummary, LoadGuardState, PlaylistAction, TopBarAction, UiInteractionState,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +96,7 @@ struct CliConfig {
     deck_height: u32,
     measure_gpu: bool,
     auto_exit_secs: Option<f64>,
+    test_res_toggles: u32,
     log_path: PathBuf,
 }
 
@@ -120,6 +123,8 @@ struct ConsoleState {
     deck_b_tex_id: egui::TextureId,
     deck_a: RenderDeck,
     deck_b: RenderDeck,
+    gl_display: Display,
+    pbuffer_config: Config,
     window: Window,
     main_surface: Surface<WindowSurface>,
     main_context: PossiblyCurrentContext,
@@ -133,13 +138,21 @@ struct ConsoleState {
     blackout_alpha: f32,
     mappings_status: String,
 
-    // GPU info
+    // GPU info & automated resolution-toggle test counter
     gpu_label: String,
     gpu_is_intel: bool,
+    res_toggles_done: u32,
+    last_res_toggle_test_at: Instant,
 
-    // Audio pipeline
+    // Audio pipeline (non-blocking async device switcher & enumerator for Stage 2A-5)
     audio_mode: AudioMode,
     live_capture: Option<LiveAudioCapture>,
+    selected_audio_device_id: Option<String>,
+    audio_devices: Vec<AudioDeviceInfo>,
+    audio_switch_handle: Option<AsyncAudioSwitch>,
+    audio_switch_seq: u64,
+    audio_device_refresh: Option<AsyncDeviceListRefresh>,
+    last_device_refresh_at: Instant,
     audio_device_name: String,
     audio_sample_rate: u32,
     last_wasapi_packets: u64,
@@ -197,7 +210,7 @@ impl ConsoleState {
     fn initialize(event_loop: &ActiveEventLoop, config: CliConfig) -> Result<Self, String> {
         let mut logger = GlErrorLogger::open(&config.log_path)?;
         logger.log_info(
-            "Stage 2A-4b: Preset Browser + Favorites & Curated Playlists (playlists.json) + Full Library Support",
+            "Stage 2A-5: Top Bar (Live/Test Audio Switch, Unplug-Safe Audio Device Dropdown, Runtime 720p/1080p Toggle)",
         );
         logger.log_info(&format!(
             "Deck render resolution: {}x{} (default 1280x720 per Light-Load Rules) | measure_gpu={}",
@@ -264,7 +277,10 @@ impl ConsoleState {
 
         // 3. Create the main winit window with minimum 1280x720 pt logical size (Section 13).
         let window_attrs = Window::default_attributes()
-            .with_title("MilkDrop VJ — Stage 2A-4b Preset Browser, Favorites & Playlists (1280x720 decks)")
+            .with_title(format!(
+                "MilkDrop VJ — Stage 2A-5 Top Bar & Console ({}x{} decks)",
+                config.deck_width, config.deck_height
+            ))
             .with_inner_size(LogicalSize::new(1440.0, 860.0))
             .with_min_inner_size(LogicalSize::new(1280.0, 720.0));
 
@@ -410,11 +426,14 @@ impl ConsoleState {
         let deck_b_tex_id = egui_renderer.register_native_texture(deck_b.output_texture());
         logger.check_frame(&main_gl, 0, "egui-and-mixer-init");
 
-        // 8. Start Live WASAPI Loopback capture (or Synthetic Test audio if requested).
+        // 8. Start Live WASAPI Loopback capture (or Synthetic Test audio if requested),
+        //    and spawn a background Windows output device list refresh for the Top Bar dropdown.
+        let mut selected_audio_device_id: Option<String> = None;
         let (audio_mode, live_capture, audio_device_name, audio_sample_rate) =
             match config.audio_mode {
                 AudioMode::LiveWasapi => {
                     let chosen_id = resolve_device_filter(config.audio_device_filter.as_deref())?;
+                    selected_audio_device_id = chosen_id.clone();
                     match LiveAudioCapture::start(chosen_id) {
                         Ok(cap) => {
                             let fmt = cap.format().clone();
@@ -450,6 +469,7 @@ impl ConsoleState {
                     )
                 }
             };
+        let audio_device_refresh = Some(AsyncDeviceListRefresh::spawn());
 
         let max_pcm = max_pcm_samples_per_channel();
         logger.log_info(&format!("projectm_pcm_get_max_samples() = {max_pcm}"));
@@ -474,6 +494,8 @@ impl ConsoleState {
             deck_b_tex_id,
             deck_a,
             deck_b,
+            gl_display,
+            pbuffer_config,
             window,
             main_surface,
             main_context,
@@ -486,8 +508,16 @@ impl ConsoleState {
             mappings_status,
             gpu_label,
             gpu_is_intel,
+            res_toggles_done: 0,
+            last_res_toggle_test_at: now,
             audio_mode,
             live_capture,
+            selected_audio_device_id,
+            audio_devices: Vec::new(),
+            audio_switch_handle: None,
+            audio_switch_seq: 0,
+            audio_device_refresh,
+            last_device_refresh_at: now,
             audio_device_name,
             audio_sample_rate,
             last_wasapi_packets: 0,
@@ -543,6 +573,260 @@ impl ConsoleState {
             logger,
             shut_down: false,
         })
+    }
+
+    /// Polls non-blocking background audio device enumeration and WASAPI switching workers (`2A-5`).
+    fn poll_audio_background_tasks(&mut self) {
+        if let Some(ref refresh) = self.audio_device_refresh {
+            if let Some(result) = refresh.poll() {
+                self.audio_device_refresh = None;
+                match result {
+                    Ok(devices) => {
+                        let count = devices.len();
+                        self.audio_devices = devices;
+                        self.logger.log_info(&format!(
+                            "[AUDIO] Refreshed active Windows output devices ({count} found)"
+                        ));
+                    }
+                    Err(err) => {
+                        self.logger
+                            .log_info(&format!("[AUDIO-ERROR] Device refresh failed: {err}"));
+                    }
+                }
+            }
+        }
+
+        if let Some(ref switcher) = self.audio_switch_handle {
+            if let Some(outcome) = switcher.poll() {
+                self.audio_switch_handle = None;
+                match outcome {
+                    AudioSwitchOutcome::LiveReady {
+                        request_id,
+                        requested_device_id,
+                        capture,
+                    } => {
+                        if request_id != self.audio_switch_seq
+                            || self.audio_mode != AudioMode::LiveWasapi
+                        {
+                            // Stale switch completed after a newer user choice; stop cleanly off-thread.
+                            AsyncAudioSwitch::stop_in_background(Some(capture));
+                            return;
+                        }
+                        let fmt = capture.format().clone();
+                        self.audio_device_name = fmt.device_name.clone();
+                        self.audio_sample_rate = fmt.output_sample_rate;
+                        self.selected_audio_device_id = requested_device_id;
+                        self.last_wasapi_packets = 0;
+                        self.last_packet_time = Instant::now();
+                        self.device_lost_logged = false;
+                        self.live_capture = Some(capture);
+                        let msg = format!(
+                            "Audio active: {} ({} Hz)",
+                            fmt.device_name, fmt.output_sample_rate
+                        );
+                        self.logger.log_info(&format!(
+                            "[AUDIO] Live WASAPI switched cleanly: `{}` ({} Hz, {} ch -> {} Hz stereo)",
+                            fmt.device_name,
+                            fmt.native_sample_rate,
+                            fmt.native_channels,
+                            fmt.output_sample_rate
+                        ));
+                        self.interact.show_toast(msg);
+                    }
+                    AudioSwitchOutcome::LiveFailed {
+                        request_id,
+                        error,
+                        ..
+                    } => {
+                        if request_id != self.audio_switch_seq
+                            || self.audio_mode != AudioMode::LiveWasapi
+                        {
+                            return;
+                        }
+                        self.live_capture = None;
+                        self.device_lost_logged = true;
+                        self.logger
+                            .log_info(&format!("[AUDIO-ERROR] Live WASAPI switch failed: {error}"));
+                        self.interact
+                            .show_toast(format!("Audio switch failed: {error}"));
+                        // Refresh device list so an unplugged endpoint disappears cleanly.
+                        self.trigger_device_list_refresh(true);
+                    }
+                }
+            }
+        }
+    }
+
+    fn trigger_device_list_refresh(&mut self, force: bool) {
+        if self.audio_device_refresh.is_some() {
+            return;
+        }
+        if !force && self.last_device_refresh_at.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.last_device_refresh_at = Instant::now();
+        self.audio_device_refresh = Some(AsyncDeviceListRefresh::spawn());
+    }
+
+    fn start_async_live_audio_switch(&mut self, device_id: Option<String>, label: String) {
+        self.audio_mode = AudioMode::LiveWasapi;
+        self.audio_switch_seq = self.audio_switch_seq.wrapping_add(1);
+        let old = self.live_capture.take();
+        self.audio_device_name = label.clone();
+        self.device_lost_logged = false;
+        self.audio_switch_handle = Some(AsyncAudioSwitch::spawn_live_switch(
+            old,
+            device_id,
+            self.audio_switch_seq,
+        ));
+        self.logger
+            .log_info(&format!("[AUDIO] Switching Live WASAPI -> `{label}` (async)..."));
+    }
+
+    /// Executes Top Bar actions (audio source switch, device switch, refresh, resolution toggle).
+    fn process_top_bar_actions(&mut self) {
+        if self.interact.top_bar_actions.is_empty() {
+            return;
+        }
+        let actions: Vec<TopBarAction> = std::mem::take(&mut self.interact.top_bar_actions);
+        for action in actions {
+            match action {
+                TopBarAction::SetAudioSourceLive(true) => {
+                    let label = self
+                        .selected_audio_device_id
+                        .as_deref()
+                        .and_then(|id| self.audio_devices.iter().find(|d| d.id == id))
+                        .map(|d| d.name.clone())
+                        .unwrap_or_else(|| "System Default".to_string());
+                    self.start_async_live_audio_switch(
+                        self.selected_audio_device_id.clone(),
+                        label,
+                    );
+                }
+                TopBarAction::SetAudioSourceLive(false) => {
+                    self.audio_mode = AudioMode::SyntheticTest;
+                    self.audio_switch_seq = self.audio_switch_seq.wrapping_add(1);
+                    self.audio_switch_handle = None;
+                    AsyncAudioSwitch::stop_in_background(self.live_capture.take());
+                    self.audio_device_name = "Synthetic Test Signal".to_string();
+                    self.audio_sample_rate = 48_000;
+                    self.device_lost_logged = false;
+                    self.logger
+                        .log_info("[AUDIO] Switched source -> Synthetic Test Audio (48000 Hz)");
+                    self.interact
+                        .show_toast("Audio source: Synthetic Test Signal (48 kHz)");
+                }
+                TopBarAction::SelectAudioDevice { device_id, label } => {
+                    self.selected_audio_device_id = device_id.clone();
+                    self.start_async_live_audio_switch(device_id, label);
+                }
+                TopBarAction::RefreshAudioDevices => {
+                    self.trigger_device_list_refresh(false);
+                }
+                TopBarAction::ReconnectAudio => {
+                    self.trigger_device_list_refresh(true);
+                    let label = self
+                        .selected_audio_device_id
+                        .as_deref()
+                        .and_then(|id| self.audio_devices.iter().find(|d| d.id == id))
+                        .map(|d| d.name.clone())
+                        .unwrap_or_else(|| "System Default".to_string());
+                    self.start_async_live_audio_switch(
+                        self.selected_audio_device_id.clone(),
+                        label,
+                    );
+                }
+                TopBarAction::ToggleDeckResolution => {
+                    let (new_w, new_h) = if self.config.deck_height >= 1080 {
+                        (1280, 720)
+                    } else {
+                        (1920, 1080)
+                    };
+                    self.resize_decks_and_mixer(new_w, new_h);
+                }
+            }
+        }
+    }
+
+    /// Runtime resolution toggle (`1280x720` <-> `1920x1080`) for Deck A, Deck B, and Master FBO.
+    fn resize_decks_and_mixer(&mut self, new_w: u32, new_h: u32) {
+        if self.config.deck_width == new_w && self.config.deck_height == new_h {
+            return;
+        }
+        let t0 = Instant::now();
+        let mem_before = current_process_memory_mb();
+
+        if let Err(err) = self.deck_a.resize(
+            new_w,
+            new_h,
+            &self.gl_display,
+            &self.pbuffer_config,
+            &mut self.logger,
+        ) {
+            self.logger
+                .log_info(&format!("[RES-ERROR] Deck A resize failed: {err}"));
+            self.interact
+                .show_toast(format!("Resolution resize error (Deck A): {err}"));
+            let _ = self.main_context.make_current(&self.main_surface);
+            return;
+        }
+        if let Err(err) = self.deck_b.resize(
+            new_w,
+            new_h,
+            &self.gl_display,
+            &self.pbuffer_config,
+            &mut self.logger,
+        ) {
+            self.logger
+                .log_info(&format!("[RES-ERROR] Deck B resize failed: {err}"));
+            self.interact
+                .show_toast(format!("Resolution resize error (Deck B): {err}"));
+            let _ = self.main_context.make_current(&self.main_surface);
+            return;
+        }
+
+        if let Err(err) = self.main_context.make_current(&self.main_surface) {
+            self.logger.log_info(&format!(
+                "[RES-ERROR] Main context make_current failed after deck resize: {err}"
+            ));
+            return;
+        }
+        if let Err(err) = self.mixer.resize(new_w, new_h) {
+            self.logger
+                .log_info(&format!("[RES-ERROR] GPU mixer resize failed: {err}"));
+            self.interact
+                .show_toast(format!("Resolution resize error (Mixer): {err}"));
+            return;
+        }
+        self.logger.check_frame(
+            &self.main_gl,
+            self.frame_count,
+            &format!("main-mixer-resize-{new_w}x{new_h}"),
+        );
+
+        self.config.deck_width = new_w;
+        self.config.deck_height = new_h;
+        self.window.set_title(&format!(
+            "MilkDrop VJ — Stage 2A-5 Top Bar & Console ({new_w}x{new_h} decks)"
+        ));
+
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let mem_after = current_process_memory_mb();
+        let mem_note = match (mem_before, mem_after) {
+            (Some(b), Some(a)) => format!(
+                "WS {:.1}->{:.1} MiB PC {:.1}->{:.1} MiB",
+                b.working_set_mb, a.working_set_mb, b.private_commit_mb, a.private_commit_mb
+            ),
+            _ => "mem=n/a".to_string(),
+        };
+        let line = format!(
+            "[RES] Toggled decks + Master -> {new_w}x{new_h} in {elapsed_ms:.2} ms | GL_err={} | {mem_note}",
+            self.logger.total_errors()
+        );
+        println!("{line}");
+        self.logger.log_info(&line);
+        self.interact
+            .show_toast(format!("Deck resolution switched to {new_w}x{new_h} ({elapsed_ms:.1} ms)"));
     }
 
     /// Polls the background preset-scanner thread without ever blocking the render loop.
@@ -1247,10 +1531,27 @@ impl ConsoleState {
         }
         self.frame_count += 1;
 
-        // 0. Poll non-blocking background preset scanner, apply playlist edits, and refresh filters.
+        // 0. Poll non-blocking background workers (preset scanner, audio switch/enum),
+        //    apply Top Bar & playlist actions, and refresh filtered preset view if needed.
         self.poll_preset_scanner();
+        self.poll_audio_background_tasks();
+        self.process_top_bar_actions();
         self.process_playlist_actions();
         self.refresh_filtered_presets_if_needed();
+
+        // Optional automated resolution-toggle verification (`--test-res-toggles N`).
+        if self.res_toggles_done < self.config.test_res_toggles
+            && self.last_res_toggle_test_at.elapsed() >= Duration::from_secs(1)
+        {
+            self.last_res_toggle_test_at = Instant::now();
+            self.res_toggles_done += 1;
+            let (next_w, next_h) = if self.config.deck_height >= 1080 {
+                (1280, 720)
+            } else {
+                (1920, 1080)
+            };
+            self.resize_decks_and_mixer(next_w, next_h);
+        }
 
         // 1. Execute any Control Bus triggers queued on the previous UI frame.
         self.process_bus_triggers();
@@ -1416,12 +1717,17 @@ impl ConsoleState {
         };
 
         let ui_state = ConsoleUiState {
+            audio_is_live: self.audio_mode == AudioMode::LiveWasapi,
             audio_source_label,
             audio_device_name: &self.audio_device_name,
+            audio_selected_device_id: self.selected_audio_device_id.as_deref(),
+            audio_devices: &self.audio_devices,
+            audio_devices_refreshing: self.audio_device_refresh.is_some(),
             audio_sample_rate: self.audio_sample_rate,
             audio_peak_db: self.audio_peak_db,
             audio_state: audio_badge,
             deck_res_label: &deck_res_label,
+            deck_is_1080p: self.config.deck_height >= 1080,
             gpu_label: &self.gpu_label,
             gpu_is_intel: self.gpu_is_intel,
             global_fps: self.global_fps,
@@ -1516,6 +1822,9 @@ impl ConsoleState {
     fn collect_audio_for_frame(&mut self) -> (usize, bool, AudioBadgeState) {
         match self.audio_mode {
             AudioMode::LiveWasapi => {
+                if self.audio_switch_handle.is_some() {
+                    return (0, false, AudioBadgeState::Switching);
+                }
                 if let Some(cap) = self.live_capture.as_mut() {
                     let pop = cap.pop_stereo(&mut self.live_pcm_buf, 4096);
                     if let Some(age_ms) = pop.oldest_sample_age_ms {
@@ -1526,9 +1835,11 @@ impl ConsoleState {
                         self.last_wasapi_packets = pkts;
                         self.last_packet_time = Instant::now();
                     }
+                    let mut newly_lost = false;
                     let badge = if cap.device_lost_events() > 0 {
                         if !self.device_lost_logged {
                             self.device_lost_logged = true;
+                            newly_lost = true;
                             let err = cap.last_error().unwrap_or_else(|| "unknown".to_string());
                             self.logger
                                 .log_info(&format!("[AUDIO] DEVICE LOST detected: {err}"));
@@ -1539,6 +1850,10 @@ impl ConsoleState {
                     } else {
                         AudioBadgeState::Silence
                     };
+
+                    if newly_lost {
+                        self.trigger_device_list_refresh(true);
+                    }
 
                     if pop.frames_read > 0 {
                         (pop.frames_read * 2, true, badge)
@@ -1608,7 +1923,7 @@ impl ConsoleState {
         };
         let end_mem = current_process_memory_mb();
 
-        self.logger.log_info("=== Stage 2A-4b Shutdown Summary (provisional, laptop-limited) ===");
+        self.logger.log_info("=== Stage 2A-5 Shutdown Summary (provisional, laptop-limited) ===");
         self.logger.log_info(&format!(
             "Elapsed: {:.2}s | Frames: {} | Avg FPS: {:.2} | Total GL errors: {}",
             elapsed,
@@ -1662,7 +1977,7 @@ impl ConsoleState {
         self.live_capture.take();
 
         println!(
-            "Stage 2A-4b closed cleanly. Frames={}, Avg FPS={:.2}, Presets={}, BlankPBO avg={:.1} us, GL errors={}, log={}",
+            "Stage 2A-5 closed cleanly. Frames={}, Avg FPS={:.2}, Presets={}, BlankPBO avg={:.1} us, GL errors={}, log={}",
             self.frame_count,
             avg_fps,
             self.presets.len(),
@@ -1892,7 +2207,8 @@ fn parse_cli_args() -> Result<CliConfig, String> {
         deck_height: 720,
         measure_gpu: false,
         auto_exit_secs: None,
-        log_path: PathBuf::from("logs").join("stage_2a4b.log"),
+        test_res_toggles: 0,
+        log_path: PathBuf::from("logs").join("stage_2a5.log"),
     };
 
     let mut args = std::env::args().skip(1);
@@ -1942,6 +2258,14 @@ fn parse_cli_args() -> Result<CliConfig, String> {
                     val.parse::<f64>()
                         .map_err(|_| format!("Invalid --auto-exit-secs `{val}`"))?,
                 );
+            }
+            "--test-res-toggles" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--test-res-toggles requires a count (e.g. 5)".to_string())?;
+                cfg.test_res_toggles = val
+                    .parse::<u32>()
+                    .map_err(|_| format!("Invalid --test-res-toggles `{val}`"))?;
             }
             "--log" => {
                 let val = args

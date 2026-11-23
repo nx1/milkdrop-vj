@@ -197,6 +197,23 @@ impl BlankDetector {
         self.dark_since = None;
     }
 
+    /// Re-attaches `output_texture` after an in-place texture resize and drops any stale PBO flight.
+    fn on_source_resized(&mut self, gl: &glow::Context, output_texture: glow::NativeTexture) {
+        self.pbo_in_flight = false;
+        self.dark_since = None;
+        unsafe {
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.src_fbo));
+            gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(output_texture),
+                0,
+            );
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+        }
+    }
+
     fn status(&self) -> BlankDeckStatus {
         let dark_seconds = self
             .dark_since
@@ -508,6 +525,101 @@ impl RenderDeck {
         if let Some(deck) = self.deck.as_ref() {
             deck.set_fps(fps);
         }
+    }
+
+    /// Resizes this deck's off-screen WGL pbuffer, shared `output_texture` (in-place so `egui`
+    /// texture IDs stay valid), `BlankDetector` FBO attachment, and `libprojectM` viewport (`2A-5`).
+    ///
+    /// Note: Leaves this deck's context current; caller should re-bind the main context afterward.
+    pub fn resize(
+        &mut self,
+        new_width: u32,
+        new_height: u32,
+        gl_display: &Display,
+        pbuffer_config: &Config,
+        logger: &mut GlErrorLogger,
+    ) -> Result<(), String> {
+        if self.width == new_width && self.height == new_height {
+            return Ok(());
+        }
+        let w_nz = NonZeroU32::new(new_width)
+            .ok_or_else(|| format!("[{}] Deck width must be > 0", self.name))?;
+        let h_nz = NonZeroU32::new(new_height)
+            .ok_or_else(|| format!("[{}] Deck height must be > 0", self.name))?;
+
+        // 1. Make current on old pbuffer and drain any in-flight GPU work/fences cleanly before
+        //    swapping out the WGL pbuffer surface and reallocating the shared texture.
+        self.make_current()?;
+        unsafe {
+            self.gl.finish();
+        }
+        if let Some(fence) = self.pending_sync.take() {
+            unsafe {
+                self.gl.delete_sync(fence);
+            }
+        }
+        while let Some(fence) = self.retired_syncs.pop_front() {
+            unsafe {
+                self.gl.delete_sync(fence);
+            }
+        }
+        self.gpu_timer_in_flight = [false; 3];
+
+        // 2. Create the new WGL pbuffer surface and bind this deck's context to it.
+        let pbuffer_attrs = SurfaceAttributesBuilder::<PbufferSurface>::new().build(w_nz, h_nz);
+        let new_pbuffer = unsafe {
+            gl_display
+                .create_pbuffer_surface(pbuffer_config, &pbuffer_attrs)
+                .map_err(|e| {
+                    format!(
+                        "[{}] Failed to create {new_width}x{new_height} pbuffer on resize: {e}",
+                        self.name
+                    )
+                })?
+        };
+        self.context.make_current(&new_pbuffer).map_err(|e| {
+            format!(
+                "[{}] Failed to make context current on resized pbuffer: {e}",
+                self.name
+            )
+        })?;
+        // Dropping the previous pbuffer after binding the new one frees its WGL/VRAM backing cleanly.
+        self.pbuffer = new_pbuffer;
+
+        // 3. Re-specify the shared `output_texture` in place so `egui` TextureIds stay valid.
+        unsafe {
+            self.gl.viewport(0, 0, new_width as i32, new_height as i32);
+            self.gl
+                .bind_texture(glow::TEXTURE_2D, Some(self.output_texture));
+            self.gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                new_width as i32,
+                new_height as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            self.gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+
+        // 4. Re-attach resized texture to BlankDetector and update libprojectM's render size.
+        self.blank_detector
+            .on_source_resized(&self.gl, self.output_texture);
+        if let Some(deck) = self.deck.as_ref() {
+            deck.resize(new_width as usize, new_height as usize);
+        }
+        self.width = new_width;
+        self.height = new_height;
+
+        logger.check_frame(
+            &self.gl,
+            0,
+            &format!("{}-resize-{new_width}x{new_height}", self.name),
+        );
+        Ok(())
     }
 
     /// Feeds PCM audio, renders one frame inside this deck's shared context with full

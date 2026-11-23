@@ -1,4 +1,4 @@
-//! Dark-Venue Traktor-Style `egui 0.37` Console UI (Milestone 2 — Stage `2A-4b`).
+//! Dark-Venue Traktor-Style `egui 0.37` Console UI (Milestone 2 — Stage `2A-5`).
 //!
 //! Layout specification: Section 13 of `docs/project_research_and_design.md`.
 //! - All sizes are in `egui` logical points (`pt`), automatically scaled by Windows DPI.
@@ -8,8 +8,9 @@
 //! - Every working control (crossfader, cuts, blend modes, blackout, deck load buttons,
 //!   browser row Load A/B buttons, transition mode, and remappable keyboard bindings)
 //!   reads and writes through the unified `ControlBus` (`0.0..=1.0`) and `mappings.json`.
-//! - Favorites and custom Playlists persist cleanly to `playlists.json` (gitignored).
-//! - Controls arriving in `2A-5` and `2B` remain greyed out until implemented.
+//! - Top Bar (`2A-5`): live Audio Source switch, unplug-safe Audio Device dropdown,
+//!   and runtime `720p` <-> `1080p` deck resolution toggle.
+//! - Controls arriving in `2B` (`Proj: OFF`) remain greyed out until implemented.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ use egui::{
 
 use crate::mixer::{BlendMode, DeckAirState};
 use crate::render_deck::BlankDeckStatus;
+use milkdrop_vj::audio::AudioDeviceInfo;
 use milkdrop_vj::control::{param, ControlBus, MappingMode, BLEND_MODE_COUNT};
 use milkdrop_vj::playlists::{CollectionFilter, PlaylistStore};
 use milkdrop_vj::preset_browser::{PresetEntry, ScanStatus, WeightFilter};
@@ -97,6 +99,20 @@ impl LoadGuardState {
         self.armed_target = None;
         self.armed_at = None;
     }
+}
+
+/// Top-bar hardware/system actions emitted by UI widgets and executed cleanly by `main.rs`.
+#[derive(Debug, Clone)]
+pub enum TopBarAction {
+    SetAudioSourceLive(bool),
+    SelectAudioDevice {
+        /// `None` = Windows System Default; `Some(id)` = specific active endpoint ID.
+        device_id: Option<String>,
+        label: String,
+    },
+    RefreshAudioDevices,
+    ReconnectAudio,
+    ToggleDeckResolution,
 }
 
 /// User curation actions emitted by UI widgets and persisted to `playlists.json` by `main.rs`.
@@ -180,6 +196,8 @@ pub struct UiInteractionState {
     pub playlist_modal_feedback: Option<String>,
     /// Queued favorite/playlist mutations handled and saved by `main.rs`.
     pub playlist_actions: Vec<PlaylistAction>,
+    /// Queued Top Bar hardware/audio/resolution actions handled cleanly by `main.rs`.
+    pub top_bar_actions: Vec<TopBarAction>,
     /// Temporary inline warning/notice shown in the Status Strip (e.g. Load Safety messages).
     toast: Option<(String, Instant)>,
 }
@@ -211,6 +229,7 @@ pub enum AudioBadgeState {
     Live,
     Test,
     Silence,
+    Switching,
     DeviceLost,
 }
 
@@ -235,14 +254,19 @@ pub struct DeckUiSnapshot<'a> {
     pub blank: BlankDeckStatus,
 }
 
-/// All live readouts needed to draw one frame of the `2A-4b` Control Console.
+/// All live readouts needed to draw one frame of the `2A-5` Control Console.
 pub struct ConsoleUiState<'a> {
+    pub audio_is_live: bool,
     pub audio_source_label: &'a str,
     pub audio_device_name: &'a str,
+    pub audio_selected_device_id: Option<&'a str>,
+    pub audio_devices: &'a [AudioDeviceInfo],
+    pub audio_devices_refreshing: bool,
     pub audio_sample_rate: u32,
     pub audio_peak_db: f32,
     pub audio_state: AudioBadgeState,
     pub deck_res_label: &'a str,
+    pub deck_is_1080p: bool,
     pub gpu_label: &'a str,
     pub gpu_is_intel: bool,
     pub global_fps: f64,
@@ -455,16 +479,137 @@ fn draw_top_bar(
     interact: &mut UiInteractionState,
 ) {
     ui.horizontal_centered(|ui| {
-        ui.add_enabled(
-            false,
-            egui::Button::new(format!("{} v (2A-5)", state.audio_source_label)),
-        );
+        // 1. LIVE Audio Source Switch (`Live WASAPI` <-> `Test Audio`).
+        egui::ComboBox::from_id_salt("top_audio_source")
+            .selected_text(RichText::new(state.audio_source_label).strong())
+            .width(114.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(state.audio_is_live, "Live WASAPI")
+                    .on_hover_text("Capture real Windows system audio via WASAPI Loopback")
+                    .clicked()
+                    && !state.audio_is_live
+                {
+                    interact
+                        .top_bar_actions
+                        .push(TopBarAction::SetAudioSourceLive(true));
+                }
+                if ui
+                    .selectable_label(!state.audio_is_live, "Test Audio")
+                    .on_hover_text("Feed built-in synthetic beat + harmonic test signal (48 kHz)")
+                    .clicked()
+                    && state.audio_is_live
+                {
+                    interact
+                        .top_bar_actions
+                        .push(TopBarAction::SetAudioSourceLive(false));
+                }
+            });
 
-        let dev_short = truncate_chars(state.audio_device_name, 26);
-        ui.add_enabled(false, egui::Button::new(format!("{dev_short} v (2A-5)")));
+        // 2. LIVE Unplug-Safe Audio Device Dropdown (non-blocking background restart).
+        let dev_short = truncate_chars(state.audio_device_name, 22);
+        ui.add_enabled_ui(state.audio_is_live, |ui| {
+            let combo_resp = egui::ComboBox::from_id_salt("top_audio_device")
+                .selected_text(RichText::new(dev_short).strong())
+                .width(196.0)
+                .show_ui(ui, |ui| {
+                    let is_sys_default = state.audio_selected_device_id.is_none();
+                    if ui
+                        .selectable_label(is_sys_default, "System Default (Windows)")
+                        .on_hover_text("Capture whichever output device Windows uses by default")
+                        .clicked()
+                    {
+                        interact
+                            .top_bar_actions
+                            .push(TopBarAction::SelectAudioDevice {
+                                device_id: None,
+                                label: "System Default".to_string(),
+                            });
+                    }
+                    ui.separator();
+
+                    if state.audio_devices.is_empty() {
+                        ui.label(
+                            RichText::new("(No active output devices detected)")
+                                .color(TEXT_MUTED)
+                                .font(FontId::proportional(13.0)),
+                        );
+                    } else {
+                        for dev in state.audio_devices {
+                            let selected =
+                                state.audio_selected_device_id == Some(dev.id.as_str());
+                            let label = if dev.is_default {
+                                format!("{} [Default]", dev.name)
+                            } else {
+                                dev.name.clone()
+                            };
+                            if ui.selectable_label(selected, label).clicked() {
+                                interact
+                                    .top_bar_actions
+                                    .push(TopBarAction::SelectAudioDevice {
+                                        device_id: Some(dev.id.clone()),
+                                        label: dev.name.clone(),
+                                    });
+                            }
+                        }
+                    }
+
+                    ui.separator();
+                    let refresh_label = if state.audio_devices_refreshing {
+                        "Refreshing devices..."
+                    } else {
+                        "Refresh Devices"
+                    };
+                    if ui
+                        .add_enabled(
+                            !state.audio_devices_refreshing,
+                            egui::Button::new(refresh_label),
+                        )
+                        .clicked()
+                    {
+                        interact
+                            .top_bar_actions
+                            .push(TopBarAction::RefreshAudioDevices);
+                    }
+                    if ui
+                        .button("Reconnect Audio")
+                        .on_hover_text("Restart WASAPI loopback capture on the selected device")
+                        .clicked()
+                    {
+                        interact
+                            .top_bar_actions
+                            .push(TopBarAction::ReconnectAudio);
+                    }
+                });
+
+            // Opening the dropdown triggers a throttled background device-list refresh so newly
+            // plugged or unplugged USB audio interfaces show up cleanly without stalling OpenGL.
+            if combo_resp.response.clicked() {
+                interact
+                    .top_bar_actions
+                    .push(TopBarAction::RefreshAudioDevices);
+            }
+        });
 
         draw_peak_meter(ui, state.audio_peak_db);
         draw_audio_status_pill(ui, state.audio_state);
+        if state.audio_state == AudioBadgeState::DeviceLost {
+            let retry_btn = egui::Button::new(
+                RichText::new("Retry")
+                    .strong()
+                    .color(Color32::BLACK),
+            )
+            .fill(COLOR_WARN);
+            if ui
+                .add(retry_btn)
+                .on_hover_text("Reconnect WASAPI loopback capture (non-blocking)")
+                .clicked()
+            {
+                interact
+                    .top_bar_actions
+                    .push(TopBarAction::ReconnectAudio);
+            }
+        }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let (fps_bg, fps_fg) = if state.global_fps >= 55.0 {
@@ -524,10 +669,27 @@ fn draw_top_bar(
             }
 
             ui.add_enabled(false, egui::Button::new("Proj: OFF (2B)"));
-            ui.add_enabled(
-                false,
-                egui::Button::new(format!("Res: {} (2A-5)", state.deck_res_label)),
-            );
+
+            // LIVE Stage 2A-5 Runtime Deck + Master Resolution Toggle (720p <-> 1080p).
+            let res_label = format!("Res: {}", state.deck_res_label);
+            let res_btn = if state.deck_is_1080p {
+                egui::Button::new(RichText::new(res_label).strong().color(Color32::BLACK))
+                    .fill(ACCENT_DECK_A)
+            } else {
+                egui::Button::new(res_label)
+            };
+            if ui
+                .add(res_btn)
+                .on_hover_text(
+                    "Toggle internal render resolution for both decks + Master FBO (1280x720 <-> 1920x1080).\n\
+                     Default 720p during development per Light-Load Rules.",
+                )
+                .clicked()
+            {
+                interact
+                    .top_bar_actions
+                    .push(TopBarAction::ToggleDeckResolution);
+            }
         });
     });
 }
@@ -580,7 +742,13 @@ fn draw_audio_status_pill(ui: &mut egui::Ui, status: AudioBadgeState) {
         AudioBadgeState::Live => ("LIVE", Color32::from_rgb(16, 70, 44), COLOR_OK, 16.0),
         AudioBadgeState::Test => ("TEST", Color32::from_rgb(14, 60, 74), ACCENT_DECK_A, 16.0),
         AudioBadgeState::Silence => ("SILENCE", Color32::from_rgb(88, 62, 12), COLOR_WARN, 16.0),
-        AudioBadgeState::DeviceLost => ("! DEVICE LOST !", COLOR_ALERT, Color32::WHITE, 18.0),
+        AudioBadgeState::Switching => (
+            "SWITCHING...",
+            Color32::from_rgb(14, 60, 74),
+            ACCENT_DECK_A,
+            15.0,
+        ),
+        AudioBadgeState::DeviceLost => ("! DEVICE LOST !", COLOR_ALERT, Color32::WHITE, 17.5),
     };
     Frame::new()
         .fill(bg)

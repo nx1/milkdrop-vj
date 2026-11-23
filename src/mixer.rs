@@ -277,11 +277,11 @@ impl GpuMixer {
         self.master_texture
     }
 
-    /// Resizes `master_texture` when the user toggles deck resolution in Stage `2A-5`.
-    #[allow(dead_code)]
-    pub fn resize(&mut self, width: u32, height: u32) {
+    /// Resizes `master_texture` in-place when the user toggles deck resolution (`2A-5`),
+    /// preserving the GL texture handle so `egui` texture IDs stay valid without reallocation.
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
         if self.width == width && self.height == height {
-            return;
+            return Ok(());
         }
         self.width = width;
         self.height = height;
@@ -300,7 +300,24 @@ impl GpuMixer {
                 glow::PixelUnpackData::Slice(None),
             );
             self.gl.bind_texture(glow::TEXTURE_2D, None);
+
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
+            self.gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(self.master_texture),
+                0,
+            );
+            let status = self.gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                return Err(format!(
+                    "GPU mixer FBO incomplete after resize to {width}x{height} (status=0x{status:04X})"
+                ));
+            }
         }
+        Ok(())
     }
 
     /// Blends `tex_a` and `tex_b` into `master_texture` using the chosen blend mode,

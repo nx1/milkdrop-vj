@@ -8,12 +8,13 @@
 //!   or calling Windows audio APIs.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::audio::ring_buffer::{create_audio_ring, PopResult, RingConsumer};
 use crate::audio::wasapi_loopback::WasapiLoopbackSource;
-use crate::audio::{AudioSource, AudioStreamFormat};
+use crate::audio::{AudioDeviceInfo, AudioSource, AudioStreamFormat};
 
 /// Shared counters updated atomically by the capture thread for logging/UI.
 struct CaptureCounters {
@@ -185,5 +186,98 @@ impl Drop for LiveAudioCapture {
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+/// Result returned asynchronously by `AsyncAudioSwitch` after restarting WASAPI off-thread.
+pub enum AudioSwitchOutcome {
+    LiveReady {
+        request_id: u64,
+        requested_device_id: Option<String>,
+        capture: LiveAudioCapture,
+    },
+    LiveFailed {
+        request_id: u64,
+        requested_device_id: Option<String>,
+        error: String,
+    },
+}
+
+/// Non-blocking audio capture switcher (`2A-5`).
+///
+/// Drops any previous `LiveAudioCapture` (stopping + joining its thread) and starts a new
+/// WASAPI Loopback capture on a short-lived worker thread so the 60 FPS OpenGL loop never freezes.
+pub struct AsyncAudioSwitch {
+    rx: Receiver<AudioSwitchOutcome>,
+}
+
+impl AsyncAudioSwitch {
+    /// Stops `old_capture` and starts capturing from `device_id` (`None` = Windows default)
+    /// completely off the render thread.
+    pub fn spawn_live_switch(
+        old_capture: Option<LiveAudioCapture>,
+        device_id: Option<String>,
+        request_id: u64,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let _ = thread::Builder::new()
+            .name("wasapi-device-switch".to_string())
+            .spawn(move || {
+                // Stop & join old capture thread first while off the main OpenGL thread.
+                drop(old_capture);
+                let outcome = match LiveAudioCapture::start(device_id.clone()) {
+                    Ok(capture) => AudioSwitchOutcome::LiveReady {
+                        request_id,
+                        requested_device_id: device_id,
+                        capture,
+                    },
+                    Err(error) => AudioSwitchOutcome::LiveFailed {
+                        request_id,
+                        requested_device_id: device_id,
+                        error,
+                    },
+                };
+                let _ = tx.send(outcome);
+            });
+        Self { rx }
+    }
+
+    /// Stops and drops `old_capture` on a background thread (used when switching to Test Audio
+    /// so `thread.join()` never stalls the render loop).
+    pub fn stop_in_background(old_capture: Option<LiveAudioCapture>) {
+        if let Some(cap) = old_capture {
+            let _ = thread::Builder::new()
+                .name("wasapi-device-stop".to_string())
+                .spawn(move || {
+                    drop(cap);
+                });
+        }
+    }
+
+    /// Non-blocking poll called once per frame from the main loop.
+    pub fn poll(&self) -> Option<AudioSwitchOutcome> {
+        self.rx.try_recv().ok()
+    }
+}
+
+/// Non-blocking background Windows audio output device enumerator (`2A-5`).
+pub struct AsyncDeviceListRefresh {
+    rx: Receiver<Result<Vec<AudioDeviceInfo>, String>>,
+}
+
+impl AsyncDeviceListRefresh {
+    pub fn spawn() -> Self {
+        let (tx, rx) = mpsc::channel();
+        let _ = thread::Builder::new()
+            .name("wasapi-device-enum".to_string())
+            .spawn(move || {
+                let res = WasapiLoopbackSource::new().and_then(|src| src.list_devices());
+                let _ = tx.send(res);
+            });
+        Self { rx }
+    }
+
+    pub fn poll(&self) -> Option<Result<Vec<AudioDeviceInfo>, String>> {
+        self.rx.try_recv().ok()
     }
 }
