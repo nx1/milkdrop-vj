@@ -27,9 +27,11 @@ mod gl_log;
 mod gl_state;
 mod metrics;
 mod mixer;
+mod projector;
 mod render_deck;
 mod ui;
 
+use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -76,6 +78,9 @@ use crate::egui_renderer::EguiGlRenderer;
 use crate::gl_log::GlErrorLogger;
 use crate::metrics::{current_process_memory_mb, MemorySnapshotMb, TimingStats};
 use crate::mixer::{step_blackout_alpha, BlendMode, DeckAirState, GpuMixer};
+use crate::projector::{
+    enumerate_monitors, DisplayMonitorInfo, ProjectorTarget, ProjectorWindow,
+};
 use crate::render_deck::RenderDeck;
 use crate::ui::{
     apply_dark_venue_style, draw_console_ui, AudioBadgeState, ConsoleUiState, DeckUiSnapshot,
@@ -88,6 +93,13 @@ enum AudioMode {
     SyntheticTest,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectorCommand {
+    Open(ProjectorTarget),
+    Close,
+    RefreshMonitors,
+}
+
 #[derive(Clone, Debug)]
 struct CliConfig {
     audio_mode: AudioMode,
@@ -97,6 +109,7 @@ struct CliConfig {
     measure_gpu: bool,
     auto_exit_secs: Option<f64>,
     test_res_toggles: u32,
+    test_projector_windowed: bool,
     log_path: PathBuf,
 }
 
@@ -123,6 +136,12 @@ struct ConsoleState {
     deck_b_tex_id: egui::TextureId,
     deck_a: RenderDeck,
     deck_b: RenderDeck,
+    projector: Option<ProjectorWindow>,
+    monitors: Vec<DisplayMonitorInfo>,
+    pending_projector_cmd: Option<ProjectorCommand>,
+    master_fence: Option<glow::NativeFence>,
+    retired_master_fences: VecDeque<glow::NativeFence>,
+    test_projector_opened: bool,
     gl_display: Display,
     pbuffer_config: Config,
     window: Window,
@@ -210,7 +229,7 @@ impl ConsoleState {
     fn initialize(event_loop: &ActiveEventLoop, config: CliConfig) -> Result<Self, String> {
         let mut logger = GlErrorLogger::open(&config.log_path)?;
         logger.log_info(
-            "Stage 2A-5: Top Bar (Live/Test Audio Switch, Unplug-Safe Audio Device Dropdown, Runtime 720p/1080p Toggle)",
+            "Stage 2B: Borderless Fullscreen Projector Output Window (Shared GL Context, GL 5.3 Sync, Single-VSync Rule)",
         );
         logger.log_info(&format!(
             "Deck render resolution: {}x{} (default 1280x720 per Light-Load Rules) | measure_gpu={}",
@@ -276,9 +295,27 @@ impl ConsoleState {
         };
 
         // 3. Create the main winit window with minimum 1280x720 pt logical size (Section 13).
+        let monitors: Vec<DisplayMonitorInfo> = enumerate_monitors(event_loop)
+            .into_iter()
+            .map(|(info, _)| info)
+            .collect();
+        logger.log_info(&format!("Detected {} Windows display(s):", monitors.len()));
+        for m in &monitors {
+            logger.log_info(&format!(
+                "  - {}: `{}` pos=({}, {}) size={}x{} scale={:.2}",
+                m.short_label(),
+                m.name,
+                m.pos_x,
+                m.pos_y,
+                m.width,
+                m.height,
+                m.scale_factor
+            ));
+        }
+
         let window_attrs = Window::default_attributes()
             .with_title(format!(
-                "MilkDrop VJ — Stage 2A-5 Top Bar & Console ({}x{} decks)",
+                "MilkDrop VJ — Stage 2B Console & Projector ({}x{} decks)",
                 config.deck_width, config.deck_height
             ))
             .with_inner_size(LogicalSize::new(1440.0, 860.0))
@@ -494,6 +531,12 @@ impl ConsoleState {
             deck_b_tex_id,
             deck_a,
             deck_b,
+            projector: None,
+            monitors,
+            pending_projector_cmd: None,
+            master_fence: None,
+            retired_master_fences: VecDeque::with_capacity(8),
+            test_projector_opened: false,
             gl_display,
             pbuffer_config,
             window,
@@ -744,7 +787,112 @@ impl ConsoleState {
                     };
                     self.resize_decks_and_mixer(new_w, new_h);
                 }
+                TopBarAction::OpenProjector(target) => {
+                    self.pending_projector_cmd = Some(ProjectorCommand::Open(target));
+                }
+                TopBarAction::CloseProjector => {
+                    self.pending_projector_cmd = Some(ProjectorCommand::Close);
+                }
+                TopBarAction::RefreshMonitors => {
+                    self.pending_projector_cmd = Some(ProjectorCommand::RefreshMonitors);
+                }
             }
+        }
+    }
+
+    /// Executes queued Projector window open/close/refresh commands that require `&ActiveEventLoop`,
+    /// enforcing the Single-VSync swap-interval rule (`Projector=Wait(1), Console=DontWait`).
+    fn apply_pending_projector_command(&mut self, event_loop: &ActiveEventLoop) {
+        // Optional automated windowed Projector test (`--test-projector-windowed`).
+        if self.config.test_projector_windowed
+            && !self.test_projector_opened
+            && self.frame_count >= 10
+        {
+            self.test_projector_opened = true;
+            self.pending_projector_cmd =
+                Some(ProjectorCommand::Open(ProjectorTarget::WindowedPreview));
+        }
+
+        let Some(cmd) = self.pending_projector_cmd.take() else {
+            return;
+        };
+        match cmd {
+            ProjectorCommand::RefreshMonitors => {
+                self.monitors = enumerate_monitors(event_loop)
+                    .into_iter()
+                    .map(|(info, _)| info)
+                    .collect();
+                self.logger.log_info(&format!(
+                    "[PROJ] Refreshed Windows displays ({} connected)",
+                    self.monitors.len()
+                ));
+            }
+            ProjectorCommand::Open(target) => {
+                // Close any existing projector cleanly before opening on a new target.
+                if self.projector.is_some() {
+                    self.close_projector();
+                }
+                // Refresh monitor snapshot so indices match current Windows topology.
+                self.monitors = enumerate_monitors(event_loop)
+                    .into_iter()
+                    .map(|(info, _)| info)
+                    .collect();
+
+                match ProjectorWindow::open(
+                    event_loop,
+                    &self.gl_display,
+                    &self.main_context,
+                    target,
+                    &mut self.logger,
+                ) {
+                    Ok(proj) => {
+                        let lbl = proj.target_label().to_string();
+                        self.projector = Some(proj);
+                        // Re-bind main console context and disable VSync on Console so ONLY
+                        // the Projector waits for VSync (prevents 30 FPS halving!).
+                        if self.main_context.make_current(&self.main_surface).is_ok() {
+                            let _ = self
+                                .main_surface
+                                .set_swap_interval(&self.main_context, SwapInterval::DontWait);
+                        }
+                        self.logger.log_info(
+                            "[PROJ] Single-VSync active: Projector=Wait(1), Control Console=DontWait",
+                        );
+                        self.window.focus_window();
+                        self.interact
+                            .show_toast(format!("Projector ON: {lbl}"));
+                    }
+                    Err(err) => {
+                        let _ = self.main_context.make_current(&self.main_surface);
+                        self.logger
+                            .log_info(&format!("[PROJ-ERROR] Failed to open Projector: {err}"));
+                        self.interact
+                            .show_toast(format!("Projector failed: {err}"));
+                    }
+                }
+            }
+            ProjectorCommand::Close => {
+                self.close_projector();
+            }
+        }
+    }
+
+    /// Closes the Projector Output window cleanly and restores `Wait(1)` VSync on Control Console.
+    fn close_projector(&mut self) {
+        if let Some(mut proj) = self.projector.take() {
+            let lbl = proj.target_label().to_string();
+            proj.destroy();
+            drop(proj);
+            if self.main_context.make_current(&self.main_surface).is_ok() {
+                let _ = self.main_surface.set_swap_interval(
+                    &self.main_context,
+                    SwapInterval::Wait(NonZeroU32::new(1).unwrap()),
+                );
+            }
+            self.logger.log_info(&format!(
+                "[PROJ] Closed Projector (`{lbl}`); restored Control Console VSync=Wait(1)"
+            ));
+            self.interact.show_toast("Projector Output closed");
         }
     }
 
@@ -807,7 +955,7 @@ impl ConsoleState {
         self.config.deck_width = new_w;
         self.config.deck_height = new_h;
         self.window.set_title(&format!(
-            "MilkDrop VJ — Stage 2A-5 Top Bar & Console ({new_w}x{new_h} decks)"
+            "MilkDrop VJ — Stage 2B Console & Projector ({new_w}x{new_h} decks)"
         ));
 
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1645,6 +1793,22 @@ impl ConsoleState {
         }
 
         // 4b. Step smooth Emergency Blackout fade (`0.4s`) and render Master Output FBO.
+        // Retire previously signaled Master cross-context fences on the main context.
+        if let Some(prev_f) = self.master_fence.take() {
+            self.retired_master_fences.push_back(prev_f);
+        }
+        while let Some(&oldest) = self.retired_master_fences.front() {
+            let status = unsafe { self.main_gl.client_wait_sync(oldest, 0, 0) };
+            if status == glow::ALREADY_SIGNALED || status == glow::CONDITION_SATISFIED {
+                self.retired_master_fences.pop_front();
+                unsafe {
+                    self.main_gl.delete_sync(oldest);
+                }
+            } else {
+                break;
+            }
+        }
+
         let dt_secs = (frame_dt_ms / 1000.0) as f32;
         let blackout_on = self.bus.get_bool(param::MASTER_BLACKOUT);
         self.blackout_alpha = step_blackout_alpha(self.blackout_alpha, blackout_on, dt_secs);
@@ -1660,6 +1824,26 @@ impl ConsoleState {
             blend_mode,
             self.blackout_alpha,
         );
+        // OpenGL 3.3 Core Spec (Section 5.3): if the Projector window is open, insert a fence
+        // + glFlush() after writing `master_texture` so the Projector context can call GPU-only
+        // `glWaitSync` before sampling it.
+        if self.projector.is_some() {
+            match unsafe {
+                self.main_gl
+                    .fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)
+            } {
+                Ok(fence) => {
+                    unsafe {
+                        self.main_gl.flush();
+                    }
+                    self.master_fence = Some(fence);
+                }
+                Err(e) => {
+                    self.logger
+                        .log_info(&format!("[ERROR] Master glFenceSync failed: {e}"));
+                }
+            }
+        }
         self.logger
             .check_frame(&self.main_gl, self.frame_count, "main-mixer");
 
@@ -1728,6 +1912,9 @@ impl ConsoleState {
             audio_state: audio_badge,
             deck_res_label: &deck_res_label,
             deck_is_1080p: self.config.deck_height >= 1080,
+            projector_active_label: self.projector.as_ref().map(|p| p.target_label()),
+            projector_renderer: self.projector.as_ref().map(|p| p.renderer_name()),
+            monitors: &self.monitors,
             gpu_label: &self.gpu_label,
             gpu_is_intel: self.gpu_is_intel,
             global_fps: self.global_fps,
@@ -1790,6 +1977,22 @@ impl ConsoleState {
                 .log_info(&format!("[ERROR] swap_buffers failed: {e}"));
         }
 
+        // 6b. If Projector Output is open, blit `master_texture` with aspect-preserving letterbox
+        //     after GPU-only `glWaitSync(master_fence)` and swap with VSync `Wait(1)`.
+        if let Some(ref proj) = self.projector {
+            let src_aspect = self.config.deck_width as f32 / self.config.deck_height.max(1) as f32;
+            if let Err(e) = proj.render_and_swap(
+                self.mixer.master_texture(),
+                self.master_fence,
+                src_aspect,
+                self.frame_count,
+                &mut self.logger,
+            ) {
+                self.logger
+                    .log_info(&format!("[PROJ-ERROR] Projector render failed: {e}"));
+            }
+        }
+
         // 7. Log preset-load frame (+0) and next two frames (+1, +2) for Risk 8 stall visibility.
         let total_frame_work_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
         self.record_pending_stall_traces(
@@ -1805,12 +2008,14 @@ impl ConsoleState {
             let mem_str = current_process_memory_mb()
                 .map(|m| format!("WS={:.1}MiB PC={:.1}MiB", m.working_set_mb, m.private_commit_mb))
                 .unwrap_or_else(|| "mem=n/a".to_string());
+            let proj_str = if self.projector.is_some() { "ON" } else { "OFF" };
             self.logger.log_info(&format!(
-                "t={:5.1}s | FPS={:5.1} | DeckA={:4.2}ms | DeckB={:4.2}ms | BlankPBO={:5.1}us | GL_err={} | {}",
+                "t={:5.1}s | FPS={:5.1} | DeckA={:4.2}ms | DeckB={:4.2}ms | Proj={} | BlankPBO={:5.1}us | GL_err={} | {}",
                 self.start_time.elapsed().as_secs_f64(),
                 self.global_fps,
                 self.deck_a_ms_ema,
                 self.deck_b_ms_ema,
+                proj_str,
                 self.blank_check_stats.avg_ms() * 1000.0,
                 self.logger.total_errors(),
                 mem_str
@@ -1923,7 +2128,7 @@ impl ConsoleState {
         };
         let end_mem = current_process_memory_mb();
 
-        self.logger.log_info("=== Stage 2A-5 Shutdown Summary (provisional, laptop-limited) ===");
+        self.logger.log_info("=== Stage 2B Shutdown Summary (provisional, laptop-limited) ===");
         self.logger.log_info(&format!(
             "Elapsed: {:.2}s | Frames: {} | Avg FPS: {:.2} | Total GL errors: {}",
             elapsed,
@@ -1967,8 +2172,21 @@ impl ConsoleState {
             ));
         }
 
-        // Clean GPU teardown: destroy mixer + egui renderer on main context, then destroy both decks.
+        // Clean GPU teardown: destroy Projector first, then main context fences/mixer/egui, then decks.
+        if let Some(mut proj) = self.projector.take() {
+            proj.destroy();
+        }
         if self.main_context.make_current(&self.main_surface).is_ok() {
+            if let Some(fence) = self.master_fence.take() {
+                unsafe {
+                    self.main_gl.delete_sync(fence);
+                }
+            }
+            while let Some(fence) = self.retired_master_fences.pop_front() {
+                unsafe {
+                    self.main_gl.delete_sync(fence);
+                }
+            }
             self.mixer.destroy();
             self.egui_renderer.destroy();
         }
@@ -1977,7 +2195,7 @@ impl ConsoleState {
         self.live_capture.take();
 
         println!(
-            "Stage 2A-5 closed cleanly. Frames={}, Avg FPS={:.2}, Presets={}, BlankPBO avg={:.1} us, GL errors={}, log={}",
+            "Stage 2B closed cleanly. Frames={}, Avg FPS={:.2}, Presets={}, BlankPBO avg={:.1} us, GL errors={}, log={}",
             self.frame_count,
             avg_fps,
             self.presets.len(),
@@ -2009,10 +2227,44 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+
+        // Handle Projector Output window events separately so closing the Projector never quits
+        // the Control Console, while live performance hotkeys (like Backspace blackout) still work!
+        let is_projector_window = state
+            .projector
+            .as_ref()
+            .map(|p| p.window_id() == window_id)
+            .unwrap_or(false);
+        if is_projector_window {
+            match event {
+                WindowEvent::ModifiersChanged(new_mods) => {
+                    state.modifiers = new_mods.state();
+                }
+                WindowEvent::KeyboardInput {
+                    event: key_event, ..
+                } => {
+                    state.handle_keyboard_event(&key_event);
+                }
+                WindowEvent::Resized(new_size) => {
+                    if let Some(ref proj) = state.projector {
+                        proj.resize(new_size.width, new_size.height);
+                    }
+                }
+                WindowEvent::CloseRequested => {
+                    state.close_projector();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if window_id != state.window.id() {
+            return;
+        }
 
         if let WindowEvent::ModifiersChanged(new_mods) = &event {
             state.modifiers = new_mods.state();
@@ -2051,6 +2303,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                state.apply_pending_projector_command(event_loop);
                 state.render_frame();
                 if let Some(limit_s) = state.config.auto_exit_secs {
                     if state.start_time.elapsed().as_secs_f64() >= limit_s {
@@ -2208,7 +2461,8 @@ fn parse_cli_args() -> Result<CliConfig, String> {
         measure_gpu: false,
         auto_exit_secs: None,
         test_res_toggles: 0,
-        log_path: PathBuf::from("logs").join("stage_2a5.log"),
+        test_projector_windowed: false,
+        log_path: PathBuf::from("logs").join("stage_2b.log"),
     };
 
     let mut args = std::env::args().skip(1);
@@ -2267,6 +2521,7 @@ fn parse_cli_args() -> Result<CliConfig, String> {
                     .parse::<u32>()
                     .map_err(|_| format!("Invalid --test-res-toggles `{val}`"))?;
             }
+            "--test-projector-windowed" => cfg.test_projector_windowed = true,
             "--log" => {
                 let val = args
                     .next()

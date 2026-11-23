@@ -1,4 +1,4 @@
-//! Dark-Venue Traktor-Style `egui 0.37` Console UI (Milestone 2 — Stage `2A-5`).
+//! Dark-Venue Traktor-Style `egui 0.37` Console UI (Milestone 2 — Stage `2B`).
 //!
 //! Layout specification: Section 13 of `docs/project_research_and_design.md`.
 //! - All sizes are in `egui` logical points (`pt`), automatically scaled by Windows DPI.
@@ -8,9 +8,8 @@
 //! - Every working control (crossfader, cuts, blend modes, blackout, deck load buttons,
 //!   browser row Load A/B buttons, transition mode, and remappable keyboard bindings)
 //!   reads and writes through the unified `ControlBus` (`0.0..=1.0`) and `mappings.json`.
-//! - Top Bar (`2A-5`): live Audio Source switch, unplug-safe Audio Device dropdown,
-//!   and runtime `720p` <-> `1080p` deck resolution toggle.
-//! - Controls arriving in `2B` (`Proj: OFF`) remain greyed out until implemented.
+//! - Top Bar (`2A-5` + `2B`): live Audio Source switch, unplug-safe Audio Device dropdown,
+//!   runtime `720p` <-> `1080p` deck toggle, and Borderless Fullscreen Projector Output menu.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -21,6 +20,7 @@ use egui::{
 };
 
 use crate::mixer::{BlendMode, DeckAirState};
+use crate::projector::{DisplayMonitorInfo, ProjectorTarget};
 use crate::render_deck::BlankDeckStatus;
 use milkdrop_vj::audio::AudioDeviceInfo;
 use milkdrop_vj::control::{param, ControlBus, MappingMode, BLEND_MODE_COUNT};
@@ -113,6 +113,9 @@ pub enum TopBarAction {
     RefreshAudioDevices,
     ReconnectAudio,
     ToggleDeckResolution,
+    OpenProjector(ProjectorTarget),
+    CloseProjector,
+    RefreshMonitors,
 }
 
 /// User curation actions emitted by UI widgets and persisted to `playlists.json` by `main.rs`.
@@ -267,6 +270,9 @@ pub struct ConsoleUiState<'a> {
     pub audio_state: AudioBadgeState,
     pub deck_res_label: &'a str,
     pub deck_is_1080p: bool,
+    pub projector_active_label: Option<&'a str>,
+    pub projector_renderer: Option<&'a str>,
+    pub monitors: &'a [DisplayMonitorInfo],
     pub gpu_label: &'a str,
     pub gpu_is_intel: bool,
     pub global_fps: f64,
@@ -668,7 +674,96 @@ fn draw_top_bar(
                 interact.remapping_idx = None;
             }
 
-            ui.add_enabled(false, egui::Button::new("Proj: OFF (2B)"));
+            // LIVE Stage 2B Projector Output menu (borderless fullscreen on external display or windowed preview).
+            let proj_is_on = state.projector_active_label.is_some();
+            let proj_btn_text = if proj_is_on {
+                RichText::new("Proj: ON").strong().color(Color32::BLACK)
+            } else {
+                RichText::new("Proj: OFF").strong().color(TEXT_PRIMARY)
+            };
+            let proj_menu_resp = ui.scope(|ui| {
+                if proj_is_on {
+                    ui.visuals_mut().widgets.inactive.weak_bg_fill = COLOR_OK;
+                    ui.visuals_mut().widgets.hovered.weak_bg_fill = COLOR_OK;
+                    ui.visuals_mut().widgets.active.weak_bg_fill = COLOR_OK;
+                }
+                ui.menu_button(proj_btn_text, |ui| {
+                    if let Some(active_lbl) = state.projector_active_label {
+                        ui.label(
+                            RichText::new(format!("Active: {active_lbl}"))
+                                .strong()
+                                .color(COLOR_OK),
+                        );
+                        if let Some(gpu_r) = state.projector_renderer {
+                            ui.label(
+                                RichText::new(format!("GPU: {}", truncate_chars(gpu_r, 36)))
+                                    .font(FontId::monospace(12.0))
+                                    .color(TEXT_MUTED),
+                            );
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Close Projector Output")
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(COLOR_ALERT),
+                            )
+                            .clicked()
+                        {
+                            interact.top_bar_actions.push(TopBarAction::CloseProjector);
+                            ui.close();
+                        }
+                        ui.separator();
+                    }
+
+                    ui.label(
+                        RichText::new("Borderless Fullscreen Display:")
+                            .font(FontId::proportional(13.0))
+                            .color(TEXT_MUTED),
+                    );
+                    // Show external monitors first so the audience projector is right at the top.
+                    let mut ordered: Vec<&DisplayMonitorInfo> = state.monitors.iter().collect();
+                    ordered.sort_by_key(|m| (m.is_primary, m.index));
+                    if ordered.is_empty() {
+                        ui.label(RichText::new("(No displays reported)").color(TEXT_MUTED));
+                    } else {
+                        for mon in ordered {
+                            if ui.button(mon.short_label()).clicked() {
+                                interact.top_bar_actions.push(TopBarAction::OpenProjector(
+                                    ProjectorTarget::Monitor(mon.index),
+                                ));
+                                ui.close();
+                            }
+                        }
+                    }
+
+                    ui.separator();
+                    if ui
+                        .button("Windowed Preview (1280x720)")
+                        .on_hover_text(
+                            "Open a resizable Projector preview window (useful on a single-screen laptop)",
+                        )
+                        .clicked()
+                    {
+                        interact.top_bar_actions.push(TopBarAction::OpenProjector(
+                            ProjectorTarget::WindowedPreview,
+                        ));
+                        ui.close();
+                    }
+                    if ui.button("Refresh Displays").clicked() {
+                        interact
+                            .top_bar_actions
+                            .push(TopBarAction::RefreshMonitors);
+                    }
+                })
+            });
+            if proj_menu_resp.inner.response.clicked() {
+                interact
+                    .top_bar_actions
+                    .push(TopBarAction::RefreshMonitors);
+            }
 
             // LIVE Stage 2A-5 Runtime Deck + Master Resolution Toggle (720p <-> 1080p).
             let res_label = format!("Res: {}", state.deck_res_label);
