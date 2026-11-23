@@ -339,7 +339,7 @@ pub fn draw_console_ui(
     load_guard.expire_if_needed();
 
     let window_h = ui.ctx().content_rect().height().max(720.0);
-    let stage_h = (window_h * 0.42).clamp(328.0, 454.0);
+    let stage_h = (window_h * 0.40).clamp(312.0, 440.0);
     let shift_held = ui.input(|i| i.modifiers.shift);
 
     // Derive ON-AIR / MIXED / CUE live states strictly from Control Bus crossfader position.
@@ -382,7 +382,7 @@ pub fn draw_console_ui(
                 .inner_margin(Margin::symmetric(10, 6)),
         )
         .show(ui, |ui| {
-            let preview_h_from_stage = (stage_h - 154.0).max(145.0);
+            let preview_h_from_stage = (stage_h - 150.0).max(140.0);
             ui.columns(3, |cols| {
                 draw_deck_column(
                     &mut cols[0],
@@ -447,6 +447,19 @@ pub fn draw_console_ui(
             });
         });
 
+    // 3b. LIVE GPU EFFECT RACKS BAR (Stage 3C: FX1 Color/Geo + FX2 Performance/Punch) — 34 pt.
+    egui::Panel::top("fx_racks_bar")
+        .exact_size(34.0)
+        .frame(
+            Frame::new()
+                .fill(BG_CARD)
+                .inner_margin(Margin::symmetric(12, 4))
+                .stroke(Stroke::new(1.0, BORDER_SUBTLE)),
+        )
+        .show(ui, |ui| {
+            draw_fx_racks_bar(ui, bus, state.beat_bpm);
+        });
+
     // 4. CONDITIONAL 30 pt AMBER TYPING BANNER — shown ONLY while Search box has focus.
     if interact.search_focused {
         egui::Panel::top("typing_mode_banner")
@@ -500,6 +513,259 @@ pub fn draw_console_ui(
     if interact.playlists_modal_open {
         draw_playlists_modal(ui.ctx(), state.playlists, interact);
     }
+}
+
+/// Compact 34 pt horizontal bar for Milestone 3 Stage `3C` GPU Effect Racks (`FX1` + `FX2`).
+fn draw_fx_racks_bar(ui: &mut egui::Ui, bus: &mut ControlBus, beat_bpm: Option<f64>) {
+    let hint_kaleid = bus
+        .mappings
+        .hint_for_target(param::MASTER_FX_KALEIDOSCOPE, MappingMode::Momentary);
+    let hint_invert = bus
+        .mappings
+        .hint_for_target(param::MASTER_FX_INVERT, MappingMode::Momentary);
+    let hint_strobe = bus
+        .mappings
+        .hint_for_target(param::MASTER_FX_STROBE, MappingMode::Momentary);
+    let hint_freeze = bus
+        .mappings
+        .hint_for_target(param::MASTER_FX_FREEZE, MappingMode::Momentary);
+
+    ui.horizontal_centered(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+
+        // --- FX1: Color & Geometry ---
+        ui.label(
+            RichText::new("FX1 COLOR/GEO")
+                .font(FontId::monospace(12.0))
+                .strong()
+                .color(ACCENT_DECK_A),
+        );
+
+        let mut hue = bus.get(param::MASTER_FX_HUE);
+        let hue_deg = (hue * 360.0).round() as u32;
+        ui.label(
+            RichText::new(format!("Hue {hue_deg:>3}°"))
+                .font(FontId::monospace(12.0))
+                .color(if hue > 0.01 { ACCENT_DECK_A } else { TEXT_MUTED }),
+        );
+        ui.spacing_mut().slider_width = 74.0;
+        let hue_resp = ui
+            .add(egui::Slider::new(&mut hue, 0.0..=1.0).show_value(false))
+            .on_hover_text(
+                "Hue Shift (0°-360°, luminance-preserving YIQ rotation).\nDouble-click slider to reset to 0°.",
+            );
+        if slider_double_clicked(ui, &hue_resp) {
+            bus.set(param::MASTER_FX_HUE, 0.0);
+        } else if hue_resp.changed() {
+            bus.set(param::MASTER_FX_HUE, hue);
+        }
+
+        let mut kaleid = bus.get(param::MASTER_FX_KALEIDOSCOPE);
+        let kaleid_active = kaleid >= 0.05;
+        let kaleid_mode = if kaleid < 0.05 {
+            "Off"
+        } else if kaleid < 0.28 {
+            "Mirror 2x"
+        } else if kaleid < 0.55 {
+            "4-way"
+        } else if kaleid < 0.82 {
+            "6-way"
+        } else {
+            "8-way"
+        };
+        let kaleid_btn = if kaleid_active {
+            egui::Button::new(
+                RichText::new(format!("Kaleid [{hint_kaleid}]"))
+                    .font(FontId::monospace(12.0))
+                    .strong()
+                    .color(Color32::BLACK),
+            )
+            .fill(ACCENT_DECK_A)
+        } else {
+            egui::Button::new(
+                RichText::new(format!("Kaleid [{hint_kaleid}]"))
+                    .font(FontId::monospace(12.0))
+                    .color(TEXT_PRIMARY),
+            )
+        };
+        if ui
+            .add(kaleid_btn)
+            .on_hover_text(format!(
+                "Mirror / Kaleidoscope ({kaleid_mode}). Click to latch 6-way, or hold [{hint_kaleid}] for momentary."
+            ))
+            .clicked()
+        {
+            bus.set(
+                param::MASTER_FX_KALEIDOSCOPE,
+                if kaleid_active { 0.0 } else { 0.67 },
+            );
+            kaleid = bus.get(param::MASTER_FX_KALEIDOSCOPE);
+        }
+        ui.spacing_mut().slider_width = 62.0;
+        let kaleid_resp = ui
+            .add(egui::Slider::new(&mut kaleid, 0.0..=1.0).show_value(false))
+            .on_hover_text(format!(
+                "Kaleidoscope symmetry: {kaleid_mode} (Off -> Mirror -> 4x -> 6x -> 8x).\nDouble-click slider to turn Off."
+            ));
+        if slider_double_clicked(ui, &kaleid_resp) {
+            bus.set(param::MASTER_FX_KALEIDOSCOPE, 0.0);
+        } else if kaleid_resp.changed() {
+            bus.set(param::MASTER_FX_KALEIDOSCOPE, kaleid);
+        }
+
+        let invert_on = bus.get_bool(param::MASTER_FX_INVERT);
+        let invert_btn = if invert_on {
+            egui::Button::new(
+                RichText::new(format!("Invert [{hint_invert}]"))
+                    .font(FontId::monospace(12.0))
+                    .strong()
+                    .color(Color32::WHITE),
+            )
+            .fill(Color32::from_rgb(190, 48, 165))
+        } else {
+            egui::Button::new(
+                RichText::new(format!("Invert [{hint_invert}]"))
+                    .font(FontId::monospace(12.0))
+                    .color(TEXT_PRIMARY),
+            )
+        };
+        if ui
+            .add(invert_btn)
+            .on_hover_text(format!(
+                "Instant Color Invert. Click to latch, or hold [{hint_invert}] for a momentary flash."
+            ))
+            .clicked()
+        {
+            bus.toggle(param::MASTER_FX_INVERT);
+        }
+
+        ui.separator();
+
+        // --- FX2: Performance & Punch ---
+        ui.label(
+            RichText::new("FX2 PERFORMANCE")
+                .font(FontId::monospace(12.0))
+                .strong()
+                .color(ACCENT_DECK_B),
+        );
+
+        let strobe_on = bus.get_bool(param::MASTER_FX_STROBE);
+        let strobe_rate_desc = match beat_bpm {
+            Some(bpm) => format!("synced to {bpm:.1} BPM (16th notes)"),
+            None => "12 Hz (tap BPM with [T] to sync)".to_string(),
+        };
+        let strobe_btn = if strobe_on {
+            egui::Button::new(
+                RichText::new(format!("Strobe [{hint_strobe}]"))
+                    .font(FontId::monospace(12.0))
+                    .strong()
+                    .color(Color32::BLACK),
+            )
+            .fill(COLOR_WARN)
+        } else {
+            egui::Button::new(
+                RichText::new(format!("Strobe [{hint_strobe}]"))
+                    .font(FontId::monospace(12.0))
+                    .color(TEXT_PRIMARY),
+            )
+        };
+        if ui
+            .add(strobe_btn)
+            .on_hover_text(format!(
+                "Live Strobe ({strobe_rate_desc}). Hold [{hint_strobe}] for momentary burst, or click to latch."
+            ))
+            .clicked()
+        {
+            bus.toggle(param::MASTER_FX_STROBE);
+        }
+
+        let freeze_on = bus.get_bool(param::MASTER_FX_FREEZE);
+        let freeze_btn = if freeze_on {
+            egui::Button::new(
+                RichText::new(format!("Freeze [{hint_freeze}]"))
+                    .font(FontId::monospace(12.0))
+                    .strong()
+                    .color(Color32::BLACK),
+            )
+            .fill(ACCENT_DECK_A)
+        } else {
+            egui::Button::new(
+                RichText::new(format!("Freeze [{hint_freeze}]"))
+                    .font(FontId::monospace(12.0))
+                    .color(TEXT_PRIMARY),
+            )
+        };
+        if ui
+            .add(freeze_btn)
+            .on_hover_text(format!(
+                "Frame Freeze: holds the clean Deck A/B frame while FX1, Strobe, and Blackout stay live.\nHold [{hint_freeze}] for momentary freeze, or click to latch."
+            ))
+            .clicked()
+        {
+            bus.toggle(param::MASTER_FX_FREEZE);
+        }
+
+        let zoom_on = bus.get_bool(param::MASTER_FX_ZOOM_PUNCH);
+        let zoom_btn = if zoom_on {
+            egui::Button::new(
+                RichText::new("Beat Zoom: ON")
+                    .font(FontId::monospace(12.0))
+                    .strong()
+                    .color(Color32::BLACK),
+            )
+            .fill(COLOR_OK)
+        } else {
+            egui::Button::new(
+                RichText::new("Beat Zoom: OFF")
+                    .font(FontId::monospace(12.0))
+                    .color(TEXT_MUTED),
+            )
+        };
+        if ui
+            .add(zoom_btn)
+            .on_hover_text(
+                "Beat Zoom-Punch: adds a crisp GPU center zoom kick whenever you press Beat [Space] or Auto-Pulse fires.",
+            )
+            .clicked()
+        {
+            bus.toggle(param::MASTER_FX_ZOOM_PUNCH);
+        }
+
+        // Right-aligned one-click Reset FX button.
+        let any_fx_active = bus.get(param::MASTER_FX_HUE) > 0.01
+            || bus.get(param::MASTER_FX_KALEIDOSCOPE) > 0.01
+            || bus.get_bool(param::MASTER_FX_INVERT)
+            || bus.get_bool(param::MASTER_FX_STROBE)
+            || bus.get_bool(param::MASTER_FX_FREEZE);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let reset_btn = if any_fx_active {
+                egui::Button::new(
+                    RichText::new("Reset FX")
+                        .font(FontId::monospace(12.0))
+                        .strong()
+                        .color(Color32::BLACK),
+                )
+                .fill(COLOR_WARN)
+            } else {
+                egui::Button::new(
+                    RichText::new("Reset FX")
+                        .font(FontId::monospace(12.0))
+                        .color(TEXT_MUTED),
+                )
+            };
+            if ui
+                .add(reset_btn)
+                .on_hover_text("Turn off Hue, Kaleidoscope, Invert, Strobe, and Freeze immediately")
+                .clicked()
+            {
+                bus.set(param::MASTER_FX_HUE, 0.0);
+                bus.set(param::MASTER_FX_KALEIDOSCOPE, 0.0);
+                bus.set(param::MASTER_FX_INVERT, 0.0);
+                bus.set(param::MASTER_FX_STROBE, 0.0);
+                bus.set(param::MASTER_FX_FREEZE, 0.0);
+            }
+        });
+    });
 }
 
 fn draw_top_bar(

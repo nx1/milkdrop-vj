@@ -46,6 +46,14 @@ pub mod param {
     pub const MASTER_BEAT_AUTO: &str = "master.beat_auto";
     pub const MASTER_BEAT_STRENGTH: &str = "master.beat_strength";
 
+    // Milestone 3 (3C): Two Live GPU Effect Racks (FX1 Color/Geo + FX2 Performance/Punch).
+    pub const MASTER_FX_HUE: &str = "master.fx.hue";
+    pub const MASTER_FX_KALEIDOSCOPE: &str = "master.fx.kaleidoscope";
+    pub const MASTER_FX_INVERT: &str = "master.fx.invert";
+    pub const MASTER_FX_STROBE: &str = "master.fx.strobe";
+    pub const MASTER_FX_FREEZE: &str = "master.fx.freeze";
+    pub const MASTER_FX_ZOOM_PUNCH: &str = "master.fx.zoom_punch";
+
     // One-shot trigger targets (queued as actions rather than stored as continuous values).
     pub const DECK_A_PREV_PRESET: &str = "deck_a.prev_preset";
     pub const DECK_A_NEXT_PRESET: &str = "deck_a.next_preset";
@@ -399,6 +407,51 @@ impl Default for MappingsConfig {
                     hard_cut: false,
                     force_on_air: false,
                 },
+                // Milestone 3 (3C): Momentary Master GPU FX (Z/X/C/V — release returns to 0.0).
+                KeyboardMapping {
+                    key: "Z".to_string(),
+                    modifiers: vec![],
+                    target: param::MASTER_FX_STROBE.to_string(),
+                    mode: MappingMode::Momentary,
+                    value: Some(1.0),
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "X".to_string(),
+                    modifiers: vec![],
+                    target: param::MASTER_FX_INVERT.to_string(),
+                    mode: MappingMode::Momentary,
+                    value: Some(1.0),
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "C".to_string(),
+                    modifiers: vec![],
+                    target: param::MASTER_FX_KALEIDOSCOPE.to_string(),
+                    mode: MappingMode::Momentary,
+                    value: Some(0.67),
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "V".to_string(),
+                    modifiers: vec![],
+                    target: param::MASTER_FX_FREEZE.to_string(),
+                    mode: MappingMode::Momentary,
+                    value: Some(1.0),
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
             ],
             midi: vec![
                 MidiMapping {
@@ -516,6 +569,18 @@ impl KeyboardMapping {
             }
             (param::MASTER_TAP_TEMPO, MappingMode::Trigger, _, _, _, _) => {
                 "Master: Tap Tempo".to_string()
+            }
+            (param::MASTER_FX_STROBE, MappingMode::Momentary, _, _, _, _) => {
+                "FX2: Strobe (Hold)".to_string()
+            }
+            (param::MASTER_FX_INVERT, MappingMode::Momentary, _, _, _, _) => {
+                "FX1: Color Invert (Hold)".to_string()
+            }
+            (param::MASTER_FX_KALEIDOSCOPE, MappingMode::Momentary, _, _, _, _) => {
+                "FX1: Kaleidoscope (Hold)".to_string()
+            }
+            (param::MASTER_FX_FREEZE, MappingMode::Momentary, _, _, _, _) => {
+                "FX2: Freeze Frame (Hold)".to_string()
             }
             _ => format!("{} ({:?})", self.target, self.mode),
         }
@@ -769,6 +834,13 @@ impl ControlBus {
         // Milestone 3 (3B): Beat Pulse strength (0.75 = punchy default) & Auto-Pulse OFF.
         params.insert(param::MASTER_BEAT_AUTO.to_string(), 0.0);
         params.insert(param::MASTER_BEAT_STRENGTH.to_string(), 0.75);
+        // Milestone 3 (3C): Two GPU Effect Racks (all FX off at startup; Beat Zoom-Punch ON).
+        params.insert(param::MASTER_FX_HUE.to_string(), 0.0);
+        params.insert(param::MASTER_FX_KALEIDOSCOPE.to_string(), 0.0);
+        params.insert(param::MASTER_FX_INVERT.to_string(), 0.0);
+        params.insert(param::MASTER_FX_STROBE.to_string(), 0.0);
+        params.insert(param::MASTER_FX_FREEZE.to_string(), 0.0);
+        params.insert(param::MASTER_FX_ZOOM_PUNCH.to_string(), 1.0);
 
         Self {
             params,

@@ -79,7 +79,9 @@ use milkdrop_vj::test_audio::TestAudioGenerator;
 use crate::egui_renderer::EguiGlRenderer;
 use crate::gl_log::GlErrorLogger;
 use crate::metrics::{current_process_memory_mb, MemorySnapshotMb, TimingStats};
-use crate::mixer::{step_blackout_alpha, BlendMode, DeckAirState, GpuMixer};
+use crate::mixer::{
+    compute_strobe_flash, step_blackout_alpha, BlendMode, DeckAirState, GpuMixer, MasterFxParams,
+};
 use crate::projector::{
     enumerate_monitors, DisplayMonitorInfo, ProjectorTarget, ProjectorWindow,
 };
@@ -156,6 +158,7 @@ struct ConsoleState {
     load_guard: LoadGuardState,
     interact: UiInteractionState,
     modifiers: ModifiersState,
+    held_momentary_targets: Vec<String>,
     blackout_alpha: f32,
     mappings_status: String,
 
@@ -236,7 +239,7 @@ impl ConsoleState {
     fn initialize(event_loop: &ActiveEventLoop, config: CliConfig) -> Result<Self, String> {
         let mut logger = GlErrorLogger::open(&config.log_path)?;
         logger.log_info(
-            "Milestone 3 Stage 3B: Manual Beat Pulse (Space), Tap Tempo (T), Auto-Pulse, & Slider Double-Click Reset Fix",
+            "Milestone 3 Stage 3C: Two Live GPU Effect Racks (FX1 Hue/Kaleid/Invert + FX2 Strobe/Freeze/Beat Zoom-Punch)",
         );
         logger.log_info(&format!(
             "Deck render resolution: {}x{} (default 1280x720 per Light-Load Rules) | measure_gpu={}",
@@ -322,7 +325,7 @@ impl ConsoleState {
 
         let window_attrs = Window::default_attributes()
             .with_title(format!(
-                "MilkDrop VJ — Stage 2B Console & Projector ({}x{} decks)",
+                "MilkDrop VJ — Stage 3C Console & FX Racks ({}x{} decks)",
                 config.deck_width, config.deck_height
             ))
             .with_inner_size(LogicalSize::new(1440.0, 860.0))
@@ -554,6 +557,7 @@ impl ConsoleState {
             load_guard: LoadGuardState::default(),
             interact: UiInteractionState::default(),
             modifiers: ModifiersState::empty(),
+            held_momentary_targets: Vec::new(),
             blackout_alpha: 0.0,
             mappings_status,
             gpu_label,
@@ -967,7 +971,7 @@ impl ConsoleState {
         self.config.deck_width = new_w;
         self.config.deck_height = new_h;
         self.window.set_title(&format!(
-            "MilkDrop VJ — Stage 2B Console & Projector ({new_w}x{new_h} decks)"
+            "MilkDrop VJ — Stage 3C Console & FX Racks ({new_w}x{new_h} decks)"
         ));
 
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1589,13 +1593,31 @@ impl ConsoleState {
         }
 
         for mapping in matches {
-            // Allow key repeat ONLY for Nudge (smooth crossfader sliding); ignore repeat on Toggle/Trigger/Cycle/Set.
+            // Allow key repeat ONLY for Nudge (smooth crossfader sliding); ignore repeat on Toggle/Trigger/Cycle/Set/Momentary.
             if event.repeat && mapping.mode != MappingMode::Nudge {
                 continue;
+            }
+            if mapping.mode == MappingMode::Momentary {
+                if pressed {
+                    if !self.held_momentary_targets.contains(&mapping.target) {
+                        self.held_momentary_targets.push(mapping.target.clone());
+                    }
+                } else {
+                    self.held_momentary_targets
+                        .retain(|t| t != &mapping.target);
+                }
             }
             self.bus.apply_keyboard_mapping(&mapping, pressed);
         }
         true
+    }
+
+    /// Safely releases any momentary keyboard FX (`Z`/`X`/`C`/`V`) if the window loses focus
+    /// while a key is held down, without disturbing FX latched with the mouse.
+    fn release_held_momentary_keys(&mut self) {
+        for target in self.held_momentary_targets.drain(..) {
+            self.bus.set(&target, 0.0);
+        }
     }
 
     fn step_browser_selection(&mut self, delta: isize) {
@@ -1889,12 +1911,31 @@ impl ConsoleState {
             .bus
             .get_discrete_index(param::MIXER_BLEND_MODE, BLEND_MODE_COUNT);
         let blend_mode = BlendMode::from_index(blend_idx);
+        let strobe_flash = compute_strobe_flash(
+            self.bus.get(param::MASTER_FX_STROBE),
+            self.start_time.elapsed().as_secs_f64(),
+            self.beat_pulse.bpm(),
+        );
+        let zoom_punch = if self.bus.get_bool(param::MASTER_FX_ZOOM_PUNCH) {
+            self.beat_pulse.ui_flash()
+        } else {
+            0.0
+        };
+        let fx = MasterFxParams {
+            hue_shift: self.bus.get(param::MASTER_FX_HUE),
+            kaleidoscope: self.bus.get(param::MASTER_FX_KALEIDOSCOPE),
+            invert: self.bus.get(param::MASTER_FX_INVERT),
+            strobe_flash,
+            freeze: self.bus.get_bool(param::MASTER_FX_FREEZE),
+            zoom_punch,
+        };
         self.mixer.render(
             self.deck_a.output_texture(),
             self.deck_b.output_texture(),
             xfade,
             blend_mode,
             self.blackout_alpha,
+            fx,
         );
         // OpenGL 3.3 Core Spec (Section 5.3): if the Projector window is open, insert a fence
         // + glFlush() after writing `master_texture` so the Projector context can call GPU-only
@@ -2202,7 +2243,7 @@ impl ConsoleState {
         };
         let end_mem = current_process_memory_mb();
 
-        self.logger.log_info("=== Stage 3B Shutdown Summary (provisional, laptop-limited) ===");
+        self.logger.log_info("=== Stage 3C Shutdown Summary (provisional, laptop-limited) ===");
         self.logger.log_info(&format!(
             "Elapsed: {:.2}s | Frames: {} | Avg FPS: {:.2} | Total GL errors: {}",
             elapsed,
@@ -2269,7 +2310,7 @@ impl ConsoleState {
         self.live_capture.take();
 
         println!(
-            "Stage 3B closed cleanly. Frames={}, Avg FPS={:.2}, Presets={}, BlankPBO avg={:.1} us, GL errors={}, log={}",
+            "Stage 3C closed cleanly. Frames={}, Avg FPS={:.2}, Presets={}, BlankPBO avg={:.1} us, GL errors={}, log={}",
             self.frame_count,
             avg_fps,
             self.presets.len(),
@@ -2328,6 +2369,9 @@ impl ApplicationHandler for App {
                         proj.resize(new_size.width, new_size.height);
                     }
                 }
+                WindowEvent::Focused(false) => {
+                    state.release_held_momentary_keys();
+                }
                 WindowEvent::CloseRequested => {
                     state.close_projector();
                 }
@@ -2358,6 +2402,9 @@ impl ApplicationHandler for App {
         }
 
         match event {
+            WindowEvent::Focused(false) => {
+                state.release_held_momentary_keys();
+            }
             WindowEvent::CloseRequested => {
                 state.shutdown();
                 event_loop.exit();
@@ -2536,7 +2583,7 @@ fn parse_cli_args() -> Result<CliConfig, String> {
         auto_exit_secs: None,
         test_res_toggles: 0,
         test_projector_windowed: false,
-        log_path: PathBuf::from("logs").join("stage_3b.log"),
+        log_path: PathBuf::from("logs").join("stage_3c.log"),
     };
 
     let mut args = std::env::args().skip(1);
