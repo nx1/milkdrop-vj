@@ -221,9 +221,17 @@ impl PresetScannerHandle {
     }
 }
 
-/// Discovers only the top-level starter `.milk` presets immediately so Deck A & Deck B can boot
+/// Discovers top-level starter `.milk` presets immediately so Deck A & Deck B can boot
 /// with zero startup delay while the full library scans in the background.
+/// If no `.milk` files sit directly in `presets\`, falls back to the first 10 presets
+/// found in subfolders (such as `presets\library\`) so fresh clones work out of the box.
 pub fn discover_immediate_starter_presets(root_dir: &Path) -> Result<Vec<PresetEntry>, String> {
+    if !root_dir.exists() {
+        return Err(format!(
+            "Presets folder `{}` does not exist. Create it and add .milk presets (see README.md).",
+            root_dir.display()
+        ));
+    }
     let entries = fs::read_dir(root_dir)
         .map_err(|e| format!("Failed to read presets folder {}: {e}", root_dir.display()))?;
     let mut paths: Vec<PathBuf> = entries
@@ -233,7 +241,14 @@ pub fn discover_immediate_starter_presets(root_dir: &Path) -> Result<Vec<PresetE
     paths.sort();
 
     if paths.is_empty() {
-        return Err(format!("No starter .milk presets found in {}", root_dir.display()));
+        collect_first_n_milk_files(root_dir, 10, &mut paths)?;
+    }
+
+    if paths.is_empty() {
+        return Err(format!(
+            "No .milk presets found in `{}`. Add .milk presets to `presets\\library\\` (see README.md).",
+            root_dir.display()
+        ));
     }
 
     Ok(paths
@@ -254,6 +269,38 @@ pub fn discover_immediate_starter_presets(root_dir: &Path) -> Result<Vec<PresetE
             }
         })
         .collect())
+}
+
+fn collect_first_n_milk_files(
+    dir: &Path,
+    limit: usize,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if out.len() >= limit {
+        return Ok(());
+    }
+    let rd = fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read folder {}: {e}", dir.display()))?;
+    let mut children: Vec<PathBuf> = rd.filter_map(|res| res.ok().map(|e| e.path())).collect();
+    children.sort();
+    for path in children {
+        if out.len() >= limit {
+            break;
+        }
+        if path.is_dir() {
+            let is_hidden = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with('.'))
+                .unwrap_or(false);
+            if !is_hidden {
+                collect_first_n_milk_files(&path, limit, out)?;
+            }
+        } else if is_scannable_milk_file(&path) {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// Performs a full recursive preset scan using `cache_path`, invoking `on_progress` periodically.

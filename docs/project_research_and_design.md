@@ -11,7 +11,7 @@ You are building a live **Video DJ (VJ)** program for Windows based on **MilkDro
 
 | Decision Area | Locked-In Choice | Why We Chose It |
 | :--- | :--- | :--- |
-| **Language** | **Rust** *(fallback: C++ only if `libprojectM` on Windows blocks us)* | Delivers smooth 60 FPS visuals without garbage-collection pauses and packages into a clean native Windows app. We will heavily comment every file and explain each module in plain English in [`PROJECT_NOTES.md`](file:///c:/Users/norma/Desktop/antigravity/PROJECT_NOTES.md). |
+| **Language** | **Rust** *(fallback: C++ only if `libprojectM` on Windows blocks us)* | Delivers smooth 60 FPS visuals without garbage-collection pauses and packages into a clean native Windows app. We heavily comment every file and explain each module in plain English. |
 | **Build Approach** | **Build from scratch**, borrowing proven patterns from `OpenDrop-VJ` | Keeps the codebase small, focused on your Traktor workflow, and 100% understandable—without broadcast bloat (Twitch, Kick, NDI SDK, cloud server). |
 | **Visual Engine** | **`libprojectM` 4.x** (via `vcpkg` + `bindgen`) | Open-source (LGPL-2.1), actively maintained, supports multiple independent instances, and reads thousands of `.milk` presets. |
 | **First Audio Input** | **WASAPI Loopback** (swappable `AudioSource` module) | Captures music playing on your laptop first; Line-In and USB audio interfaces plug into the exact same module later. |
@@ -365,7 +365,7 @@ The **Dell Precision 7740** has both an **Intel integrated GPU (iGPU)** and an *
 | **4. Broken or ultra-heavy `.milk` preset freezes live output** | High | High | Wrap preset loads cleanly, show load errors without crashing, monitor FPS, and let the user mark/hide bad presets. |
 | **5. WASAPI Loopback stops sending packets during silence** | High | Medium | Known Windows behavior! When no loopback packets arrive, feed zeroed silence buffers (+ any manual beat pulses) so visuals stay alive at 60 FPS between songs. |
 | **6. `spout2-rs` crate goes unmaintained (`v0.1.1`)** | Medium | Low | Keep Spout in Milestone 4 behind a clean `VideoOutput` trait; replace with direct C++ Spout2 SDK bindings if needed. |
-| **7. Rust learning curve slows iteration** | Medium | Medium | Keep architecture simple (no complex async runtime needed in core/UI), comment every file thoroughly, and document every module in [`PROJECT_NOTES.md`](file:///c:/Users/norma/Desktop/antigravity/PROJECT_NOTES.md). |
+| **7. Rust learning curve slows iteration** | Medium | Medium | Keep architecture simple (no complex async runtime needed in core/UI), comment every file thoroughly, and document every module in plain English. |
 | **8. Preset-load & shader-compile stall (off-air load stalls on-air deck)** | High | Medium | **Plain fact (verified in `ProjectM.cpp` lines 56–67):** Because rendering is single-threaded and `projectm_load_preset_file()` parses files and compiles OpenGL shaders synchronously on the calling thread, **loading a preset on the off-air deck also briefly stalls the on-air deck** (`~7–25 ms` on warm NVIDIA shader cache, longer on a true cold compile). **Measurement in Milestone 2:** Normal runs will automatically log the frame containing each preset load plus the next two frames for both decks so real stall impact is visible without a separate stress test. **Options:** (1) Accept small warm-cache hitches as minor; (2) cue/preload new presets on the off-air deck during a quiet musical moment or breakdown; (3) flag slow-loading presets in the browser; (4) only if hitches prove visibly distracting live, evaluate moving each deck's shared OpenGL context onto its own worker thread in a later milestone. |
 
 ---
@@ -418,7 +418,7 @@ The **Dell Precision 7740** has both an **Intel integrated GPU (iGPU)** and an *
 ### Chosen Directory Layout
 - **Code repository:** `C:\dev\vj\` (short path, outside OneDrive).
 - **`vcpkg` root (`VCPKG_ROOT`):** `C:\vcpkg` (short path, outside OneDrive).
-- **Continuous notes:** [`C:\Users\norma\Desktop\antigravity\PROJECT_NOTES.md`](file:///c:/Users/norma/Desktop/antigravity/PROJECT_NOTES.md) (kept where it is, as requested).
+- **Continuous notes:** Kept locally in `PROJECT_NOTES.md` alongside the developer workspace.
 
 ### Exact Install Order, Commands, and Admin/Restart Notices
 
