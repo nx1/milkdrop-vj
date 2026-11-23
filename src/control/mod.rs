@@ -70,6 +70,46 @@ pub mod param {
     pub const BROWSER_LOAD_OFF_AIR: &str = "browser.load_off_air";
     pub const DECK_A_LOAD_SELECTED: &str = "deck_a.load_selected";
     pub const DECK_B_LOAD_SELECTED: &str = "deck_b.load_selected";
+
+    // Milestone 3 (3D): Hot-Preset Banks (`1`–`4` Deck A, `5`–`8` Deck B).
+    pub const DECK_A_HOT_BANK_1: &str = "deck_a.hot_bank_1";
+    pub const DECK_A_HOT_BANK_2: &str = "deck_a.hot_bank_2";
+    pub const DECK_A_HOT_BANK_3: &str = "deck_a.hot_bank_3";
+    pub const DECK_A_HOT_BANK_4: &str = "deck_a.hot_bank_4";
+    pub const DECK_B_HOT_BANK_1: &str = "deck_b.hot_bank_1";
+    pub const DECK_B_HOT_BANK_2: &str = "deck_b.hot_bank_2";
+    pub const DECK_B_HOT_BANK_3: &str = "deck_b.hot_bank_3";
+    pub const DECK_B_HOT_BANK_4: &str = "deck_b.hot_bank_4";
+
+    /// Returns the canonical Control Bus target string for a Hot-Preset Bank pad (`slot` in `0..4`).
+    pub fn hot_bank_target(is_deck_a: bool, slot: usize) -> Option<&'static str> {
+        match (is_deck_a, slot) {
+            (true, 0) => Some(DECK_A_HOT_BANK_1),
+            (true, 1) => Some(DECK_A_HOT_BANK_2),
+            (true, 2) => Some(DECK_A_HOT_BANK_3),
+            (true, 3) => Some(DECK_A_HOT_BANK_4),
+            (false, 0) => Some(DECK_B_HOT_BANK_1),
+            (false, 1) => Some(DECK_B_HOT_BANK_2),
+            (false, 2) => Some(DECK_B_HOT_BANK_3),
+            (false, 3) => Some(DECK_B_HOT_BANK_4),
+            _ => None,
+        }
+    }
+
+    /// Parses a Hot-Preset Bank target string back into `(is_deck_a, slot_idx)`.
+    pub fn parse_hot_bank_target(target: &str) -> Option<(bool, usize)> {
+        match target {
+            DECK_A_HOT_BANK_1 => Some((true, 0)),
+            DECK_A_HOT_BANK_2 => Some((true, 1)),
+            DECK_A_HOT_BANK_3 => Some((true, 2)),
+            DECK_A_HOT_BANK_4 => Some((true, 3)),
+            DECK_B_HOT_BANK_1 => Some((false, 0)),
+            DECK_B_HOT_BANK_2 => Some((false, 1)),
+            DECK_B_HOT_BANK_3 => Some((false, 2)),
+            DECK_B_HOT_BANK_4 => Some((false, 3)),
+            _ => None,
+        }
+    }
 }
 
 /// Number of GPU blend modes supported by Milestone 2 (`2A-2`).
@@ -459,6 +499,95 @@ impl Default for MappingsConfig {
                     hard_cut: false,
                     force_on_air: false,
                 },
+                // Milestone 3 (3D): Hot-Preset Banks (`1`-`4` Deck A, `5`-`8` Deck B).
+                KeyboardMapping {
+                    key: "1".to_string(),
+                    modifiers: vec![],
+                    target: param::DECK_A_HOT_BANK_1.to_string(),
+                    mode: MappingMode::Trigger,
+                    value: Some(1.0),
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "2".to_string(),
+                    modifiers: vec![],
+                    target: param::DECK_A_HOT_BANK_2.to_string(),
+                    mode: MappingMode::Trigger,
+                    value: Some(1.0),
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "3".to_string(),
+                    modifiers: vec![],
+                    target: param::DECK_A_HOT_BANK_3.to_string(),
+                    mode: MappingMode::Trigger,
+                    value: Some(1.0),
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "4".to_string(),
+                    modifiers: vec![],
+                    target: param::DECK_A_HOT_BANK_4.to_string(),
+                    mode: MappingMode::Trigger,
+                    value: Some(1.0),
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "5".to_string(),
+                    modifiers: vec![],
+                    target: param::DECK_B_HOT_BANK_1.to_string(),
+                    mode: MappingMode::Trigger,
+                    value: Some(1.0),
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "6".to_string(),
+                    modifiers: vec![],
+                    target: param::DECK_B_HOT_BANK_2.to_string(),
+                    mode: MappingMode::Trigger,
+                    value: Some(1.0),
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "7".to_string(),
+                    modifiers: vec![],
+                    target: param::DECK_B_HOT_BANK_3.to_string(),
+                    mode: MappingMode::Trigger,
+                    value: Some(1.0),
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
+                KeyboardMapping {
+                    key: "8".to_string(),
+                    modifiers: vec![],
+                    target: param::DECK_B_HOT_BANK_4.to_string(),
+                    mode: MappingMode::Trigger,
+                    value: Some(1.0),
+                    step: None,
+                    steps: None,
+                    hard_cut: false,
+                    force_on_air: false,
+                },
             ],
             midi: vec![
                 MidiMapping {
@@ -588,6 +717,30 @@ impl KeyboardMapping {
             }
             (param::MASTER_FX_FREEZE, MappingMode::Momentary, _, _, _, _) => {
                 "FX2: Freeze Frame (Hold)".to_string()
+            }
+            (param::DECK_A_HOT_BANK_1, MappingMode::Trigger, _, _, _, _) => {
+                "Deck A: Hot-Preset Bank 1".to_string()
+            }
+            (param::DECK_A_HOT_BANK_2, MappingMode::Trigger, _, _, _, _) => {
+                "Deck A: Hot-Preset Bank 2".to_string()
+            }
+            (param::DECK_A_HOT_BANK_3, MappingMode::Trigger, _, _, _, _) => {
+                "Deck A: Hot-Preset Bank 3".to_string()
+            }
+            (param::DECK_A_HOT_BANK_4, MappingMode::Trigger, _, _, _, _) => {
+                "Deck A: Hot-Preset Bank 4".to_string()
+            }
+            (param::DECK_B_HOT_BANK_1, MappingMode::Trigger, _, _, _, _) => {
+                "Deck B: Hot-Preset Bank 1".to_string()
+            }
+            (param::DECK_B_HOT_BANK_2, MappingMode::Trigger, _, _, _, _) => {
+                "Deck B: Hot-Preset Bank 2".to_string()
+            }
+            (param::DECK_B_HOT_BANK_3, MappingMode::Trigger, _, _, _, _) => {
+                "Deck B: Hot-Preset Bank 3".to_string()
+            }
+            (param::DECK_B_HOT_BANK_4, MappingMode::Trigger, _, _, _, _) => {
+                "Deck B: Hot-Preset Bank 4".to_string()
             }
             _ => format!("{} ({:?})", self.target, self.mode),
         }

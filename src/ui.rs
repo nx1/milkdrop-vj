@@ -24,6 +24,7 @@ use crate::projector::{DisplayMonitorInfo, ProjectorTarget};
 use crate::render_deck::BlankDeckStatus;
 use milkdrop_vj::audio::AudioDeviceInfo;
 use milkdrop_vj::control::{param, ControlBus, MappingMode, BLEND_MODE_COUNT};
+use milkdrop_vj::hot_banks::{HotBankStore, HOT_BANK_SLOTS_PER_DECK};
 use milkdrop_vj::playlists::{CollectionFilter, PlaylistStore};
 use milkdrop_vj::preset_browser::{PresetEntry, ScanStatus, WeightFilter};
 use milkdrop_vj::preset_meta::{ComplexityTier, PresetComplexity};
@@ -152,6 +153,21 @@ pub enum PlaylistAction {
     },
 }
 
+/// Hot-Preset Bank assignment/clear actions emitted by Deck A/B pads and saved to `hot_banks.json`.
+#[derive(Debug, Clone)]
+pub enum HotBankAction {
+    Assign {
+        is_deck_a: bool,
+        slot: usize,
+        rel_path: String,
+        display_name: String,
+    },
+    Clear {
+        is_deck_a: bool,
+        slot: usize,
+    },
+}
+
 /// Interactive focus, selection, filter, playlist, and key-remapping modal state.
 #[derive(Default)]
 pub struct UiInteractionState {
@@ -199,6 +215,8 @@ pub struct UiInteractionState {
     pub playlist_modal_feedback: Option<String>,
     /// Queued favorite/playlist mutations handled and saved by `main.rs`.
     pub playlist_actions: Vec<PlaylistAction>,
+    /// Queued Hot-Preset Bank assign/clear mutations handled and saved to `hot_banks.json`.
+    pub hot_bank_actions: Vec<HotBankAction>,
     /// Queued Top Bar hardware/audio/resolution actions handled cleanly by `main.rs`.
     pub top_bar_actions: Vec<TopBarAction>,
     /// Set when the user clicks `x` next to the Tap Tempo BPM pill to clear BPM/Auto-Pulse.
@@ -293,6 +311,7 @@ pub struct ConsoleUiState<'a> {
     pub folders: &'a [String],
     pub scan_status: &'a ScanStatus,
     pub playlists: &'a PlaylistStore,
+    pub hot_banks: &'a HotBankStore,
 }
 
 /// Applies the high-contrast dark-venue palette and larger readable typography once at startup.
@@ -383,14 +402,22 @@ pub fn draw_console_ui(
         )
         .show(ui, |ui| {
             let preview_h_from_stage = (stage_h - 150.0).max(140.0);
+            let selected_browser_preset: Option<(&str, &str)> = state
+                .filtered_indices
+                .get(interact.selected_preset_idx)
+                .and_then(|&idx| state.all_presets.get(idx))
+                .map(|e| (e.rel_path.as_str(), e.display_name.as_str()));
             ui.columns(3, |cols| {
                 draw_deck_column(
                     &mut cols[0],
+                    true,
                     "DECK A",
                     ACCENT_DECK_A,
                     air_a,
                     &state.deck_a,
                     state.playlists,
+                    state.hot_banks,
+                    selected_browser_preset,
                     preview_h_from_stage,
                     bus,
                     load_guard,
@@ -421,11 +448,14 @@ pub fn draw_console_ui(
                 );
                 draw_deck_column(
                     &mut cols[2],
+                    false,
                     "DECK B",
                     ACCENT_DECK_B,
                     air_b,
                     &state.deck_b,
                     state.playlists,
+                    state.hot_banks,
+                    selected_browser_preset,
                     preview_h_from_stage,
                     bus,
                     load_guard,
@@ -1310,11 +1340,14 @@ struct DeckEqParamNames {
 #[allow(clippy::too_many_arguments)]
 fn draw_deck_column(
     ui: &mut egui::Ui,
+    is_deck_a: bool,
     title: &str,
     accent: Color32,
     air_state: DeckAirState,
     snap: &DeckUiSnapshot<'_>,
     playlists: &PlaylistStore,
+    hot_banks: &HotBankStore,
+    selected_browser_preset: Option<(&str, &str)>,
     preview_h_from_stage: f32,
     bus: &mut ControlBus,
     load_guard: &mut LoadGuardState,
@@ -1452,35 +1485,6 @@ fn draw_deck_column(
                 .on_hover_text(snap.preset_name);
             });
 
-            if snap.blank.is_blank_warning {
-                Frame::new()
-                    .fill(COLOR_ALERT)
-                    .corner_radius(CornerRadius::same(4))
-                    .inner_margin(Margin::symmetric(8, 2))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "! BLANK DECK (luma {:.1}/255 for {:.1}s)",
-                                snap.blank.avg_luma, snap.blank.dark_seconds
-                            ))
-                            .font(FontId::proportional(13.0))
-                            .strong()
-                            .color(Color32::WHITE),
-                        );
-                    });
-            } else {
-                let luma_text = if snap.blank.has_sample {
-                    format!("Luma: {:.0}/255 (ok)", snap.blank.avg_luma)
-                } else {
-                    "Luma: sampling...".to_string()
-                };
-                ui.label(
-                    RichText::new(luma_text)
-                        .font(FontId::monospace(12.0))
-                        .color(TEXT_MUTED),
-                );
-            }
-
             ui.horizontal(|ui| {
                 if guarded_load_button(
                     ui,
@@ -1529,12 +1533,211 @@ fn draw_deck_column(
                         bus.trigger(blank_target, false, true);
                     }
                 }
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if snap.blank.is_blank_warning {
+                        Frame::new()
+                            .fill(COLOR_ALERT)
+                            .corner_radius(CornerRadius::same(4))
+                            .inner_margin(Margin::symmetric(6, 2))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "! BLANK ({:.0}, {:.1}s)",
+                                        snap.blank.avg_luma, snap.blank.dark_seconds
+                                    ))
+                                    .font(FontId::monospace(11.5))
+                                    .strong()
+                                    .color(Color32::WHITE),
+                                );
+                            });
+                    } else {
+                        let luma_text = if snap.blank.has_sample {
+                            format!("Luma {:.0}", snap.blank.avg_luma)
+                        } else {
+                            "Luma ...".to_string()
+                        };
+                        ui.label(
+                            RichText::new(luma_text)
+                                .font(FontId::monospace(11.5))
+                                .color(TEXT_MUTED),
+                        )
+                        .on_hover_text(
+                            "Async 32x18 PBO average luma (0-255). Alerts if dark for >2 seconds.",
+                        );
+                    }
+                });
             });
 
             // Milestone 3 (3A): Per-Deck 3-Band Visual EQ & Kill Switches (read-only PCM copy;
             // speakers are never modified). Double-click any slider to reset to 1.0x unity.
             draw_deck_visual_eq_strip(ui, eq_params, bus);
+
+            // Milestone 3 (3D): 4 Hot-Preset Bank Pads (`1`-`4` Deck A, `5`-`8` Deck B).
+            draw_deck_hot_banks_row(
+                ui,
+                is_deck_a,
+                title,
+                accent,
+                air_state,
+                snap,
+                hot_banks,
+                selected_browser_preset,
+                bus,
+                load_guard,
+                interact,
+                shift_held,
+            );
         });
+}
+
+/// Draws the 4 Traktor-style Hot-Preset Bank pads (`[1]-[4]` Deck A, `[5]-[8]` Deck B).
+#[allow(clippy::too_many_arguments)]
+fn draw_deck_hot_banks_row(
+    ui: &mut egui::Ui,
+    is_deck_a: bool,
+    deck_title: &str,
+    accent: Color32,
+    air_state: DeckAirState,
+    snap: &DeckUiSnapshot<'_>,
+    hot_banks: &HotBankStore,
+    selected_browser_preset: Option<(&str, &str)>,
+    bus: &mut ControlBus,
+    load_guard: &mut LoadGuardState,
+    interact: &mut UiInteractionState,
+    shift_held: bool,
+) {
+    let pad_w = ((ui.available_width() - 12.0) / HOT_BANK_SLOTS_PER_DECK as f32).max(56.0);
+    let max_name_chars = ((pad_w - 30.0) / 6.5).clamp(4.0, 14.0) as usize;
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for slot in 0..HOT_BANK_SLOTS_PER_DECK {
+            let Some(target) = param::hot_bank_target(is_deck_a, slot) else {
+                continue;
+            };
+            let hint = bus.mappings.hint_for_target(target, MappingMode::Trigger);
+            let assigned = hot_banks.get(is_deck_a, slot);
+            let armed = load_guard.is_armed(target);
+            let is_loaded_here = assigned
+                .and_then(|a| snap.preset_rel_path.map(|cur| cur == a.rel_path))
+                .unwrap_or(false);
+
+            let btn = if armed {
+                egui::Button::new(
+                    RichText::new("CONFIRM?")
+                        .font(FontId::monospace(11.5))
+                        .strong()
+                        .color(Color32::BLACK),
+                )
+                .fill(COLOR_WARN)
+                .min_size(Vec2::new(pad_w, 22.0))
+            } else if let Some(entry) = assigned {
+                let short = truncate_chars(&entry.display_name, max_name_chars);
+                let label = format!("[{hint}] {short}");
+                if is_loaded_here {
+                    egui::Button::new(
+                        RichText::new(label)
+                            .font(FontId::monospace(11.5))
+                            .strong()
+                            .color(Color32::BLACK),
+                    )
+                    .fill(accent)
+                    .min_size(Vec2::new(pad_w, 22.0))
+                } else {
+                    egui::Button::new(
+                        RichText::new(label)
+                            .font(FontId::monospace(11.5))
+                            .color(TEXT_PRIMARY),
+                    )
+                    .fill(accent.gamma_multiply(0.20))
+                    .stroke(Stroke::new(1.0, accent.gamma_multiply(0.65)))
+                    .min_size(Vec2::new(pad_w, 22.0))
+                }
+            } else {
+                egui::Button::new(
+                    RichText::new(format!("[{hint}] +Save"))
+                        .font(FontId::monospace(11.5))
+                        .color(TEXT_MUTED),
+                )
+                .min_size(Vec2::new(pad_w, 22.0))
+            };
+
+            let hover = if let Some(entry) = assigned {
+                format!(
+                    "Hot-Preset Bank [{hint}]: {}\n\
+                     Left-click or press [{hint}] to load on {deck_title} (respects Load Safety; Shift = hard cut; Ctrl+{hint} = force on-air).\n\
+                     Right-click to overwrite or clear.",
+                    entry.display_name
+                )
+            } else {
+                format!(
+                    "Empty Hot-Preset Bank [{hint}] ({deck_title}).\n\
+                     Left-click to save {deck_title}'s current preset here.\n\
+                     Right-click to save the selected Browser preset here."
+                )
+            };
+
+            let resp = ui.add(btn).on_hover_text(hover);
+
+            if resp.clicked() {
+                if assigned.is_some() {
+                    if load_guard.click_load(target, air_state) {
+                        bus.trigger(target, shift_held, true);
+                    }
+                } else if let Some(rel_path) = snap.preset_rel_path {
+                    interact.hot_bank_actions.push(HotBankAction::Assign {
+                        is_deck_a,
+                        slot,
+                        rel_path: rel_path.to_string(),
+                        display_name: snap.preset_name.to_string(),
+                    });
+                } else {
+                    interact.show_toast("Load a normal library preset before saving to a Hot Bank");
+                }
+            }
+
+            resp.context_menu(|ui| {
+                if let Some(rel_path) = snap.preset_rel_path {
+                    let cur_short = truncate_chars(snap.preset_name, 26);
+                    if ui
+                        .button(format!("Save {deck_title}: {cur_short}"))
+                        .clicked()
+                    {
+                        interact.hot_bank_actions.push(HotBankAction::Assign {
+                            is_deck_a,
+                            slot,
+                            rel_path: rel_path.to_string(),
+                            display_name: snap.preset_name.to_string(),
+                        });
+                        ui.close();
+                    }
+                }
+                if let Some((sel_rel, sel_name)) = selected_browser_preset {
+                    let sel_short = truncate_chars(sel_name, 26);
+                    if ui
+                        .button(format!("Save Browser row: {sel_short}"))
+                        .clicked()
+                    {
+                        interact.hot_bank_actions.push(HotBankAction::Assign {
+                            is_deck_a,
+                            slot,
+                            rel_path: sel_rel.to_string(),
+                            display_name: sel_name.to_string(),
+                        });
+                        ui.close();
+                    }
+                }
+                if assigned.is_some() {
+                    ui.separator();
+                    if ui.button(format!("Clear pad [{hint}]")).clicked() {
+                        interact.hot_bank_actions.push(HotBankAction::Clear { is_deck_a, slot });
+                        ui.close();
+                    }
+                }
+            });
+        }
+    });
 }
 
 fn draw_deck_visual_eq_strip(

@@ -68,6 +68,7 @@ use milkdrop_vj::control::{
 use milkdrop_vj::deck::{
     init_gl_loader_for_projectm, max_pcm_samples_per_channel, projectm_version_string,
 };
+use milkdrop_vj::hot_banks::HotBankStore;
 use milkdrop_vj::playlists::{CollectionFilter, PlaylistStore};
 use milkdrop_vj::preset_browser::{
     discover_immediate_starter_presets, filter_preset_indices, PresetEntry, PresetScannerHandle,
@@ -89,7 +90,8 @@ use crate::projector::{
 use crate::render_deck::RenderDeck;
 use crate::ui::{
     apply_dark_venue_style, draw_console_ui, AudioBadgeState, ConsoleUiState, DeckUiSnapshot,
-    LastLoadSummary, LoadGuardState, PlaylistAction, TopBarAction, UiInteractionState,
+    HotBankAction, LastLoadSummary, LoadGuardState, PlaylistAction, TopBarAction,
+    UiInteractionState,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +203,8 @@ struct ConsoleState {
     playlists_path: PathBuf,
     playlists: PlaylistStore,
     playlists_revision: usize,
+    hot_banks_path: PathBuf,
+    hot_banks: HotBankStore,
     presets: Vec<PresetEntry>,
     folders: Vec<String>,
     filtered_indices: Vec<usize>,
@@ -240,7 +244,7 @@ impl ConsoleState {
     fn initialize(event_loop: &ActiveEventLoop, config: CliConfig) -> Result<Self, String> {
         let mut logger = GlErrorLogger::open(&config.log_path)?;
         logger.log_info(
-            "Milestone 3 Stage 3C: Two Live GPU Effect Racks (FX1 Hue/Kaleid/Invert + FX2 Strobe/Freeze/Beat Zoom-Punch)",
+            "Milestone 3 Stage 3D: Hot-Preset Banks (1-4 Deck A, 5-8 Deck B, Load Safety & hot_banks.json)",
         );
         logger.log_info(&format!(
             "Deck render resolution: {}x{} (default 1280x720 per Light-Load Rules) | measure_gpu={}",
@@ -277,6 +281,19 @@ impl ConsoleState {
             },
             playlists.favorite_count(),
             playlists.playlists().len()
+        ));
+
+        // 1c. Load Hot-Preset Banks (`hot_banks.json`, gitignored).
+        let hot_banks_path = PathBuf::from("hot_banks.json");
+        let (hot_banks, hot_banks_existed) = HotBankStore::load_or_default(&hot_banks_path)?;
+        logger.log_info(&format!(
+            "Hot-Preset Banks ({}): {} slot(s) assigned",
+            if hot_banks_existed {
+                "loaded hot_banks.json"
+            } else {
+                "new empty banks"
+            },
+            hot_banks.assigned_count()
         ));
 
         // 2. Discover immediate top-level starter presets for instant boot, then start the
@@ -326,7 +343,7 @@ impl ConsoleState {
 
         let window_attrs = Window::default_attributes()
             .with_title(format!(
-                "MilkDrop VJ — Stage 3C Console & FX Racks ({}x{} decks)",
+                "MilkDrop VJ — Stage 3D Console, FX Racks & Hot Banks ({}x{} decks)",
                 config.deck_width, config.deck_height
             ))
             .with_inner_size(LogicalSize::new(1440.0, 860.0))
@@ -595,6 +612,8 @@ impl ConsoleState {
             playlists_path,
             playlists,
             playlists_revision: 0,
+            hot_banks_path,
+            hot_banks,
             presets,
             folders,
             filtered_indices,
@@ -973,7 +992,7 @@ impl ConsoleState {
         self.config.deck_width = new_w;
         self.config.deck_height = new_h;
         self.window.set_title(&format!(
-            "MilkDrop VJ — Stage 3C Console & FX Racks ({new_w}x{new_h} decks)"
+            "MilkDrop VJ — Stage 3D Console, FX Racks & Hot Banks ({new_w}x{new_h} decks)"
         ));
 
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1428,8 +1447,153 @@ impl ConsoleState {
                             .show_toast(format!("Tap Tempo: {bpm:.1} BPM"));
                     }
                 }
-                _ => {}
+                other => {
+                    if let Some((is_deck_a, slot)) = param::parse_hot_bank_target(other) {
+                        let air = if is_deck_a { air_a } else { air_b };
+                        self.trigger_hot_bank_slot(
+                            is_deck_a,
+                            slot,
+                            trig.hard_cut,
+                            trig.force_on_air,
+                            air,
+                        );
+                    }
+                }
             }
+        }
+    }
+
+    /// Saves or clears Hot-Preset Bank slots triggered by the UI and persists `hot_banks.json`.
+    fn process_hot_bank_actions(&mut self) {
+        if self.interact.hot_bank_actions.is_empty() {
+            return;
+        }
+        let actions: Vec<HotBankAction> = self.interact.hot_bank_actions.drain(..).collect();
+        let mut changed = false;
+        for action in actions {
+            match action {
+                HotBankAction::Assign {
+                    is_deck_a,
+                    slot,
+                    rel_path,
+                    display_name,
+                } => {
+                    let target = param::hot_bank_target(is_deck_a, slot).unwrap_or("");
+                    let hint = self
+                        .bus
+                        .mappings
+                        .hint_for_target(target, MappingMode::Trigger);
+                    let deck_lbl = if is_deck_a { "Deck A" } else { "Deck B" };
+                    if self
+                        .hot_banks
+                        .assign(is_deck_a, slot, rel_path, display_name.clone())
+                    {
+                        changed = true;
+                        let msg = format!("Saved `{display_name}` to {deck_lbl} Hot Bank [{hint}]");
+                        self.logger.log_info(&format!("[BANKS] {msg}"));
+                        self.interact.show_toast(msg);
+                    }
+                }
+                HotBankAction::Clear { is_deck_a, slot } => {
+                    let target = param::hot_bank_target(is_deck_a, slot).unwrap_or("");
+                    let hint = self
+                        .bus
+                        .mappings
+                        .hint_for_target(target, MappingMode::Trigger);
+                    let deck_lbl = if is_deck_a { "Deck A" } else { "Deck B" };
+                    if self.hot_banks.clear(is_deck_a, slot) {
+                        changed = true;
+                        let msg = format!("Cleared {deck_lbl} Hot Bank [{hint}]");
+                        self.logger.log_info(&format!("[BANKS] {msg}"));
+                        self.interact.show_toast(msg);
+                    }
+                }
+            }
+        }
+        if changed {
+            if let Err(err) = self.hot_banks.save(&self.hot_banks_path) {
+                self.logger
+                    .log_info(&format!("[ERROR] Failed to save hot_banks.json: {err}"));
+                self.interact
+                    .show_toast(format!("Failed to save hot_banks.json: {err}"));
+            }
+        }
+    }
+
+    /// Loads a preset assigned to a Hot-Preset Bank slot, respecting Load Safety and Smooth/Cut mode.
+    fn trigger_hot_bank_slot(
+        &mut self,
+        is_deck_a: bool,
+        slot: usize,
+        hard_cut: bool,
+        force_on_air: bool,
+        air_state: DeckAirState,
+    ) {
+        let deck_lbl = if is_deck_a { "Deck A" } else { "Deck B" };
+        let target = param::hot_bank_target(is_deck_a, slot).unwrap_or("");
+        let hint = self
+            .bus
+            .mappings
+            .hint_for_target(target, MappingMode::Trigger);
+
+        let Some(assigned) = self.hot_banks.get(is_deck_a, slot).cloned() else {
+            self.interact.show_toast(format!(
+                "{deck_lbl} Hot Bank [{hint}] is empty — click pad to save current preset"
+            ));
+            return;
+        };
+
+        if air_state.is_protected() && !force_on_air {
+            self.interact.show_toast(format!(
+                "{deck_lbl} is ON-AIR/MIXED — press Ctrl+{hint} to force load Hot Bank [{hint}]"
+            ));
+            return;
+        }
+
+        let smooth_param = if is_deck_a {
+            param::DECK_A_TRANSITION_SMOOTH
+        } else {
+            param::DECK_B_TRANSITION_SMOOTH
+        };
+        let smooth = !hard_cut && self.bus.get_bool(smooth_param);
+
+        // Prefer the indexed entry from `self.presets` (full complexity metadata).
+        if let Some(idx) = self
+            .presets
+            .iter()
+            .position(|p| p.rel_path == assigned.rel_path)
+        {
+            self.load_deck_preset(is_deck_a, idx, smooth);
+            return;
+        }
+
+        // Fallback: load directly from `presets/<rel_path>` so Hot Banks work even during the first
+        // second of startup before the background library scan finishes!
+        let direct_path = self.presets_root.join(&assigned.rel_path);
+        if direct_path.exists() {
+            let folder = Path::new(&assigned.rel_path)
+                .parent()
+                .and_then(|p| p.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Starter")
+                .to_string();
+            let entry = PresetEntry {
+                path: direct_path,
+                rel_path: assigned.rel_path.clone(),
+                display_name: assigned.display_name.clone(),
+                search_haystack: format!("{} {}", assigned.display_name, folder).to_lowercase(),
+                folder,
+                complexity: PresetComplexity {
+                    enabled_shape_instances: 0,
+                    tier: milkdrop_vj::preset_meta::ComplexityTier::Light,
+                },
+            };
+            self.load_deck_preset_entry(is_deck_a, entry, smooth);
+        } else {
+            self.interact.show_toast(format!(
+                "Hot Bank [{hint}] file missing on disk: {}",
+                assigned.rel_path
+            ));
         }
     }
 
@@ -1576,16 +1740,32 @@ impl ConsoleState {
             .mappings
             .find_keyboard_matches(&key_name, shift, ctrl, alt);
 
-        // Convenience: allow Ctrl+Shift+<force-load key> to combine Force On-Air + Hard Cut.
-        if matches.is_empty() && ctrl && shift && !alt {
-            for mut m in self
-                .bus
-                .mappings
-                .find_keyboard_matches(&key_name, false, true, false)
-            {
-                if m.force_on_air {
-                    m.hard_cut = true;
-                    matches.push(m);
+        // Convenience: allow Ctrl+Shift+<force-load key> to combine Force On-Air + Hard Cut,
+        // and allow Shift / Ctrl / Ctrl+Shift with Hot-Preset Bank keys (`1`-`8`) for Hard Cut / Force On-Air.
+        if matches.is_empty() && !alt {
+            if ctrl && shift {
+                for mut m in self
+                    .bus
+                    .mappings
+                    .find_keyboard_matches(&key_name, false, true, false)
+                {
+                    if m.force_on_air {
+                        m.hard_cut = true;
+                        matches.push(m);
+                    }
+                }
+            }
+            if matches.is_empty() && (ctrl || shift) {
+                for mut m in self
+                    .bus
+                    .mappings
+                    .find_keyboard_matches(&key_name, false, false, false)
+                {
+                    if param::parse_hot_bank_target(&m.target).is_some() {
+                        m.hard_cut = shift;
+                        m.force_on_air = ctrl;
+                        matches.push(m);
+                    }
                 }
             }
         }
@@ -1637,6 +1817,10 @@ impl ConsoleState {
         let Some(entry) = self.presets.get(idx).cloned() else {
             return;
         };
+        self.load_deck_preset_entry(is_deck_a, entry, smooth);
+    }
+
+    fn load_deck_preset_entry(&mut self, is_deck_a: bool, entry: PresetEntry, smooth: bool) {
         let deck_label = if is_deck_a { "Deck A" } else { "Deck B" };
         let t0 = Instant::now();
         let result = if is_deck_a {
@@ -1738,6 +1922,7 @@ impl ConsoleState {
         self.poll_audio_background_tasks();
         self.process_top_bar_actions();
         self.process_playlist_actions();
+        self.process_hot_bank_actions();
         self.refresh_filtered_presets_if_needed();
 
         // Optional automated resolution-toggle verification (`--test-res-toggles N`).
@@ -2077,6 +2262,7 @@ impl ConsoleState {
             folders: &self.folders,
             scan_status: &self.scan_status,
             playlists: &self.playlists,
+            hot_banks: &self.hot_banks,
         };
 
         let bus_ref = &mut self.bus;
@@ -2258,7 +2444,7 @@ impl ConsoleState {
         };
         let end_mem = current_process_memory_mb();
 
-        self.logger.log_info("=== Stage 3C Shutdown Summary (provisional, laptop-limited) ===");
+        self.logger.log_info("=== Stage 3D Shutdown Summary (provisional, laptop-limited) ===");
         self.logger.log_info(&format!(
             "Elapsed: {:.2}s | Frames: {} | Avg FPS: {:.2} | Total GL errors: {}",
             elapsed,
@@ -2325,7 +2511,7 @@ impl ConsoleState {
         self.live_capture.take();
 
         println!(
-            "Stage 3C closed cleanly. Frames={}, Avg FPS={:.2}, Presets={}, BlankPBO avg={:.1} us, GL errors={}, log={}",
+            "Stage 3D closed cleanly. Frames={}, Avg FPS={:.2}, Presets={}, BlankPBO avg={:.1} us, GL errors={}, log={}",
             self.frame_count,
             avg_fps,
             self.presets.len(),
@@ -2598,7 +2784,7 @@ fn parse_cli_args() -> Result<CliConfig, String> {
         auto_exit_secs: None,
         test_res_toggles: 0,
         test_projector_windowed: false,
-        log_path: PathBuf::from("logs").join("stage_3c.log"),
+        log_path: PathBuf::from("logs").join("stage_3d.log"),
     };
 
     let mut args = std::env::args().skip(1);

@@ -7,6 +7,7 @@
 pub mod audio;
 pub mod control;
 pub mod deck;
+pub mod hot_banks;
 pub mod playlists;
 pub mod preset_browser;
 pub mod preset_meta;
