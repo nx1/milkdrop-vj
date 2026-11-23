@@ -12,7 +12,9 @@ Mix two independent MilkDrop visual decks live like DJing music in **Traktor**�
 - **Live GPU Mixer & Master Preview:** Real-time crossfader (`0.0` to `1.0`, double-click to center), **`ON-AIR` / `MIXED` / `CUE`** deck indicators, and 5 blend modes:
   - `Crossfade`, `Additive`, `Multiply`, `Difference`, and `Luma Key`
 - **Emergency Blackout:** Smooth `0.4 s` fade-to-black panic toggle (`Backspace`) on the Master output.
-- **Live Windows System Audio (WASAPI Loopback):** Captures music playing out of Windows speakers/headphones/USB audio interfaces via a lock-free ring buffer, with automatic silence handling and a built-in synthetic test signal (`--audio-source test`).
+- **Live Windows System Audio (WASAPI Loopback):** Captures music playing out of Windows speakers/headphones/USB audio interfaces via a lock-free ring buffer, with live **Audio Source** switching (`Live WASAPI` ↔ `Test Audio`), an **unplug-safe Audio Device dropdown** with non-blocking background reconnect and one-click **`Retry`** on `DEVICE LOST`, and automatic silence handling.
+- **Runtime Resolution Toggle (`720p` ↔ `1080p`):** Switch both decks and the Master FBO cleanly between `1280x720` and `1920x1080` live in the Top Bar with zero OpenGL errors.
+- **Borderless Fullscreen Projector Output:** Open a clean, cursor-hidden borderless fullscreen output on any external monitor or projector (plus a `1280x720` Windowed Preview option), using GPU-only cross-context fence sync, aspect-preserving letterboxing, forwarded hotkeys, and a Single-VSync rule so dual windows hold locked `60 FPS`.
 - **Keyboard-First Controls & Unified Control Bus:** Every live control reads and writes normalized values (`0.0` to `1.0`) through `mappings.json`. Remap any key in the app (**`Keys`** button), including UK/European ISO `\` keyboard support.
 - **Load Safety Guard:** Prevents accidentally overwriting a live (`ON-AIR` or `MIXED`) deck with a single stray keypress or click (requires a 2-click **`CONFIRM?`** on mouse, or **`Ctrl+A` / `Ctrl+B`** on keyboard).
 - **10,000-Preset Browser, Favorites, & Curated Playlists:**
@@ -28,10 +30,8 @@ Mix two independent MilkDrop visual decks live like DJing music in **Traktor**�
 | Milestone | Scope | Status |
 | :--- | :--- | :--- |
 | **Milestone 1** | Dual `libprojectM 4.1.8` OpenGL engine + WASAPI Loopback audio + lock-free ring buffer | **Complete** |
-| **Milestone 2 (`2A-1` – `2A-4b`)** | Control Bus, dark-venue `egui` console, GPU mixer (5 blend modes + Blackout), remappable keys, 10k-preset browser, Favorites & Playlists | **Complete** |
-| **Milestone 2 (`2A-5`)** | Top bar: live audio device dropdown (unplug-safe restart), Live/Test source switch, runtime `720p` / `1080p` deck toggle | **Next** |
-| **Milestone 2 (`2B`)** | Borderless fullscreen Projector Output window on a second monitor | Planned |
-| **Milestone 3** | Per-deck 3-band Visual EQ + Kill switches, Manual Beat Pulse (`Space`), Tap Tempo (`T`), 2 GPU Effect Racks, Hot-Preset Banks (`1`–`8`) | Planned |
+| **Milestone 2 (`2A-1` – `2B`)** | Control Bus, dark-venue `egui` console, GPU mixer (5 blend modes + Blackout), remappable keys, 10k-preset browser + Favorites/Playlists, Top Bar audio switcher & `720p`/`1080p` toggle, Borderless Fullscreen Projector Output | **Complete** |
+| **Milestone 3** | Per-deck 3-band Visual EQ + Kill switches (`Q`/`W`/`E`, `I`/`O`/`P`), Manual Beat Pulse (`Space`), Tap Tempo (`T`), 2 GPU Effect Racks, Hot-Preset Banks (`1`–`8`) | **Next** |
 | **Milestone 4** | Line-In / USB audio interface input, USB MIDI (`midir`) + MIDI Learn, Spout2 output | Planned |
 
 For full architecture notes, benchmarks, and UI specifications, read [docs/project_research_and_design.md](docs/project_research_and_design.md).
@@ -152,6 +152,7 @@ All live shortcuts can be remapped inside the app via the top-bar **`Keys`** but
     ├── egui_renderer.rs             # Zero-reallocation OpenGL 3.3 batched renderer (avoids NVIDIA WGL leak)
     ├── render_deck.rs               # Per-deck WGL pbuffer context, GL 5.3 fence sync, GPU timers, blank PBO
     ├── mixer.rs                     # GPU Master FBO, 5 blend shaders, DeckAirState, 0.4s blackout fade
+    ├── projector.rs                 # Borderless fullscreen Projector window, shared GL context, letterboxing
     ├── deck.rs                      # Safe Rust wrapper around libprojectM C FFI + PCM chunking
     ├── gl_state.rs                  # Saves/restores OpenGL state around libprojectM calls
     ├── gl_log.rs                    # Per-frame OpenGL error logger & telemetry log writer

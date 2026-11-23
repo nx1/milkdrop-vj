@@ -12,14 +12,14 @@ For full background, design specs, and benchmarks, see [docs/project_research_an
 
 ### Current Milestone Progress
 - **Milestone 1 (Complete):** Dual isolated `libprojectM 4.1.8` OpenGL 3.3 Core decks + native Windows WASAPI Loopback audio capture via a lock-free SPSC ring buffer.
-- **Milestone 2 (In Progress):**
+- **Milestone 2 (Complete — All 6 Sub-Stages Verified on Desktop):**
   - `2A-1` **Done:** Control Bus (`0.0..=1.0`) + `mappings.json`, dark-venue `egui 0.37` console, custom zero-leak GL renderer (`src/egui_renderer.rs`), OpenGL 5.3 fence sync, non-blocking `GL_TIME_ELAPSED` deck timers, async `32x18` PBO blank-deck detector, `[LOAD-STALL]` logging.
   - `2A-2` **Done:** `GpuMixer` FBO (`src/mixer.rs`), Master preview, 5 blend modes (`Crossfade`, `Additive`, `Multiply`, `Difference`, `Luma Key`), crossfader + double-click center, `ON-AIR`/`MIXED`/`CUE` badges, 2-click Load Safety, `0.4 s` smooth Emergency Blackout (`Backspace`).
   - `2A-3` **Done:** Remappable keyboard routing via Control Bus + Focus Model (`/` Typing Mode, `Esc`, `↑`/`↓`, `Enter`, `A`/`B`/`Shift`/`Ctrl`) + in-app `Keys` remap modal + UK ISO `KeyCode::IntlBackslash` fix.
   - `2A-4` & `2A-4b` **Done:** Background `preset-scanner` thread + `preset_cache.json` (with 1,000-file checkpoints), live Search / `Weight:` / `Folder:` filters, virtualized `ScrollArea::show_rows` (handles 9,800+ presets cleanly), Favorites (`*` / `FAV`) & ordered Curated Playlists (`playlists.json`).
-  - **`2A-5` (Next):** Top bar — live audio device dropdown (non-blocking background capture-thread restart, unplug-safe), `Live WASAPI` ↔ `Test Audio` switch, and runtime `1280x720` ↔ `1920x1080` deck resolution toggle.
-  - **`2B` (After `2A-5`):** Borderless fullscreen Projector Output window on a second monitor.
-- **Milestone 3 (Planned):** Per-deck 3-band Visual EQ + Kill switches, Manual Beat Pulse (`Space`), Tap Tempo (`T`), 2 GPU Effect Racks, Hot-Preset Banks (`1`–`8`).
+  - `2A-5` **Done:** Top bar — live audio device dropdown (non-blocking background capture-thread restart, unplug-safe), `Live WASAPI` ↔ `Test Audio` switch, and runtime `1280x720` ↔ `1920x1080` deck resolution toggle.
+  - `2B` **Done:** Borderless fullscreen Projector Output window (`src/projector.rs`) with shared GL context, GL 5.3 Master fence sync, aspect-preserving letterboxing, hotkey forwarding, and Single-VSync rule (`Projector=Wait(1), Console=DontWait`).
+- **Milestone 3 (Next):** Per-deck 3-band Visual EQ + Kill switches (`Q`/`W`/`E`, `I`/`O`/`P`), Manual Beat Pulse (`Space`), Tap Tempo (`T`), 2 GPU Effect Racks, Hot-Preset Banks (`1`–`8`).
 - **Milestone 4 (Planned):** Line-In / USB audio interface input (`AudioSource` backend #2), USB MIDI (`midir`) + MIDI Learn, Spout2 output (`VideoOutput` trait).
 
 ---
